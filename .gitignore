@@ -1,0 +1,25 @@
+# Auth tokens & secrets
+tokens.json
+mcp_config.json
+
+# Virtual environment
+.venv/
+
+# Audit output files
+audit_*.csv
+
+# Claude Code project config
+.claude/
+CLAUDE.md
+
+# Tests
+tests/
+pytest.ini
+
+# Archived / scratch files
+archive/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
