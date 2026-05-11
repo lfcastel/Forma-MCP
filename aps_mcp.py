@@ -599,6 +599,31 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="rename_file",
+            description=(
+                "Rename a file in an ACC project by creating a new version with the new name "
+                "(no re-upload needed). "
+                "folder_path is the slash-separated path to the folder containing the file, "
+                "e.g. 'Project Files/Drawings'. "
+                "file_name is the current display name of the file (exact match, case-insensitive). "
+                "Returns item_id, old_name, new_name, and the new version ID on success."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the folder containing the file.",
+                    },
+                    "file_name": {"type": "string", "description": "Current display name of the file."},
+                    "new_name": {"type": "string", "description": "New display name for the file."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "folder_path", "file_name", "new_name"],
+            },
+        ),
+        Tool(
             name="list_project_members",
             description=(
                 "List all members of an ACC project with their roles and companies. "
@@ -1067,6 +1092,92 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "folder_id": folder_id,
                 "old_name": old_name,
                 "new_name": new_name,
+                "status": "renamed",
+            }, indent=2))]
+
+        if name == "rename_file":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+            )
+            folder_path = arguments["folder_path"]
+            file_name = arguments["file_name"].strip()
+            new_name = arguments["new_name"].strip()
+            if not new_name:
+                raise ValueError("new_name cannot be empty.")
+
+            folder_id, _ = await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path)
+
+            r = await client.get(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
+                headers=hdrs,
+            )
+            r.raise_for_status()
+            items = [i for i in r.json().get("data", []) if i["type"] == "items"]
+            name_lower = file_name.lower()
+            match = next(
+                (i for i in items if (i["attributes"].get("displayName") or "").lower() == name_lower),
+                None,
+            )
+            if match is None:
+                available = [i["attributes"].get("displayName") for i in items]
+                raise ValueError(
+                    f"File '{file_name}' not found in '{folder_path}'. Available files: {available}"
+                )
+
+            item_id = match["id"]
+            tip_version_id = (
+                match.get("relationships", {}).get("tip", {}).get("data", {}).get("id")
+            )
+            if not tip_version_id:
+                # Fallback: fetch the item directly
+                item_r = await client.get(
+                    f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}",
+                    headers=hdrs,
+                )
+                item_r.raise_for_status()
+                tip_version_id = (
+                    item_r.json().get("data", {})
+                    .get("relationships", {}).get("tip", {}).get("data", {}).get("id")
+                )
+            if not tip_version_id:
+                raise ValueError(f"Could not determine tip version for '{file_name}'.")
+
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "versions",
+                    "attributes": {
+                        "name": new_name,
+                        "extension": {"version": "1.0"},
+                    },
+                    "relationships": {
+                        "item": {"data": {"type": "items", "id": item_id}},
+                    },
+                },
+            }
+            post_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.post(
+                f"{APS_BASE}/data/v1/projects/{project_id}/versions",
+                headers=post_hdrs,
+                params={"copyFrom": tip_version_id},
+                json=payload,
+            )
+            if not r.is_success:
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+
+            resp_data = r.json().get("data", {})
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "item_id": item_id,
+                "old_name": file_name,
+                "new_name": new_name,
+                "new_version_id": resp_data.get("id"),
                 "status": "renamed",
             }, indent=2))]
 
