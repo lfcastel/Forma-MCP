@@ -114,6 +114,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `list_projects` | List all projects in a hub | 3-legged |
 | `list_top_folders` | List top-level folders in a project | 3-legged |
 | `list_folder_contents` | List files and subfolders at a given path | 3-legged |
+| `rename_folder` | Rename a folder by its display-name path | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
 | `find_recent_activity` | Show files modified since a given date | 3-legged |
 
@@ -171,6 +172,7 @@ flowchart LR
         T2(list_projects)
         T3(list_top_folders)
         T4(list_folder_contents)
+        T20(rename_folder)
         T5(find_recent_activity)
         T6(find_files)
     end
@@ -216,11 +218,13 @@ flowchart LR
     E14["POST /construction/admin/v2/projects/{p}/users:import"]
     E15["PATCH /construction/admin/v1/projects/{p}/users/{u}"]
     E16["DELETE /construction/admin/v1/projects/{p}/users/{u}"]
+    E17["PATCH /data/v1/projects/{p}/folders/{f}"]
 
     T1 --> E1
     T2 --> E2
     T3 --> E3
     T4 --> E4
+    T20 --> E17
     T5 --> E4
     T6 --> E4
 
@@ -245,10 +249,10 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
     class E10,E11,E12,E14 post
-    class E15 patch
+    class E15,E17 patch
     class E16 del
 ```
 
@@ -333,9 +337,8 @@ Released under the [Creative Commons Zero v1.0 Universal](https://creativecommon
 
 ```
 forma-mcp/
-├── aps_mcp.py          # MCP server — 19 tools
+├── aps_mcp.py          # MCP server — 20 tools
 ├── requirements.txt
-└── tests/
-    ├── conftest.py
-    └── test_bulk_tools.py
+├── README.md
+└── .gitignore
 ```
