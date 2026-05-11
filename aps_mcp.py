@@ -577,6 +577,28 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="rename_folder",
+            description=(
+                "Rename a single folder in an ACC project. "
+                "folder_path is the slash-separated display-name path to the folder to rename, "
+                "e.g. 'Project Files/Drawings/Old Name'. "
+                "Returns folder_id, old_name, and new_name on success."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the folder, e.g. 'Project Files/Drawings/My Folder'.",
+                    },
+                    "new_name": {"type": "string", "description": "New display name for the folder."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "folder_path", "new_name"],
+            },
+        ),
+        Tool(
             name="list_project_members",
             description=(
                 "List all members of an ACC project with their roles and companies. "
@@ -1004,6 +1026,48 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "path": folder_path,
                 "folders": [_fmt_folder(i) for i in items if i["type"] == "folders"],
                 "files": [_fmt_item(i) for i in items if i["type"] == "items"],
+            }, indent=2))]
+
+        if name == "rename_folder":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+            )
+            folder_path = arguments["folder_path"]
+            new_name = arguments["new_name"].strip()
+            if not new_name:
+                raise ValueError("new_name cannot be empty.")
+
+            folder_id, old_name = await _resolve_folder_with_hub(
+                client, token, hub_id, project_id, folder_path
+            )
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "folders",
+                    "id": folder_id,
+                    "attributes": {"name": new_name},
+                },
+            }
+            patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.patch(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}",
+                headers=patch_hdrs,
+                json=payload,
+            )
+            if not r.is_success:
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "folder_id": folder_id,
+                "old_name": old_name,
+                "new_name": new_name,
+                "status": "renamed",
             }, indent=2))]
 
         if name == "list_project_members":

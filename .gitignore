@@ -16,6 +16,9 @@ CLAUDE.md
 tests/
 pytest.ini
 
+# Local work tracking
+todo.md
+
 # Archived / scratch files
 archive/
 
