@@ -328,6 +328,28 @@ async def _resolve_folder_with_hub(
     return current_id, current_name
 
 
+async def _resolve_folder(
+    client: "httpx.AsyncClient",
+    token: str,
+    hub_id: str,
+    project_id: str,
+    folder_path_or_urn: str,
+) -> tuple[str, str]:
+    """Resolve a display-name path or a raw folder URN to (folder_id, folder_name).
+    URNs (starting with 'urn:') skip path traversal entirely with a single GET.
+    """
+    if folder_path_or_urn.startswith("urn:"):
+        r = await client.get(
+            f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_path_or_urn}",
+            headers=auth_headers(token),
+        )
+        r.raise_for_status()
+        attrs = r.json().get("data", {}).get("attributes", {})
+        name = attrs.get("displayName") or attrs.get("name") or folder_path_or_urn
+        return folder_path_or_urn, name
+    return await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path_or_urn)
+
+
 # ---------------------------------------------------------------------------
 # Formatters
 # ---------------------------------------------------------------------------
@@ -570,7 +592,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string"},
-                    "folder_path": {"type": "string", "description": "e.g. 'Project Files/Drawings'"},
+                    "folder_path": {"type": "string", "description": "Slash-separated path e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path"],
@@ -590,7 +612,7 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "folder_path": {
                         "type": "string",
-                        "description": "Slash-separated path to the folder, e.g. 'Project Files/Drawings/My Folder'.",
+                        "description": "Slash-separated path e.g. 'Project Files/Drawings/My Folder', or a raw folder URN for faster resolution.",
                     },
                     "new_name": {"type": "string", "description": "New display name for the folder."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
@@ -614,13 +636,53 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "folder_path": {
                         "type": "string",
-                        "description": "Slash-separated path to the folder containing the file.",
+                        "description": "Slash-separated path to the folder containing the file, or a raw folder URN for faster resolution.",
                     },
                     "file_name": {"type": "string", "description": "Current display name of the file."},
                     "new_name": {"type": "string", "description": "New display name for the file."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path", "file_name", "new_name"],
+            },
+        ),
+        Tool(
+            name="find_folder",
+            description=(
+                "Search for folders by name (substring, case-insensitive) across a project. "
+                "Optionally limit the search to a starting folder_path. "
+                "Returns matching folder names, full paths, and IDs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "query": {"type": "string", "description": "Folder name substring to search for."},
+                    "folder_path": {"type": "string", "description": "Limit search to this folder and its descendants (optional). Accepts a slash-separated path or a raw folder URN."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "query"],
+            },
+        ),
+        Tool(
+            name="create_folder",
+            description=(
+                "Create a new folder inside an existing parent folder in an ACC project. "
+                "parent_folder_path is the slash-separated path to the folder that will contain "
+                "the new folder, e.g. 'Project Files/Drawings'. "
+                "Returns the new folder_id and name on success."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "parent_folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the parent folder, e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution.",
+                    },
+                    "folder_name": {"type": "string", "description": "Name for the new folder."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "parent_folder_path", "folder_name"],
             },
         ),
         Tool(
@@ -680,7 +742,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "project_name": {"type": "string"},
                     "query": {"type": "string", "description": "Filename substring"},
-                    "folder_path": {"type": "string", "description": "Limit to this folder (optional)"},
+                    "folder_path": {"type": "string", "description": "Limit search to this folder (optional). Accepts a slash-separated path or a raw folder URN."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name", "query"],
@@ -738,7 +800,7 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "folder_path": {
                         "type": "string",
-                        "description": "Root folder to scan, e.g. 'Project Files/20_SHARED_Extern'.",
+                        "description": "Root folder to scan, e.g. 'Project Files/20_SHARED_Extern', or a raw folder URN for faster resolution.",
                     },
                     "max_depth": {
                         "type": "integer",
@@ -1039,7 +1101,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "list_folder_contents":
             hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
             folder_path = arguments["folder_path"]
-            folder_id, _ = await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path)
+            folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
             res = await client.get(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
                 headers=hdrs,
@@ -1062,7 +1124,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not new_name:
                 raise ValueError("new_name cannot be empty.")
 
-            folder_id, old_name = await _resolve_folder_with_hub(
+            folder_id, old_name = await _resolve_folder(
                 client, token, hub_id, project_id, folder_path
             )
             payload = {
@@ -1105,7 +1167,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not new_name:
                 raise ValueError("new_name cannot be empty.")
 
-            folder_id, _ = await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path)
+            folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
 
             r = await client.get(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
@@ -1179,6 +1241,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "new_name": new_name,
                 "new_version_id": resp_data.get("id"),
                 "status": "renamed",
+            }, indent=2))]
+
+        if name == "create_folder":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+            )
+            parent_path = arguments["parent_folder_path"]
+            folder_name = arguments["folder_name"].strip()
+            if not folder_name:
+                raise ValueError("folder_name cannot be empty.")
+
+            parent_id, _ = await _resolve_folder(client, token, hub_id, project_id, parent_path)
+
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "folders",
+                    "attributes": {
+                        "name": folder_name,
+                        "displayName": folder_name,
+                        "extension": {
+                            "type": "folders:autodesk.bim360:Folder",
+                            "version": "1.0",
+                        },
+                    },
+                    "relationships": {
+                        "parent": {"data": {"type": "folders", "id": parent_id}},
+                    },
+                },
+            }
+            post_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.post(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders",
+                headers=post_hdrs,
+                json=payload,
+            )
+            if not r.is_success:
+                try:
+                    body = r.json()
+                except Exception:
+                    body = r.text
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+
+            new_folder = r.json().get("data", {})
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "parent_folder_id": parent_id,
+                "folder_id": new_folder.get("id"),
+                "folder_name": folder_name,
+                "status": "created",
             }, indent=2))]
 
         if name == "list_project_members":
@@ -1325,7 +1439,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             folder_path = arguments.get("folder_path")
 
             if folder_path:
-                folder_id, _ = await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path)
+                folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
                 start_folders = [{"id": folder_id, "attributes": {"displayName": folder_path}}]
             else:
                 res = await client.get(
@@ -1370,6 +1484,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({
                 "project": resolved_name, "query": query,
                 "result_count": len(results), "files": results,
+            }, indent=2))]
+
+        if name == "find_folder":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+            )
+            query = arguments["query"].lower()
+            folder_path = arguments.get("folder_path")
+
+            if folder_path:
+                folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
+                start_folders = [{"id": folder_id, "attributes": {"displayName": folder_path}}]
+            else:
+                res = await client.get(
+                    f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
+                    headers=hdrs,
+                )
+                res.raise_for_status()
+                start_folders = res.json().get("data", [])
+
+            results: list[dict] = []
+
+            async def search_folders(folder_id: str, path: str, depth: int = 0):
+                if depth > 8:
+                    return
+                r = await client.get(
+                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
+                    headers=hdrs,
+                )
+                if r.status_code != 200:
+                    return
+                tasks = []
+                for item in r.json().get("data", []):
+                    if item["type"] != "folders":
+                        continue
+                    display_name = item["attributes"].get("displayName", "")
+                    item_path = f"{path}/{display_name}"
+                    if query in display_name.lower():
+                        results.append({
+                            "name": display_name,
+                            "path": item_path,
+                            "id": item["id"],
+                        })
+                    tasks.append(search_folders(item["id"], item_path, depth + 1))
+                await asyncio.gather(*tasks)
+
+            await asyncio.gather(*[
+                search_folders(f["id"], f["attributes"]["displayName"]) for f in start_folders
+            ])
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name, "query": query,
+                "result_count": len(results), "folders": results,
             }, indent=2))]
 
         if name == "list_project_roles":
@@ -1447,7 +1613,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_depth = int(arguments.get("max_depth", 2))
             bare_id = project_id.removeprefix("b.")
 
-            folder_id, _ = await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path)
+            folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
             folder_data = await _walk_folder_tree(
                 client, project_id, bare_id, folder_id, folder_path, hdrs, max_depth
             )

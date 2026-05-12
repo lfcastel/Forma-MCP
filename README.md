@@ -116,7 +116,9 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `list_folder_contents` | List files and subfolders at a given path | 3-legged |
 | `rename_folder` | Rename a folder by its display-name path | 3-legged |
 | `rename_file` | Rename a file by creating a new version (no re-upload) | 3-legged |
+| `create_folder` | Create a new folder inside an existing parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
+| `find_folder` | Search for folders by name across a project | 3-legged |
 | `find_recent_activity` | Show files modified since a given date | 3-legged |
 
 ### User & member management
@@ -175,8 +177,10 @@ flowchart LR
         T4(list_folder_contents)
         T20(rename_folder)
         T21(rename_file)
+        T22(create_folder)
         T5(find_recent_activity)
         T6(find_files)
+        T23(find_folder)
     end
 
     subgraph UMEM["User & Member Info · 3-legged + 2-legged"]
@@ -222,6 +226,7 @@ flowchart LR
     E16["DELETE /construction/admin/v1/projects/{p}/users/{u}"]
     E17["PATCH /data/v1/projects/{p}/folders/{f}"]
     E18["POST /data/v1/projects/{p}/versions?copyFrom=..."]
+    E19["POST /data/v1/projects/{p}/folders"]
 
     T1 --> E1
     T2 --> E2
@@ -229,8 +234,10 @@ flowchart LR
     T4 --> E4
     T20 --> E17
     T21 --> E18
+    T22 --> E19
     T5 --> E4
     T6 --> E4
+    T23 --> E4
 
     T7 --> E5
     T7 --> E6
@@ -253,9 +260,9 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
-    class E10,E11,E12,E14,E18 post
+    class E10,E11,E12,E14,E18,E19 post
     class E15,E17 patch
     class E16 del
 ```
@@ -341,7 +348,7 @@ Released under the [Creative Commons Zero v1.0 Universal](https://creativecommon
 
 ```
 forma-mcp/
-├── aps_mcp.py          # MCP server — 21 tools
+├── aps_mcp.py          # MCP server — 23 tools
 ├── requirements.txt
 ├── README.md
 └── .gitignore
