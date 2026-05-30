@@ -55,6 +55,17 @@ Located in `tests/`. Uses `respx` for HTTP mocking and `unittest.mock.patch` to 
 
 - `README.md` — Setup, OAuth app registration, Claude Code config snippet, tools reference table, and Mermaid flowchart of all tools with API endpoints and auth modes
 
+## Public Repo — Sensitive Data Check
+
+This repository is **publicly visible**. Before committing or helping stage any file, verify it contains no sensitive data. Block and warn if any of the following are detected:
+
+- **Credentials / secrets** — API keys, client secrets, tokens, passwords (including in `.env` files or any file not in `.gitignore`)
+- **Real user data** — names, email addresses, or user IDs of actual people
+- **Real Autodesk IDs** — hub IDs, project IDs, folder URNs, or account IDs that belong to a live environment
+- **Internal URLs or hostnames** — ACC project links, internal dashboard URLs, VPN hostnames
+
+The safe list (fake/placeholder data in tests, public API base URLs like `developer.api.autodesk.com`) is fine to commit. When in doubt, ask before staging.
+
 ## Documentation Maintenance
 
 After **any** code change that impacts user-facing behaviour, update `README.md` before finishing. This includes, but is not limited to:
