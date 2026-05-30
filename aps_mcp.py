@@ -96,8 +96,15 @@ def _wait_for_callback() -> str:
     return received["code"]
 
 
+def _get_basic_auth_header() -> str:
+    """Build the Basic auth header value for client_credentials flows."""
+    return base64.b64encode(
+        f"{APS_CLIENT_ID}:{APS_CLIENT_SECRET}".encode()
+    ).decode()
+
+
 async def _exchange_code(code: str) -> dict:
-    creds = base64.b64encode(f"{APS_CLIENT_ID}:{APS_CLIENT_SECRET}".encode()).decode()
+    creds = _get_basic_auth_header()
     async with httpx.AsyncClient() as client:
         res = await client.post(
             f"{APS_BASE}/authentication/v2/token",
@@ -116,7 +123,7 @@ async def _exchange_code(code: str) -> dict:
 
 
 async def _refresh_tokens(refresh_token: str) -> dict:
-    creds = base64.b64encode(f"{APS_CLIENT_ID}:{APS_CLIENT_SECRET}".encode()).decode()
+    creds = _get_basic_auth_header()
     async with httpx.AsyncClient() as client:
         res = await client.post(
             f"{APS_BASE}/authentication/v2/token",
@@ -181,6 +188,34 @@ def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _to_bare_id(aps_id: str) -> str:
+    """Strip the 'b.' prefix from APS hub/project IDs."""
+    return aps_id.removeprefix("b.")
+
+
+def _extract_response_items(data: "Any") -> list:
+    """Extract an item list from APS responses that use 'results', 'data', or bare lists."""
+    if isinstance(data, list):
+        return data
+    return data.get("results", data.get("data", []))
+
+
+def _norm_emails(emails: list[str]) -> list[str]:
+    return [e.lower().strip() for e in emails]
+
+
+def _norm_region(arguments: dict) -> str:
+    return (arguments.get("region") or "EMEA").strip().upper()
+
+
+def _error_body(r: "httpx.Response") -> "Any":
+    """Return parsed JSON from a response, falling back to raw text."""
+    try:
+        return r.json()
+    except Exception:
+        return r.text
+
+
 # ---------------------------------------------------------------------------
 # 2-legged OAuth (app-only endpoints like HQ account users)
 # ---------------------------------------------------------------------------
@@ -194,7 +229,7 @@ async def get_app_token() -> str:
     if _app_token_cache["token"] and now < _app_token_cache["expires_at"] - 60:
         return _app_token_cache["token"]
 
-    creds = base64.b64encode(f"{APS_CLIENT_ID}:{APS_CLIENT_SECRET}".encode()).decode()
+    creds = _get_basic_auth_header()
     async with httpx.AsyncClient() as client:
         res = await client.post(
             f"{APS_BASE}/authentication/v2/token",
@@ -224,7 +259,7 @@ async def get_all_pages(
     offset = 0
     while True:
         params["offset"] = offset
-        res = await client.get(url, headers=headers, params=params)
+        res = await _request_with_retry(client, "get", url, headers=headers, params=params)
         res.raise_for_status()
         body = res.json()
         data = body.get("data") or body.get("results") or []
@@ -238,11 +273,34 @@ async def get_all_pages(
     return items
 
 
+async def _request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    max_retries: int = 5,
+    **kwargs,
+) -> httpx.Response:
+    """Issue an HTTP request and retry on 429 using Retry-After or exponential backoff."""
+    for attempt in range(max_retries + 1):
+        r = await getattr(client, method)(url, **kwargs)
+        if r.status_code != 429 or attempt == max_retries:
+            return r
+        wait = int(r.headers.get("Retry-After", min(2 ** attempt, 60)))
+        await asyncio.sleep(wait)
+    return r
+
+
 # ---------------------------------------------------------------------------
 # Name → ID resolver layer
 # ---------------------------------------------------------------------------
 
-async def resolve_hub(client: httpx.AsyncClient, token: str, region: str = "EMEA") -> tuple[str, str]:
+async def resolve_hub(
+    client: httpx.AsyncClient,
+    token: str,
+    region: str = "EMEA",
+    hub_name: str | None = None,
+) -> tuple[str, str]:
     res = await client.get(f"{APS_BASE}/project/v1/hubs", headers=auth_headers(token))
     res.raise_for_status()
     hubs = res.json().get("data", [])
@@ -253,15 +311,30 @@ async def resolve_hub(client: httpx.AsyncClient, token: str, region: str = "EMEA
     if not matched:
         available = [(h["attributes"]["name"], h["attributes"].get("region")) for h in hubs]
         raise ValueError(f"No {region_upper} hub found. Available hubs: {available}")
-    hub = matched[0]
+    if hub_name:
+        hub_name_lower = hub_name.lower()
+        exact = [h for h in matched if h["attributes"]["name"].lower() == hub_name_lower]
+        partial = [h for h in matched if hub_name_lower in h["attributes"]["name"].lower()]
+        name_matched = exact or partial
+        if not name_matched:
+            available_names = [h["attributes"]["name"] for h in matched]
+            raise ValueError(f"Hub '{hub_name}' not found in {region_upper}. Available: {available_names}")
+        hub = name_matched[0]
+    else:
+        hub = matched[0]
     return hub["id"], hub["attributes"]["name"]
 
 
 async def resolve_project(
-    client: httpx.AsyncClient, token: str, project_name: str, hub_id: str | None = None, region: str = "EMEA"
+    client: httpx.AsyncClient,
+    token: str,
+    project_name: str,
+    hub_id: str | None = None,
+    region: str = "EMEA",
+    hub_name: str | None = None,
 ) -> tuple[str, str, str]:
     if hub_id is None:
-        hub_id, _ = await resolve_hub(client, token, region)
+        hub_id, _ = await resolve_hub(client, token, region, hub_name=hub_name)
 
     projects = await get_all_pages(
         client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", auth_headers(token)
@@ -307,23 +380,25 @@ async def _resolve_folder_with_hub(
         raise ValueError("folder_path cannot be empty.")
 
     current_id = current_name = None
-    for part in parts:
+    for i, part in enumerate(parts):
         part_lower = part.lower()
         match = next(
-            (f for f in current_items if f["attributes"]["displayName"].lower() == part_lower),
+            (f for f in current_items if (f["attributes"].get("displayName") or f["attributes"].get("name", "")).lower() == part_lower),
             None,
         )
         if match is None:
-            available = [f["attributes"]["displayName"] for f in current_items]
+            available = [f["attributes"].get("displayName") or f["attributes"].get("name", "") for f in current_items]
             raise ValueError(f"Folder '{part}' not found. Available: {available}")
         current_id = match["id"]
-        current_name = match["attributes"]["displayName"]
-        res = await client.get(
-            f"{APS_BASE}/data/v1/projects/{project_id}/folders/{current_id}/contents",
-            headers=hdrs,
-        )
-        res.raise_for_status()
-        current_items = [i for i in res.json().get("data", []) if i["type"] == "folders"]
+        current_name = match["attributes"].get("displayName") or match["attributes"].get("name", "")
+        if i < len(parts) - 1:
+            res = await client.get(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{current_id}/contents",
+                headers=hdrs,
+                params={"page[limit]": 200},
+            )
+            res.raise_for_status()
+            current_items = [x for x in res.json().get("data", []) if x["type"] == "folders"]
 
     return current_id, current_name
 
@@ -348,6 +423,28 @@ async def _resolve_folder(
         name = attrs.get("displayName") or attrs.get("name") or folder_path_or_urn
         return folder_path_or_urn, name
     return await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path_or_urn)
+
+
+async def _subtree_has_files(
+    client: httpx.AsyncClient,
+    project_id: str,
+    folder_id: str,
+    hdrs: dict,
+) -> bool:
+    """Return True if any files (items) exist anywhere in the folder's subtree."""
+    contents = await get_all_pages(
+        client,
+        f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
+        hdrs,
+    )
+    for item in contents:
+        if item["type"] == "items":
+            return True
+    for item in contents:
+        if item["type"] == "folders":
+            if await _subtree_has_files(client, project_id, item["id"], hdrs):
+                return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +478,7 @@ def _fmt_item(i: dict) -> dict:
 async def _get_folder_perms(
     client: httpx.AsyncClient, project_id: str, folder_id: str, hdrs: dict
 ) -> list[dict]:
-    bare_project_id = project_id.removeprefix("b.")
+    bare_project_id = _to_bare_id(project_id)
     r = await client.get(
         f"{APS_BASE}/bim360/docs/v1/projects/{bare_project_id}/folders/{folder_id}/permissions",
         headers=hdrs,
@@ -408,7 +505,8 @@ async def _walk_folder_tree(
     if depth >= max_depth:
         return results
 
-    r = await client.get(
+    r = await _request_with_retry(
+        client, "get",
         f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
         headers=hdrs,
         params={"page[limit]": 200},
@@ -434,7 +532,7 @@ async def _fetch_project_roles(
     client: httpx.AsyncClient, project_id: str, hdrs: dict
 ) -> dict[str, str]:
     """Return a role_id → role_name map by paging GET construction/admin/v1/projects/{projectId}/users."""
-    bare_id = project_id.removeprefix("b.")
+    bare_id = _to_bare_id(project_id)
     role_map: dict[str, str] = {}
     params: dict = {"limit": 200, "offset": 0}
     while True:
@@ -446,7 +544,7 @@ async def _fetch_project_roles(
         if not r.is_success:
             break
         data = r.json()
-        users = data if isinstance(data, list) else data.get("results", data.get("data", []))
+        users = _extract_response_items(data)
         for user in users:
             for role in user.get("roles", []):
                 rid = role.get("id", "")
@@ -467,7 +565,7 @@ async def _get_project_members_map(
     client: httpx.AsyncClient, project_id: str, hdrs: dict
 ) -> dict[str, dict]:
     """Return email.lower() → user dict for all members (Admin API)."""
-    bare_id = project_id.removeprefix("b.")
+    bare_id = _to_bare_id(project_id)
     members: dict[str, dict] = {}
     params: dict = {"limit": 200, "offset": 0}
     while True:
@@ -479,7 +577,7 @@ async def _get_project_members_map(
         if not r.is_success:
             break
         data = r.json()
-        users = data.get("results", data.get("data", []))
+        users = _extract_response_items(data)
         for u in users:
             email = (u.get("email") or "").lower()
             if email:
@@ -527,12 +625,11 @@ def _resolve_role_id(role_name: str, role_map: dict[str, str]) -> str | None:
 
 
 def _write_audit_csv(rows: list[dict], operation: str) -> str:
-    """Write audit rows to a timestamped CSV next to this script. Returns file path."""
+    """Write audit rows to a timestamped CSV in the audit_logs/ folder. Returns file path."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        f"audit_{operation}_{timestamp}.csv",
-    )
+    audit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_logs")
+    os.makedirs(audit_dir, exist_ok=True)
+    filepath = os.path.join(audit_dir, f"audit_{operation}_{timestamp}.csv")
     if rows:
         with open(filepath, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -562,7 +659,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "hub_id": {"type": "string", "description": "Hub ID (b.xxxx). Omit to use first hub."},
+                    "hub_id": {"type": "string", "description": "Hub ID (b.xxxx). Omit to use hub_name or first hub."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
             },
@@ -577,6 +675,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string", "description": "Project name (partial match ok)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -593,6 +692,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "project_name": {"type": "string"},
                     "folder_path": {"type": "string", "description": "Slash-separated path e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path"],
@@ -615,6 +715,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Slash-separated path e.g. 'Project Files/Drawings/My Folder', or a raw folder URN for faster resolution.",
                     },
                     "new_name": {"type": "string", "description": "New display name for the folder."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path", "new_name"],
@@ -640,6 +741,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "file_name": {"type": "string", "description": "Current display name of the file."},
                     "new_name": {"type": "string", "description": "New display name for the file."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path", "file_name", "new_name"],
@@ -658,6 +760,7 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "query": {"type": "string", "description": "Folder name substring to search for."},
                     "folder_path": {"type": "string", "description": "Limit search to this folder and its descendants (optional). Accepts a slash-separated path or a raw folder URN."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "query"],
@@ -680,9 +783,36 @@ async def list_tools() -> list[Tool]:
                         "description": "Slash-separated path to the parent folder, e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution.",
                     },
                     "folder_name": {"type": "string", "description": "Name for the new folder."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "parent_folder_path", "folder_name"],
+            },
+        ),
+        Tool(
+            name="delete_folder",
+            description=(
+                "Soft-delete (hide) a folder in an ACC project by setting hidden=true. "
+                "ACC does not permanently delete folders — this is reversible by an admin. "
+                "Refuses to delete if any files exist anywhere in the folder's subtree. "
+                "Set dry_run=true (default) to preview without making changes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path e.g. 'Project Files/Drawings/Old Folder', or a raw folder URN.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), preview without making changes.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "folder_path"],
             },
         ),
         Tool(
@@ -695,6 +825,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -710,6 +841,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
             },
@@ -726,6 +858,7 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "since_date": {"type": "string", "description": "YYYY-MM-DD, defaults to 7 days ago"},
                     "limit": {"type": "integer", "description": "Max items (default 50)"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -743,6 +876,7 @@ async def list_tools() -> list[Tool]:
                     "project_name": {"type": "string"},
                     "query": {"type": "string", "description": "Filename substring"},
                     "folder_path": {"type": "string", "description": "Limit search to this folder (optional). Accepts a slash-separated path or a raw folder URN."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
                 "required": ["project_name", "query"],
@@ -760,6 +894,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -775,6 +910,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -806,6 +942,7 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Folder levels to scan below the root (default 2).",
                     },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name", "folder_path"],
@@ -830,6 +967,7 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "Send completion email. Default: true.",
                     },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_name"],
@@ -849,6 +987,7 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                     "request_id": {
                         "type": "string",
@@ -870,6 +1009,7 @@ async def list_tools() -> list[Tool]:
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "changes": {
                         "type": "array",
                         "description": "Permission changes to apply.",
@@ -932,6 +1072,7 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true (default), return a preview without making any changes.",
                     },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_names", "user_emails"],
@@ -964,6 +1105,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Per-project role map: {\"Project A\": \"Admin\"}.",
                     },
                     "dry_run": {"type": "boolean"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_names", "user_emails", "default_role"],
@@ -989,6 +1131,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Projects to remove users from. Empty list = all projects they are members of.",
                     },
                     "dry_run": {"type": "boolean"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["user_emails"],
@@ -1015,6 +1158,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Emails of users who should receive the same access.",
                     },
                     "dry_run": {"type": "boolean"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["reference_user_email", "target_user_emails"],
@@ -1047,6 +1191,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional: restrict to these emails within the company.",
                     },
                     "dry_run": {"type": "boolean"},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["company_name", "project_names", "default_role"],
@@ -1080,14 +1225,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "list_projects":
             hub_id = arguments.get("hub_id")
             if hub_id is None:
-                hub_id, _ = await resolve_hub(client, token, arguments.get("region", "EMEA"))
+                hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
             projects = await get_all_pages(
                 client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
             )
             return [TextContent(type="text", text=json.dumps([_fmt_project(p) for p in projects], indent=2))]
 
         if name == "list_top_folders":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
+            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
             res = await client.get(
                 f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
                 headers=hdrs,
@@ -1099,12 +1244,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_folder_contents":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
+            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
             folder_path = arguments["folder_path"]
             folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
             res = await client.get(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
                 headers=hdrs,
+                params={"page[limit]": 200},
             )
             res.raise_for_status()
             items = res.json().get("data", [])
@@ -1117,7 +1263,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "rename_folder":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             folder_path = arguments["folder_path"]
             new_name = arguments["new_name"].strip()
@@ -1142,10 +1288,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 json=payload,
             )
             if not r.is_success:
-                try:
-                    body = r.json()
-                except Exception:
-                    body = r.text
+                body = _error_body(r)
                 return [TextContent(type="text", text=json.dumps({
                     "error": r.status_code, "body": body,
                 }, indent=2))]
@@ -1159,7 +1302,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "rename_file":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             folder_path = arguments["folder_path"]
             file_name = arguments["file_name"].strip()
@@ -1225,10 +1368,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 json=payload,
             )
             if not r.is_success:
-                try:
-                    body = r.json()
-                except Exception:
-                    body = r.text
+                body = _error_body(r)
                 return [TextContent(type="text", text=json.dumps({
                     "error": r.status_code, "body": body,
                 }, indent=2))]
@@ -1245,7 +1385,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "create_folder":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             parent_path = arguments["parent_folder_path"]
             folder_name = arguments["folder_name"].strip()
@@ -1278,10 +1418,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 json=payload,
             )
             if not r.is_success:
-                try:
-                    body = r.json()
-                except Exception:
-                    body = r.text
+                body = _error_body(r)
                 return [TextContent(type="text", text=json.dumps({
                     "error": r.status_code, "body": body,
                 }, indent=2))]
@@ -1295,10 +1432,71 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "status": "created",
             }, indent=2))]
 
+        if name == "delete_folder":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            folder_path = arguments["folder_path"]
+            dry_run = arguments.get("dry_run", True)
+
+            folder_id, folder_name = await _resolve_folder(
+                client, token, hub_id, project_id, folder_path
+            )
+
+            has_files = await _subtree_has_files(client, project_id, folder_id, hdrs)
+
+            if dry_run:
+                return [TextContent(type="text", text=json.dumps({
+                    "dry_run": True,
+                    "project": resolved_name,
+                    "folder_id": folder_id,
+                    "folder_name": folder_name,
+                    "has_files_in_subtree": has_files,
+                    "would_delete": not has_files,
+                    "message": (
+                        "Folder cannot be deleted: files exist in its subtree."
+                        if has_files else
+                        "Folder is empty and can be deleted. Set dry_run=false to proceed."
+                    ),
+                }, indent=2))]
+
+            if has_files:
+                raise ValueError(
+                    f"Refusing to delete '{folder_name}': files exist in its subtree. "
+                    "Remove all files first, then retry."
+                )
+
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "folders",
+                    "id": folder_id,
+                    "attributes": {"hidden": True},
+                },
+            }
+            patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.patch(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}",
+                headers=patch_hdrs,
+                json=payload,
+            )
+            if not r.is_success:
+                body = _error_body(r)
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "folder_id": folder_id,
+                "folder_name": folder_name,
+                "status": "deleted",
+                "note": "Folder is hidden (soft-deleted). It can be restored by an ACC admin.",
+            }, indent=2))]
+
         if name == "list_project_members":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
-            proj_id_clean = project_id.lstrip("b.")
-            account_id = hub_id.lstrip("b.")
+            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            proj_id_clean = _to_bare_id(project_id)
+            account_id = _to_bare_id(hub_id)
 
             # Fetch project members (3-legged) and account users (2-legged) in parallel
             app_token = await get_app_token()
@@ -1344,8 +1542,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_account_users":
-            hub_id, _ = await resolve_hub(client, token, arguments.get("region", "EMEA"))
-            account_id = hub_id.lstrip("b.")
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
             app_token = await get_app_token()
             # HQ API returns a plain array (not wrapped in {"data": []}), max limit 100
             users = []
@@ -1382,7 +1580,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "find_recent_activity":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
+            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
             limit = int(arguments.get("limit", 50))
             since_raw = arguments.get("since_date")
             since_dt = (
@@ -1394,9 +1592,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             async def collect_recent(folder_id: str, collected: list, depth: int = 0):
                 if len(collected) >= limit or depth > 6:
                     return
-                r = await client.get(
+                r = await _request_with_retry(
+                    client, "get",
                     f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
                     headers=hdrs,
+                    params={"page[limit]": 200},
                 )
                 if r.status_code != 200:
                     return
@@ -1434,7 +1634,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "find_files":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=arguments.get("region", "EMEA"))
+            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
             query = arguments["query"].lower()
             folder_path = arguments.get("folder_path")
 
@@ -1454,9 +1654,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             async def search_folder(folder_id: str, path: str, depth: int = 0):
                 if depth > 8:
                     return
-                r = await client.get(
+                r = await _request_with_retry(
+                    client, "get",
                     f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
                     headers=hdrs,
+                    params={"page[limit]": 200},
                 )
                 if r.status_code != 200:
                     return
@@ -1488,7 +1690,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "find_folder":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             query = arguments["query"].lower()
             folder_path = arguments.get("folder_path")
@@ -1509,9 +1711,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             async def search_folders(folder_id: str, path: str, depth: int = 0):
                 if depth > 8:
                     return
-                r = await client.get(
+                r = await _request_with_retry(
+                    client, "get",
                     f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
                     headers=hdrs,
+                    params={"page[limit]": 200},
                 )
                 if r.status_code != 200:
                     return
@@ -1540,9 +1744,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "list_project_roles":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
-            bare_id = project_id.removeprefix("b.")
+            bare_id = _to_bare_id(project_id)
             role_map: dict[str, str] = {}
             members = []
             params: dict = {"limit": 200, "offset": 0}
@@ -1555,7 +1759,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if not r.is_success:
                     break
                 data = r.json()
-                users = data.get("results", data.get("data", []))
+                users = _extract_response_items(data)
                 for u in users:
                     for role in u.get("roles", []):
                         rid, rname = role.get("id", ""), role.get("name", "")
@@ -1578,10 +1782,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "list_project_companies":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
-            bare_project_id = project_id.removeprefix("b.")
-            account_id = hub_id.removeprefix("b.")
+            bare_project_id = _to_bare_id(project_id)
+            account_id = _to_bare_id(hub_id)
             app_token = await get_app_token()
             companies = []
             offset = 0
@@ -1593,7 +1797,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
                 r.raise_for_status()
                 page = r.json()
-                batch = page if isinstance(page, list) else page.get("results", [])
+                batch = _extract_response_items(page)
                 for c in batch:
                     companies.append({"company_id": c["id"], "name": c["name"]})
                 if len(batch) < 100:
@@ -1607,11 +1811,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "export_permission_matrix":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             folder_path = arguments["folder_path"]
             max_depth = int(arguments.get("max_depth", 2))
-            bare_id = project_id.removeprefix("b.")
+            bare_id = _to_bare_id(project_id)
 
             folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
             folder_data = await _walk_folder_tree(
@@ -1712,10 +1916,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "create_role_data_export":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
-            account_id = hub_id.removeprefix("b.")
-            bare_project_id = project_id.removeprefix("b.")
+            account_id = _to_bare_id(hub_id)
+            bare_project_id = _to_bare_id(project_id)
             payload = {
                 "description": f"Role export for {resolved_name}",
                 "scheduleInterval": "ONE_TIME",
@@ -1730,10 +1934,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 json=payload,
             )
             if not r.is_success:
-                try:
-                    body = r.json()
-                except Exception:
-                    body = r.text
+                body = _error_body(r)
                 return [TextContent(type="text", text=json.dumps({"error": r.status_code, "body": body}, indent=2))]
             data = r.json()
             return [TextContent(type="text", text=json.dumps({
@@ -1748,8 +1949,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "get_data_connector_requests":
-            hub_id, _ = await resolve_hub(client, token, arguments.get("region", "EMEA"))
-            account_id = hub_id.removeprefix("b.")
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
             request_id = arguments.get("request_id")
 
             async def _poll_for_job(req_id: str) -> dict:
@@ -1834,7 +2035,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "apply_permission_changes":
             hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=arguments.get("region", "EMEA")
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
             )
             changes = arguments["changes"]
 
@@ -1847,7 +2048,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 stype = change.get("subject_type", "COMPANY")
                 actions = change["actions"]
 
-                bare_pid = project_id.removeprefix("b.")
+                bare_pid = _to_bare_id(project_id)
                 if not actions:
                     url = f"{APS_BASE}/bim360/docs/v1/projects/{bare_pid}/folders/{fid}/permissions:batch-delete"
                     payload = [{"subjectId": sid, "subjectType": stype}]
@@ -1862,10 +2063,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "subject_type": stype, "actions": actions,
                     })
                 else:
-                    try:
-                        body = r.json()
-                    except Exception:
-                        body = r.text
+                    body = _error_body(r)
                     errors.append({
                         "folder_id": fid, "subject_id": sid,
                         "error": str(r.status_code), "response": body,
@@ -1888,108 +2086,122 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             default_role: str,
             role_overrides: dict[str, str],
             dry_run: bool,
-        ) -> tuple[list[dict], list[str]]:
+        ) -> tuple[list[dict], list[str], bool]:
             """
             Core assign logic reused by bulk_assign_users, clone_user_access,
             and bulk_assign_company_users.
-            Returns (results, warnings).
+            Returns (results, warnings, api_calls_made).
             NOTE: request body format for users:import may need adjustment
             against the ACC Admin API v1 spec during implementation.
             """
-            results: list[dict] = []
             warnings: list[str] = []
             BATCH = 200
+            sem = asyncio.Semaphore(5)
+            api_calls_made_flag = [False]
 
-            for proj in resolved_projects:
-                pid = proj["id"]
-                pname = proj["name"]
-                role_name = role_overrides.get(pname.lower(), default_role)
+            async def _process_project(proj: dict) -> list[dict]:
+                async with sem:
+                    pid = proj["id"]
+                    pname = proj["name"]
+                    role_name = role_overrides.get(pname.lower(), default_role)
+                    proj_results: list[dict] = []
 
-                role_id: str | None = None
-                if role_name:
-                    role_map = await _fetch_project_roles(client, pid, hdrs)
-                    role_id = _resolve_role_id(role_name, role_map)
-                    if not role_id:
-                        available = list(role_map.values()) or ["(none found — project may have no members yet)"]
+                    role_id: str | None = None
+                    if role_name:
+                        role_map = await _fetch_project_roles(client, pid, hdrs)
+                        role_id = _resolve_role_id(role_name, role_map)
+                        if not role_id:
+                            available = list(role_map.values()) or ["(none found — project may have no members yet)"]
+                            for email in user_emails:
+                                proj_results.append({
+                                    "user": email, "project": pname, "role": role_name,
+                                    "status": "error",
+                                    "message": f"Role '{role_name}' not found. Available: {available}",
+                                })
+                            return proj_results
+
+                    if dry_run:
+                        members = await _get_project_members_map(client, pid, hdrs)
                         for email in user_emails:
-                            results.append({
-                                "user": email, "project": pname, "role": role_name,
-                                "status": "error",
-                                "message": f"Role '{role_name}' not found. Available: {available}",
-                            })
-                        continue
-
-                if dry_run:
-                    for email in user_emails:
-                        results.append({
-                            "user": email, "project": pname, "role": role_name or "(none)",
-                            "status": "would_add",
-                            "message": f"Would add with role '{role_name}'" if role_name else "Would add (no role)",
-                        })
-                    continue
-
-                bare_pid = pid.removeprefix("b.")
-                for i in range(0, len(user_emails), BATCH):
-                    batch = user_emails[i : i + BATCH]
-                    users_payload = []
-                    for email in batch:
-                        entry: dict = {
-                            "email": email,
-                            "products": DEFAULT_PRODUCTS,
-                        }
-                        if role_id:
-                            entry["roleIds"] = [role_id]
-                        users_payload.append(entry)
-
-                    r = await client.post(
-                        f"{APS_BASE}/construction/admin/v2/projects/{bare_pid}/users:import",
-                        headers=hdrs,
-                        json={"users": users_payload, "suppressAdministrativeEmails": False},
-                    )
-                    if r.is_success:
-                        resp = r.json()
-                        items = resp if isinstance(resp, list) else resp.get("results", [])
-                        if items:
-                            for item in items:
-                                email_resp = (item.get("email") or "").lower()
-                                ok = item.get("success", True)
-                                results.append({
-                                    "user": email_resp or "(unknown)",
-                                    "project": pname, "role": role_name or "(none)",
-                                    "status": "success" if ok else "error",
-                                    "message": item.get("message") or item.get("error") or "",
-                                })
-                        else:
-                            for email in batch:
-                                results.append({
+                            if email in members:
+                                proj_results.append({
                                     "user": email, "project": pname, "role": role_name or "(none)",
-                                    "status": "success", "message": "",
+                                    "status": "already_member",
+                                    "message": "Already a member — no change",
                                 })
-                    else:
-                        try:
-                            body = r.json()
-                        except Exception:
-                            body = r.text
-                        for email in batch:
-                            results.append({
-                                "user": email, "project": pname, "role": role_name or "(none)",
-                                "status": "error", "message": f"HTTP {r.status_code}: {body}",
-                            })
+                            else:
+                                proj_results.append({
+                                    "user": email, "project": pname, "role": role_name or "(none)",
+                                    "status": "would_add",
+                                    "message": f"Would add with role '{role_name}'" if role_name else "Would add (no role)",
+                                })
+                        return proj_results
 
-            return results, warnings
+                    bare_pid = _to_bare_id(pid)
+                    for i in range(0, len(user_emails), BATCH):
+                        batch = user_emails[i : i + BATCH]
+                        users_payload = []
+                        for email in batch:
+                            entry: dict = {
+                                "email": email,
+                                "products": DEFAULT_PRODUCTS,
+                            }
+                            if role_id:
+                                entry["roleIds"] = [role_id]
+                            users_payload.append(entry)
+
+                        api_calls_made_flag[0] = True
+                        r = await client.post(
+                            f"{APS_BASE}/construction/admin/v2/projects/{bare_pid}/users:import",
+                            headers=hdrs,
+                            json={"users": users_payload, "suppressAdministrativeEmails": False},
+                        )
+                        if r.is_success:
+                            resp = r.json()
+                            items = _extract_response_items(resp)
+                            if items:
+                                for item in items:
+                                    email_resp = (item.get("email") or "").lower()
+                                    ok = item.get("success", True)
+                                    proj_results.append({
+                                        "user": email_resp or "(unknown)",
+                                        "project": pname, "role": role_name or "(none)",
+                                        "status": "success" if ok else "error",
+                                        "message": item.get("message") or item.get("error") or "",
+                                    })
+                            else:
+                                for email in batch:
+                                    proj_results.append({
+                                        "user": email, "project": pname, "role": role_name or "(none)",
+                                        "status": "success", "message": "",
+                                    })
+                        else:
+                            body = _error_body(r)
+                            for email in batch:
+                                proj_results.append({
+                                    "user": email, "project": pname, "role": role_name or "(none)",
+                                    "status": "error", "message": f"HTTP {r.status_code}: {body}",
+                                })
+                    return proj_results
+
+            gathered = await asyncio.gather(*[_process_project(p) for p in resolved_projects])
+            results: list[dict] = []
+            for proj_results in gathered:
+                results.extend(proj_results)
+            return results, warnings, api_calls_made_flag[0]
 
         # ------------------------------------------------------------------
 
         if name == "bulk_assign_users":
-            region = arguments.get("region", "EMEA")
+            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
             project_names = arguments["project_names"]
-            user_emails = [e.lower().strip() for e in arguments["user_emails"]]
+            user_emails = _norm_emails(arguments["user_emails"])
             default_role = arguments.get("default_role") or ""
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
 
-            hub_id, _ = await resolve_hub(client, token, region)
-            account_id = hub_id.removeprefix("b.")
+            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
 
             resolved_projects: list[dict] = []
             project_errors: list[dict] = []
@@ -2000,19 +2212,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
-            app_token = await get_app_token()
-            account_users = await _get_account_users_map(client, account_id, app_token)
             warnings: list[str] = []
-            for email in user_emails:
-                if email not in account_users:
-                    warnings.append(
-                        f"'{email}' not found in account — will attempt to add (external users may not appear in HQ roster)"
-                    )
+            invalid_email_set: set[str] = set()
+            if resolved_projects:
+                app_token = await get_app_token()
+                account_users = await _get_account_users_map(client, account_id, app_token)
+                for email in user_emails:
+                    if email not in account_users:
+                        invalid_email_set.add(email)
+                        warnings.append(f"'{email}' not found in account roster — skipping")
 
-            results, extra_warnings = await _execute_bulk_assign(
-                resolved_projects, user_emails, default_role, role_overrides, dry_run
+            valid_emails = [e for e in user_emails if e not in invalid_email_set]
+            results, extra_warnings, api_calls_made = await _execute_bulk_assign(
+                resolved_projects, valid_emails, default_role, role_overrides, dry_run
             )
             warnings.extend(extra_warnings)
+
+            for email in invalid_email_set:
+                for proj in resolved_projects:
+                    role_name = role_overrides.get(proj["name"].lower(), default_role)
+                    results.append({
+                        "user": email, "project": proj["name"], "role": role_name,
+                        "status": "error", "message": "Not found in account roster",
+                    })
+
             for pentry in project_errors:
                 role_name = role_overrides.get(pentry["project"].lower(), default_role)
                 for email in user_emails:
@@ -2022,12 +2245,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     })
 
             audit_file = None
-            if not dry_run and results:
+            if not dry_run and api_calls_made:
                 audit_file = _write_audit_csv(results, "bulk_assign")
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "error")
+                for k in ("success", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({
@@ -2037,14 +2260,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "update_user_roles":
-            region = arguments.get("region", "EMEA")
+            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
             project_names = arguments["project_names"]
-            user_emails = [e.lower().strip() for e in arguments["user_emails"]]
+            user_emails = _norm_emails(arguments["user_emails"])
             default_role = arguments["default_role"]
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
 
-            hub_id, _ = await resolve_hub(client, token, region)
+            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
 
             resolved_projects: list[dict] = []
             project_errors: list[dict] = []
@@ -2055,7 +2279,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
+            invalid_email_set: set[str] = set()
+            if resolved_projects:
+                app_token = await get_app_token()
+                account_users = await _get_account_users_map(client, account_id, app_token)
+                for email in user_emails:
+                    if email not in account_users:
+                        invalid_email_set.add(email)
+
+            valid_emails = [e for e in user_emails if e not in invalid_email_set]
+
             results: list[dict] = []
+            for email in invalid_email_set:
+                for proj in resolved_projects:
+                    role_name = role_overrides.get(proj["name"].lower(), default_role)
+                    results.append({
+                        "user": email, "project": proj["name"], "role": role_name,
+                        "status": "error", "message": "Not found in account roster",
+                    })
+
             for pentry in project_errors:
                 role_name = role_overrides.get(pentry["project"].lower(), default_role)
                 for email in user_emails:
@@ -2063,6 +2305,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "user": email, "project": pentry["project"], "role": role_name,
                         "status": "error", "message": f"Project not found: {pentry['project']}",
                     })
+
+            api_calls_made = False
             for proj in resolved_projects:
                 pid = proj["id"]
                 pname = proj["name"]
@@ -2072,7 +2316,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 role_id = _resolve_role_id(role_name, role_map)
                 if not role_id:
                     available = list(role_map.values()) or ["(none found)"]
-                    for email in user_emails:
+                    for email in valid_emails:
                         results.append({
                             "user": email, "project": pname, "role": role_name,
                             "status": "error",
@@ -2081,9 +2325,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
 
                 members = await _get_project_members_map(client, pid, hdrs)
-                bare_pid = pid.removeprefix("b.")
+                bare_pid = _to_bare_id(pid)
 
-                for email in user_emails:
+                for email in valid_emails:
                     member = members.get(email)
                     if not member:
                         results.append({
@@ -2101,14 +2345,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         continue
 
                     if dry_run:
-                        current_role = member.get("roleId") or member.get("role") or "(unknown)"
+                        current_role_id = member.get("roleId") or member.get("role") or ""
+                        current_role_name = role_map.get(current_role_id) or current_role_id or "(unknown)"
                         results.append({
                             "user": email, "project": pname, "role": role_name,
                             "status": "would_update",
-                            "message": f"Would change role from '{current_role}' to '{role_name}'",
+                            "message": f"Would change role from '{current_role_name}' to '{role_name}'",
                         })
                         continue
 
+                    api_calls_made = True
                     r = await client.patch(
                         f"{APS_BASE}/construction/admin/v1/projects/{bare_pid}/users/{user_id}",
                         headers=hdrs,
@@ -2120,17 +2366,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "status": "success", "message": "",
                         })
                     else:
-                        try:
-                            body = r.json()
-                        except Exception:
-                            body = r.text
+                        body = _error_body(r)
                         results.append({
                             "user": email, "project": pname, "role": role_name,
                             "status": "error", "message": f"HTTP {r.status_code}: {body}",
                         })
 
             audit_file = None
-            if not dry_run and results:
+            if not dry_run and api_calls_made:
                 audit_file = _write_audit_csv(results, "update_roles")
 
             summary = {
@@ -2145,12 +2388,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "remove_users_from_projects":
-            region = arguments.get("region", "EMEA")
+            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
-            user_emails = [e.lower().strip() for e in arguments["user_emails"]]
+            user_emails = _norm_emails(arguments["user_emails"])
             project_names = arguments.get("project_names") or []
 
-            hub_id, _ = await resolve_hub(client, token, region)
+            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
 
             resolved_projects_list: list[dict] = []
             project_errors_list: list[dict] = []
@@ -2180,7 +2423,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             for proj in resolved_projects_list:
                 pid = proj["id"]
                 pname = proj["name"]
-                bare_pid = pid.removeprefix("b.")
+                bare_pid = _to_bare_id(pid)
                 members = await _get_project_members_map(client, pid, hdrs)
 
                 for email in user_emails:
@@ -2218,10 +2461,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "status": "success", "message": "Removed",
                         })
                     else:
-                        try:
-                            body = r.json()
-                        except Exception:
-                            body = r.text
+                        body = _error_body(r)
                         results.append({
                             "user": email, "project": pname,
                             "status": "error", "message": f"HTTP {r.status_code}: {body}",
@@ -2243,12 +2483,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "clone_user_access":
-            region = arguments.get("region", "EMEA")
+            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
             ref_email = arguments["reference_user_email"].lower().strip()
-            target_emails = [e.lower().strip() for e in arguments["target_user_emails"]]
+            target_emails = _norm_emails(arguments["target_user_emails"])
 
-            hub_id, _ = await resolve_hub(client, token, region)
+            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
             all_projs = await get_all_pages(
                 client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
             )
@@ -2282,7 +2522,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 # Use the first role; warn below if the user holds multiple roles in a project
                 role_overrides[entry["name"].lower()] = role_names[0] if role_names else "Viewer"
 
-            results, warnings = await _execute_bulk_assign(
+            results, warnings, api_calls_made = await _execute_bulk_assign(
                 ref_project_roles, target_emails, "", role_overrides, dry_run
             )
             warnings.insert(0, f"Reference user '{ref_email}' found in {len(ref_project_roles)} projects.")
@@ -2294,12 +2534,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     )
 
             audit_file = None
-            if not dry_run and results:
+            if not dry_run and api_calls_made:
                 audit_file = _write_audit_csv(results, "clone_access")
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "error")
+                for k in ("success", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({
@@ -2311,16 +2551,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "bulk_assign_company_users":
-            region = arguments.get("region", "EMEA")
+            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
             company_name = arguments["company_name"].lower()
             project_names = arguments["project_names"]
             default_role = arguments.get("default_role") or ""
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
-            user_filter = [e.lower().strip() for e in (arguments.get("user_filter") or [])]
+            user_filter = _norm_emails(arguments.get("user_filter") or [])
 
-            hub_id, _ = await resolve_hub(client, token, region)
-            account_id = hub_id.removeprefix("b.")
+            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
             app_token = await get_app_token()
 
             # Find company by name across all account companies (HQ API)
@@ -2348,7 +2588,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
-            results, warnings = await _execute_bulk_assign(
+            results, warnings, api_calls_made = await _execute_bulk_assign(
                 resolved_projects, company_emails, default_role, role_overrides, dry_run
             )
             warnings.insert(0, f"Found {len(company_emails)} users for company '{arguments['company_name']}'.")
@@ -2361,12 +2601,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     })
 
             audit_file = None
-            if not dry_run and results:
+            if not dry_run and api_calls_made:
                 audit_file = _write_audit_csv(results, "company_assign")
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "error")
+                for k in ("success", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({

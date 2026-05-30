@@ -106,6 +106,8 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 ## Tools reference
 
+> **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "BAC - EU Hub"`. Without it, the first hub returned for the region is used.
+
 ### Navigation & file exploration
 
 | Tool | What it does | Auth |
@@ -119,6 +121,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `create_folder` | Create a new folder inside an existing parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
 | `find_folder` | Search for folders by name across a project | 3-legged |
+| `delete_folder` | Soft-delete (hide) an empty folder | 3-legged |
 | `find_recent_activity` | Show files modified since a given date | 3-legged |
 
 ### User & member management
@@ -181,6 +184,7 @@ flowchart LR
         T5(find_recent_activity)
         T6(find_files)
         T23(find_folder)
+        T24(delete_folder)
     end
 
     subgraph UMEM["User & Member Info · 3-legged + 2-legged"]
@@ -238,6 +242,7 @@ flowchart LR
     T5 --> E4
     T6 --> E4
     T23 --> E4
+    T24 --> E17
 
     T7 --> E5
     T7 --> E6
@@ -260,7 +265,7 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
     class E10,E11,E12,E14,E18,E19 post
     class E15,E17 patch
@@ -284,8 +289,10 @@ flowchart LR
 ```
 List all my ACC hubs
 Show all projects in my hub
+Show all projects in the "BAC - EU Hub" hub
 What are the top folders in "Northgate Tower"?
 List the contents of Project Files/Drawings/Structural in "Northgate Tower"
+List the contents of Project Files/Drawings in "Northgate Tower" in hub "BAC - EU Hub"
 Find all files named "facade" in "Northgate Tower"
 What files were modified in the last 7 days in "Northgate Tower"?
 ```
@@ -338,6 +345,12 @@ Export the full permission matrix for Project Files in "Northgate Tower"
 
 ---
 
+## Known Limitations
+
+- **User last-activity date** — the `last_sign_in` field is only populated for **BIM360 projects**. The underlying ACC Account Admin API does not return this field for Forma projects, so activity timestamps will be absent for those users.
+
+---
+
 ## License
 
 Released under the [Creative Commons Zero v1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) (CC0) license — you may use, copy, modify, and distribute this work without restriction.
@@ -348,7 +361,7 @@ Released under the [Creative Commons Zero v1.0 Universal](https://creativecommon
 
 ```
 forma-mcp/
-├── aps_mcp.py          # MCP server — 23 tools
+├── aps_mcp.py          # MCP server — 24 tools
 ├── requirements.txt
 ├── README.md
 └── .gitignore
