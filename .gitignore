@@ -18,6 +18,7 @@ pytest.ini
 
 # Local work tracking
 todo.md
+test_plan_*.md
 
 # Archived / scratch files
 archive/
