@@ -357,11 +357,27 @@ Released under the [Creative Commons Zero v1.0 Universal](https://creativecommon
 
 ---
 
+## Contributing
+
+```bash
+git clone https://github.com/lfcastel/Forma-MCP.git
+cd Forma-MCP
+python -m venv .venv && .venv\Scripts\activate   # Windows
+pip install -r requirements.txt
+python -m pytest tests/ -v                        # all tests must pass before pushing
+```
+
+All changes go through a pull request. GitHub Actions runs the test suite automatically on every PR — the PR cannot be merged until CI is green.
+
+> **One-time repo setup (owner only):** after the first CI run completes, go to **Settings → Branches → Add rule** for `main`, tick *Require status checks to pass*, and select the `test` job.
+
 ## Repository layout
 
 ```
 forma-mcp/
-├── aps_mcp.py          # MCP server — 24 tools
+├── aps_mcp.py                  # MCP server — 24 tools
+├── tests/                      # pytest test suite
+├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt
 ├── README.md
 └── .gitignore

@@ -8,13 +8,8 @@ mcp_config.json
 # Audit output files
 audit_*.csv
 
-# Claude Code project config
+# Claude Code project config (personal hooks/memory — not shared)
 .claude/
-CLAUDE.md
-
-# Tests
-tests/
-pytest.ini
 
 # Local work tracking
 todo.md
