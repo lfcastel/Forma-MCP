@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MCP (Model Context Protocol) stdio server for managing an Autodesk Construction Cloud (ACC) environment via the Autodesk Platform Services (APS) API. Runs as a stdio subprocess registered in Claude Code's MCP config.
 
-- **`aps_mcp.py`** — 24 tools for navigation, permission auditing, and bulk user management
+- **`aps_mcp.py`** — 26 tools for navigation, folder/file operations, permission auditing, and bulk user management
 
 ## Commands
 
@@ -40,7 +40,7 @@ Environment variables required: `APS_CLIENT_ID`, `APS_CLIENT_SECRET`.
 
 ### `aps_mcp.py` (2,000+ lines)
 
-All 23 tools are registered via `@app.call_tool`. The key layers:
+All 26 tools are registered via `@app.call_tool`. The key layers:
 
 - **Name → ID resolution**: `resolve_hub()`, `resolve_project()` (fuzzy matching: exact first, then partial), `_resolve_folder_with_hub()` (recursive path traversal)
 - **Pagination**: `get_all_pages()` handles limit/offset automatically (200 items/page)

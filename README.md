@@ -119,6 +119,8 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `rename_folder` | Rename a folder by its display-name path | 3-legged |
 | `rename_file` | Rename a file by creating a new version (no re-upload) | 3-legged |
 | `create_folder` | Create a new folder inside an existing parent folder | 3-legged |
+| `move_file` | Move a file into another folder (changes its parent; no re-upload) | 3-legged |
+| `move_folder` | Move a folder (and its contents) into another parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
 | `find_folder` | Search for folders by name across a project | 3-legged |
 | `delete_folder` | Soft-delete (hide) an empty folder | 3-legged |
@@ -181,6 +183,8 @@ flowchart LR
         T20(rename_folder)
         T21(rename_file)
         T22(create_folder)
+        T25(move_file)
+        T26(move_folder)
         T5(find_recent_activity)
         T6(find_files)
         T23(find_folder)
@@ -231,6 +235,7 @@ flowchart LR
     E17["PATCH /data/v1/projects/{p}/folders/{f}"]
     E18["POST /data/v1/projects/{p}/versions?copyFrom=..."]
     E19["POST /data/v1/projects/{p}/folders"]
+    E20["PATCH /data/v1/projects/{p}/items/{i}"]
 
     T1 --> E1
     T2 --> E2
@@ -239,6 +244,8 @@ flowchart LR
     T20 --> E17
     T21 --> E18
     T22 --> E19
+    T25 --> E20
+    T26 --> E17
     T5 --> E4
     T6 --> E4
     T23 --> E4
@@ -265,10 +272,10 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
     class E10,E11,E12,E14,E18,E19 post
-    class E15,E17 patch
+    class E15,E17,E20 patch
     class E16 del
 ```
 
@@ -375,7 +382,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 24 tools
+├── aps_mcp.py                  # MCP server — 26 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt

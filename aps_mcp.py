@@ -816,6 +816,71 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="move_file",
+            description=(
+                "Move a single file from one folder to another within an ACC project "
+                "by changing its parent folder (no re-upload — the file keeps its version history). "
+                "source_folder_path is the slash-separated path to the folder currently containing the file; "
+                "file_name is its current display name (exact match, case-insensitive); "
+                "destination_folder_path is the slash-separated path to the target folder. "
+                "Note: cloud-workshared Revit models (C4RModel) cannot be moved via the API and will return a 403. "
+                "Set dry_run=true (default) to preview without making changes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "source_folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the folder currently containing the file, or a raw folder URN.",
+                    },
+                    "file_name": {"type": "string", "description": "Current display name of the file to move."},
+                    "destination_folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the destination folder, or a raw folder URN.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), preview without making changes.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "source_folder_path", "file_name", "destination_folder_path"],
+            },
+        ),
+        Tool(
+            name="move_folder",
+            description=(
+                "Move a folder into a different parent folder within an ACC project "
+                "by changing its parent relationship. The folder and all of its contents move together. "
+                "folder_path is the slash-separated path to the folder to move; "
+                "destination_parent_path is the slash-separated path to the folder that will become its new parent. "
+                "Set dry_run=true (default) to preview without making changes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folder_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the folder to move, e.g. 'Project Files/Drawings/My Folder', or a raw folder URN.",
+                    },
+                    "destination_parent_path": {
+                        "type": "string",
+                        "description": "Slash-separated path to the new parent folder, or a raw folder URN.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), preview without making changes.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "folder_path", "destination_parent_path"],
+            },
+        ),
+        Tool(
             name="list_project_members",
             description=(
                 "List all members of an ACC project with their roles and companies. "
@@ -1381,6 +1446,142 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "new_name": new_name,
                 "new_version_id": resp_data.get("id"),
                 "status": "renamed",
+            }, indent=2))]
+
+        if name == "move_file":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            source_folder_path = arguments["source_folder_path"]
+            file_name = arguments["file_name"].strip()
+            destination_folder_path = arguments["destination_folder_path"]
+            dry_run = arguments.get("dry_run", True)
+
+            src_folder_id, _ = await _resolve_folder(
+                client, token, hub_id, project_id, source_folder_path
+            )
+
+            r = await client.get(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{src_folder_id}/contents",
+                headers=hdrs,
+            )
+            r.raise_for_status()
+            items = [i for i in r.json().get("data", []) if i["type"] == "items"]
+            name_lower = file_name.lower()
+            match = next(
+                (i for i in items if (i["attributes"].get("displayName") or "").lower() == name_lower),
+                None,
+            )
+            if match is None:
+                available = [i["attributes"].get("displayName") for i in items]
+                raise ValueError(
+                    f"File '{file_name}' not found in '{source_folder_path}'. Available files: {available}"
+                )
+            item_id = match["id"]
+
+            dest_folder_id, _ = await _resolve_folder(
+                client, token, hub_id, project_id, destination_folder_path
+            )
+
+            if dry_run:
+                return [TextContent(type="text", text=json.dumps({
+                    "project": resolved_name,
+                    "item_id": item_id,
+                    "file_name": file_name,
+                    "from": source_folder_path,
+                    "to": destination_folder_path,
+                    "destination_folder_id": dest_folder_id,
+                    "status": "would_move",
+                    "dry_run": True,
+                }, indent=2))]
+
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "items",
+                    "id": item_id,
+                    "relationships": {
+                        "parent": {"data": {"type": "folders", "id": dest_folder_id}},
+                    },
+                },
+            }
+            patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.patch(
+                f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}",
+                headers=patch_hdrs,
+                json=payload,
+            )
+            if not r.is_success:
+                body = _error_body(r)
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "item_id": item_id,
+                "file_name": file_name,
+                "from": source_folder_path,
+                "to": destination_folder_path,
+                "destination_folder_id": dest_folder_id,
+                "status": "moved",
+            }, indent=2))]
+
+        if name == "move_folder":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            folder_path = arguments["folder_path"]
+            destination_parent_path = arguments["destination_parent_path"]
+            dry_run = arguments.get("dry_run", True)
+
+            folder_id, folder_name = await _resolve_folder(
+                client, token, hub_id, project_id, folder_path
+            )
+            dest_parent_id, _ = await _resolve_folder(
+                client, token, hub_id, project_id, destination_parent_path
+            )
+
+            if dry_run:
+                return [TextContent(type="text", text=json.dumps({
+                    "project": resolved_name,
+                    "folder_id": folder_id,
+                    "name": folder_name,
+                    "from": folder_path,
+                    "to": destination_parent_path,
+                    "destination_parent_id": dest_parent_id,
+                    "status": "would_move",
+                    "dry_run": True,
+                }, indent=2))]
+
+            payload = {
+                "jsonapi": {"version": "1.0"},
+                "data": {
+                    "type": "folders",
+                    "id": folder_id,
+                    "relationships": {
+                        "parent": {"data": {"type": "folders", "id": dest_parent_id}},
+                    },
+                },
+            }
+            patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            r = await client.patch(
+                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}",
+                headers=patch_hdrs,
+                json=payload,
+            )
+            if not r.is_success:
+                body = _error_body(r)
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "body": body,
+                }, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "folder_id": folder_id,
+                "name": folder_name,
+                "from": folder_path,
+                "to": destination_parent_path,
+                "destination_parent_id": dest_parent_id,
+                "status": "moved",
             }, indent=2))]
 
         if name == "create_folder":
