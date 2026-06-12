@@ -92,7 +92,11 @@ async def test_call_tool_quota_returns_friendly_result():
     with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
         result = await aps_mcp.call_tool("list_hubs", {})
 
-    data = json.loads(result[0].text)
+    # Quota errors come back as a CallToolResult flagged isError=True, with the
+    # readable JSON still in the content so the client LLM can act on it.
+    assert isinstance(result, aps_mcp.CallToolResult)
+    assert result.isError is True
+    data = json.loads(result.content[0].text)
     assert data["error"] == "quota_exceeded"
     assert data["status"] == 429
     assert data["retry_after_seconds"] == 30

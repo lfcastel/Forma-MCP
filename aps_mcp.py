@@ -15,7 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, CallToolResult
 
 APS_CLIENT_ID = os.environ["APS_CLIENT_ID"]
 APS_CLIENT_SECRET = os.environ["APS_CLIENT_SECRET"]
@@ -1349,28 +1349,36 @@ async def list_tools() -> list[Tool]:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _quota_error_result(message: str, retry_after: "int | None") -> CallToolResult:
+    """Build a tool result for a 429: readable JSON content AND `isError=True`, so
+    the calling agent both sees it's a failure and can read why / when to retry."""
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps({
+            "error": "quota_exceeded",
+            "status": 429,
+            "message": message,
+            "retry_after_seconds": retry_after,
+        }, indent=2))],
+    )
+
+
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> "list[TextContent] | CallToolResult":
     """Entry point: dispatch the tool, converting any 429 rate/quota limit into a
-    clean, user-facing result so the calling agent is told it can't proceed (and
-    why) instead of hanging or seeing an opaque error."""
+    clean error result (`isError=True` with a readable message) so the calling
+    agent is told it can't proceed (and why) instead of hanging or seeing an
+    opaque error."""
     try:
         return await _dispatch_tool(name, arguments)
     except APSQuotaError as e:
-        return [TextContent(type="text", text=json.dumps({
-            "error": "quota_exceeded",
-            "status": 429,
-            "message": str(e),
-            "retry_after_seconds": e.retry_after,
-        }, indent=2))]
+        return _quota_error_result(str(e), e.retry_after)
     except httpx.HTTPStatusError as e:
         if e.response is not None and e.response.status_code == 429:
-            return [TextContent(type="text", text=json.dumps({
-                "error": "quota_exceeded",
-                "status": 429,
-                "message": _quota_message(e.response),
-                "retry_after_seconds": _safe_int(e.response.headers.get("Retry-After")),
-            }, indent=2))]
+            return _quota_error_result(
+                _quota_message(e.response),
+                _safe_int(e.response.headers.get("Retry-After")),
+            )
         raise
 
 
