@@ -44,6 +44,7 @@ All 26 tools are registered via `@app.call_tool`. The key layers:
 
 - **Name → ID resolution**: `resolve_hub()`, `resolve_project()` (fuzzy matching: exact first, then partial), `_resolve_folder_with_hub()` (recursive path traversal)
 - **Pagination**: `get_all_pages()` handles limit/offset automatically (200 items/page)
+- **Rate/quota limits (429)**: `_request_with_retry()` retries transient 429s with a short capped back-off, but fails fast with `APSQuotaError` on a hard quota ("Quota limit exceeded") or once retries are exhausted. `call_tool()` wraps the whole dispatch and converts any 429 into a clean `quota_exceeded` result (with `retry_after_seconds`) so the agent is told it can't proceed instead of hanging
 - **Permission tree walker**: `_walk_folder_tree()` recurses with an asyncio semaphore to limit concurrency; `_get_folder_perms()` fetches per-folder
 - **Bulk user tools**: `_execute_bulk_assign()` is the shared core for `bulk_assign_users`, `clone_user_access`, and `bulk_assign_company_users`. All bulk tools default to `dry_run=True` and generate a timestamped audit CSV when run live.
 
