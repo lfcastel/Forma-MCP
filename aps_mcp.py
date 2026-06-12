@@ -324,6 +324,47 @@ async def get_all_pages(
     return items
 
 
+async def get_all_folder_contents(
+    client: httpx.AsyncClient,
+    project_id: str,
+    folder_id: str,
+    headers: dict,
+    *,
+    raise_on_error: bool = True,
+) -> list:
+    """Return ALL items in a folder, following JSON:API `links.next` pagination.
+
+    The Data Management `folders/{id}/contents` endpoint caps each page at 200
+    items and exposes further pages via `links.next` — not the limit/offset +
+    `meta.pagination` scheme that `get_all_pages` handles. Use this for any
+    folder that may hold more than 200 files/subfolders.
+
+    With `raise_on_error=False`, a non-success response (e.g. a 403 on a
+    restricted subfolder) stops pagination and returns what was collected so
+    far instead of raising — used by best-effort tree walks.
+    """
+    url = f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents"
+    params: dict | None = {"page[limit]": 200}
+    items: list = []
+    while url:
+        res = await _request_with_retry(client, "get", url, headers=headers, params=params)
+        if not res.is_success:
+            if raise_on_error:
+                res.raise_for_status()
+            break
+        body = res.json()
+        items.extend(body.get("data", []))
+        nxt = (body.get("links") or {}).get("next")
+        if isinstance(nxt, dict):
+            url = nxt.get("href")
+        elif isinstance(nxt, str):
+            url = nxt
+        else:
+            url = None
+        params = None  # the `next` href already carries pagination params
+    return items
+
+
 async def _request_with_retry(
     client: httpx.AsyncClient,
     method: str,
@@ -454,13 +495,8 @@ async def _resolve_folder_with_hub(
         current_id = match["id"]
         current_name = _folder_name(match["attributes"])
         if i < len(parts) - 1:
-            res = await client.get(
-                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{current_id}/contents",
-                headers=hdrs,
-                params={"page[limit]": 200},
-            )
-            res.raise_for_status()
-            current_items = [x for x in res.json().get("data", []) if x["type"] == "folders"]
+            contents = await get_all_folder_contents(client, project_id, current_id, hdrs)
+            current_items = [x for x in contents if x["type"] == "folders"]
 
     return current_id, current_name
 
@@ -494,11 +530,7 @@ async def _subtree_has_files(
     hdrs: dict,
 ) -> bool:
     """Return True if any files (items) exist anywhere in the folder's subtree."""
-    contents = await get_all_pages(
-        client,
-        f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-        hdrs,
-    )
+    contents = await get_all_folder_contents(client, project_id, folder_id, hdrs)
     for item in contents:
         if item["type"] == "items":
             return True
@@ -585,14 +617,9 @@ async def _walk_folder_tree(
     if depth >= max_depth:
         return results
 
-    r = await _request_with_retry(
-        client, "get",
-        f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-        headers=hdrs,
-        params={"page[limit]": 200},
+    contents = await get_all_folder_contents(
+        client, project_id, folder_id, hdrs, raise_on_error=False
     )
-    if not r.is_success:
-        return results
 
     tasks = [
         _walk_folder_tree(
@@ -600,7 +627,7 @@ async def _walk_folder_tree(
             f"{folder_path}/{_folder_name(item['attributes'])}",
             hdrs, max_depth, depth + 1,
         )
-        for item in r.json().get("data", [])
+        for item in contents
         if item["type"] == "folders"
     ]
     for sub in await asyncio.gather(*tasks):
@@ -1424,13 +1451,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
             folder_path = arguments["folder_path"]
             folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
-            res = await client.get(
-                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-                headers=hdrs,
-                params={"page[limit]": 200},
-            )
-            res.raise_for_status()
-            items = res.json().get("data", [])
+            items = await get_all_folder_contents(client, project_id, folder_id, hdrs)
             return [TextContent(type="text", text=json.dumps({
                 "project": resolved_name,
                 "path": folder_path,
@@ -1489,12 +1510,8 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
 
-            r = await client.get(
-                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-                headers=hdrs,
-            )
-            r.raise_for_status()
-            items = [i for i in r.json().get("data", []) if i["type"] == "items"]
+            contents = await get_all_folder_contents(client, project_id, folder_id, hdrs)
+            items = [i for i in contents if i["type"] == "items"]
             name_lower = file_name.lower()
             match = next(
                 (i for i in items if (i["attributes"].get("displayName") or "").lower() == name_lower),
@@ -1573,12 +1590,8 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 client, token, hub_id, project_id, source_folder_path
             )
 
-            r = await client.get(
-                f"{APS_BASE}/data/v1/projects/{project_id}/folders/{src_folder_id}/contents",
-                headers=hdrs,
-            )
-            r.raise_for_status()
-            items = [i for i in r.json().get("data", []) if i["type"] == "items"]
+            contents = await get_all_folder_contents(client, project_id, src_folder_id, hdrs)
+            items = [i for i in contents if i["type"] == "items"]
             name_lower = file_name.lower()
             match = next(
                 (i for i in items if (i["attributes"].get("displayName") or "").lower() == name_lower),
@@ -1905,16 +1918,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             async def collect_recent(folder_id: str, collected: list, depth: int = 0):
                 if len(collected) >= limit or depth > 6:
                     return
-                r = await _request_with_retry(
-                    client, "get",
-                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-                    headers=hdrs,
-                    params={"page[limit]": 200},
+                contents = await get_all_folder_contents(
+                    client, project_id, folder_id, hdrs, raise_on_error=False
                 )
-                if r.status_code != 200:
-                    return
                 tasks = []
-                for item in r.json().get("data", []):
+                for item in contents:
                     a = item.get("attributes", {})
                     if item["type"] == "folders":
                         tasks.append(collect_recent(item["id"], collected, depth + 1))
@@ -1967,16 +1975,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             async def search_folder(folder_id: str, path: str, depth: int = 0):
                 if depth > 8:
                     return
-                r = await _request_with_retry(
-                    client, "get",
-                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-                    headers=hdrs,
-                    params={"page[limit]": 200},
+                contents = await get_all_folder_contents(
+                    client, project_id, folder_id, hdrs, raise_on_error=False
                 )
-                if r.status_code != 200:
-                    return
                 tasks = []
-                for item in r.json().get("data", []):
+                for item in contents:
                     a = item.get("attributes", {})
                     if item["type"] == "folders":
                         tasks.append(search_folder(item["id"], f"{path}/{_folder_name(a)}", depth + 1))
@@ -2024,16 +2027,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             async def search_folders(folder_id: str, path: str, depth: int = 0):
                 if depth > 8:
                     return
-                r = await _request_with_retry(
-                    client, "get",
-                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
-                    headers=hdrs,
-                    params={"page[limit]": 200},
+                contents = await get_all_folder_contents(
+                    client, project_id, folder_id, hdrs, raise_on_error=False
                 )
-                if r.status_code != 200:
-                    return
                 tasks = []
-                for item in r.json().get("data", []):
+                for item in contents:
                     if item["type"] != "folders":
                         continue
                     folder_name = _folder_name(item["attributes"])
