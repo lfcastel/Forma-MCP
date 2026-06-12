@@ -43,7 +43,7 @@ Environment variables required: `APS_CLIENT_ID`, `APS_CLIENT_SECRET`.
 All 26 tools are registered via `@app.call_tool`. The key layers:
 
 - **Name → ID resolution**: `resolve_hub()`, `resolve_project()` (fuzzy matching: exact first, then partial), `_resolve_folder_with_hub()` (recursive path traversal)
-- **Pagination**: `get_all_pages()` handles limit/offset automatically (200 items/page)
+- **Pagination**: `get_all_pages()` handles limit/offset + `meta.pagination` endpoints (200 items/page). `get_all_folder_contents()` handles the Data Management `folders/{id}/contents` endpoint, which instead pages via JSON:API `links.next` — every folder-listing/lookup site (`list_folder_contents`, folder-path resolution, file lookups in `rename_file`/`move_file`, `find_files`/`find_folder`, permission walker) routes through it so folders with >200 items aren't truncated
 - **Permission tree walker**: `_walk_folder_tree()` recurses with an asyncio semaphore to limit concurrency; `_get_folder_perms()` fetches per-folder
 - **Bulk user tools**: `_execute_bulk_assign()` is the shared core for `bulk_assign_users`, `clone_user_access`, and `bulk_assign_company_users`. All bulk tools default to `dry_run=True` and generate a timestamped audit CSV when run live.
 
