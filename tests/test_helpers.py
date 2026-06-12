@@ -195,13 +195,14 @@ async def test_request_with_retry_retries_on_429():
 
 
 @pytest.mark.asyncio
-async def test_request_with_retry_returns_after_max_retries():
+async def test_request_with_retry_raises_after_max_retries():
+    # Persistent 429s (transient wording, no quota) eventually fail fast with a
+    # clear APSQuotaError rather than returning the raw 429 for callers to handle.
     async def always_429(url, **kwargs):
         return httpx.Response(429, headers={"Retry-After": "0"}, json={})
 
     async with httpx.AsyncClient() as client:
         with patch.object(client, "get", side_effect=always_429), \
              patch("asyncio.sleep", new_callable=AsyncMock):
-            r = await aps_mcp._request_with_retry(client, "get", "https://example.com", max_retries=2)
-
-    assert r.status_code == 429
+            with pytest.raises(aps_mcp.APSQuotaError):
+                await aps_mcp._request_with_retry(client, "get", "https://example.com", max_retries=2)

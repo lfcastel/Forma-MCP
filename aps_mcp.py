@@ -15,7 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, CallToolResult
 
 APS_CLIENT_ID = os.environ["APS_CLIENT_ID"]
 APS_CLIENT_SECRET = os.environ["APS_CLIENT_SECRET"]
@@ -216,6 +216,57 @@ def _error_body(r: "httpx.Response") -> "Any":
         return r.text
 
 
+class APSQuotaError(Exception):
+    """Raised when APS responds 429 (rate/quota limit) and the call cannot proceed.
+
+    Carries a user-facing message and the `Retry-After` hint (seconds) if present,
+    so the tool can report a clean "can't proceed right now" result instead of
+    hanging on long retries or surfacing an opaque exception.
+    """
+
+    def __init__(self, message: str, retry_after: "int | None" = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _safe_int(value: "Any") -> "int | None":
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_quota_429(r: "httpx.Response") -> bool:
+    """Whether a 429 is a hard quota limit (vs a transient rate spike).
+
+    APS quota errors carry wording like `"developerMessage": "Quota limit
+    exceeded."` — retrying within seconds won't help, so we fail fast on these.
+    """
+    try:
+        return "quota" in json.dumps(r.json()).lower()
+    except Exception:
+        return False
+
+
+def _quota_message(r: "httpx.Response") -> str:
+    """Build a clear, user-facing message for a 429 response."""
+    detail = ""
+    try:
+        body = r.json()
+        if isinstance(body, dict):
+            detail = body.get("developerMessage") or body.get("title") or body.get("detail") or ""
+    except Exception:
+        pass
+    retry_after = r.headers.get("Retry-After")
+    parts = ["Autodesk APS rate/quota limit reached (HTTP 429)."]
+    if detail:
+        parts.append(str(detail))
+    if retry_after:
+        parts.append(f"Retry-After: {retry_after}s.")
+    parts.append("The MCP server stopped instead of hanging — please wait and try again later.")
+    return " ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # 2-legged OAuth (app-only endpoints like HQ account users)
 # ---------------------------------------------------------------------------
@@ -319,17 +370,28 @@ async def _request_with_retry(
     method: str,
     url: str,
     *,
-    max_retries: int = 5,
+    max_retries: int = 3,
     **kwargs,
 ) -> httpx.Response:
-    """Issue an HTTP request and retry on 429 using Retry-After or exponential backoff."""
+    """Issue an HTTP request, retrying transient 429s with a short, capped backoff.
+
+    Fails fast with a clear `APSQuotaError` when APS signals a hard quota limit
+    (retrying within seconds can't clear it) or when the retries are exhausted —
+    so the caller surfaces a "can't proceed" message instead of hanging.
+    """
     for attempt in range(max_retries + 1):
         r = await getattr(client, method)(url, **kwargs)
-        if r.status_code != 429 or attempt == max_retries:
+        if r.status_code != 429:
             return r
-        wait = int(r.headers.get("Retry-After", min(2 ** attempt, 60)))
-        await asyncio.sleep(wait)
-    return r
+        # Hard quota, or out of retries → stop now with a clear message.
+        if _is_quota_429(r) or attempt == max_retries:
+            raise APSQuotaError(_quota_message(r), _safe_int(r.headers.get("Retry-After")))
+        # Transient rate spike → brief, capped back-off, then retry.
+        wait = _safe_int(r.headers.get("Retry-After"))
+        if wait is None:
+            wait = min(2 ** attempt, 10)
+        await asyncio.sleep(min(wait, 10))
+    return r  # unreachable; keeps type-checkers happy
 
 
 # ---------------------------------------------------------------------------
@@ -1314,8 +1376,40 @@ async def list_tools() -> list[Tool]:
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _quota_error_result(message: str, retry_after: "int | None") -> CallToolResult:
+    """Build a tool result for a 429: readable JSON content AND `isError=True`, so
+    the calling agent both sees it's a failure and can read why / when to retry."""
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps({
+            "error": "quota_exceeded",
+            "status": 429,
+            "message": message,
+            "retry_after_seconds": retry_after,
+        }, indent=2))],
+    )
+
+
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> "list[TextContent] | CallToolResult":
+    """Entry point: dispatch the tool, converting any 429 rate/quota limit into a
+    clean error result (`isError=True` with a readable message) so the calling
+    agent is told it can't proceed (and why) instead of hanging or seeing an
+    opaque error."""
+    try:
+        return await _dispatch_tool(name, arguments)
+    except APSQuotaError as e:
+        return _quota_error_result(str(e), e.retry_after)
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 429:
+            return _quota_error_result(
+                _quota_message(e.response),
+                _safe_int(e.response.headers.get("Retry-After")),
+            )
+        raise
+
+
+async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
     token = await get_access_token()
 
     async with httpx.AsyncClient(timeout=30) as client:
