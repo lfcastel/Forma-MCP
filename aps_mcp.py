@@ -383,14 +383,14 @@ async def _resolve_folder_with_hub(
     for i, part in enumerate(parts):
         part_lower = part.lower()
         match = next(
-            (f for f in current_items if (f["attributes"].get("displayName") or f["attributes"].get("name", "")).lower() == part_lower),
+            (f for f in current_items if _folder_name_matches(f["attributes"], part_lower)),
             None,
         )
         if match is None:
-            available = [f["attributes"].get("displayName") or f["attributes"].get("name", "") for f in current_items]
+            available = [_folder_name(f["attributes"]) for f in current_items]
             raise ValueError(f"Folder '{part}' not found. Available: {available}")
         current_id = match["id"]
-        current_name = match["attributes"].get("displayName") or match["attributes"].get("name", "")
+        current_name = _folder_name(match["attributes"])
         if i < len(parts) - 1:
             res = await client.get(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{current_id}/contents",
@@ -420,7 +420,7 @@ async def _resolve_folder(
         )
         r.raise_for_status()
         attrs = r.json().get("data", {}).get("attributes", {})
-        name = attrs.get("displayName") or attrs.get("name") or folder_path_or_urn
+        name = _folder_name(attrs) or folder_path_or_urn
         return folder_path_or_urn, name
     return await _resolve_folder_with_hub(client, token, hub_id, project_id, folder_path_or_urn)
 
@@ -456,8 +456,26 @@ def _fmt_project(p: dict) -> dict:
     return {"id": p["id"], "name": a.get("name"), "status": a.get("status"), "type": a.get("projectType")}
 
 
+def _folder_name(attrs: dict) -> str:
+    """Human-facing folder name. Forma/ACC folders carry both `name` and
+    `displayName`; the ACC/Forma UI shows `name`, so prefer it and fall back
+    to `displayName` (and then "") when absent."""
+    return attrs.get("name") or attrs.get("displayName") or ""
+
+
+def _folder_name_matches(attrs: dict, target_lower: str) -> bool:
+    """Whether a folder path segment matches this folder, comparing against
+    BOTH `name` and `displayName` (case-insensitive) so paths typed from either
+    label resolve."""
+    for key in ("name", "displayName"):
+        val = attrs.get(key)
+        if val and val.lower() == target_lower:
+            return True
+    return False
+
+
 def _fmt_folder(f: dict) -> dict:
-    return {"id": f["id"], "name": f["attributes"].get("displayName"), "type": "folder"}
+    return {"id": f["id"], "name": _folder_name(f["attributes"]), "type": "folder"}
 
 
 def _fmt_item(i: dict) -> dict:
@@ -517,7 +535,7 @@ async def _walk_folder_tree(
     tasks = [
         _walk_folder_tree(
             client, project_id, bare_id, item["id"],
-            f"{folder_path}/{item['attributes'].get('displayName') or item['attributes'].get('name', '')}",
+            f"{folder_path}/{_folder_name(item['attributes'])}",
             hdrs, max_depth, depth + 1,
         )
         for item in r.json().get("data", [])
@@ -1665,14 +1683,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 tasks = []
                 for item in r.json().get("data", []):
                     a = item.get("attributes", {})
-                    display_name = a.get("displayName", "")
-                    item_path = f"{path}/{display_name}"
                     if item["type"] == "folders":
-                        tasks.append(search_folder(item["id"], item_path, depth + 1))
-                    elif query in display_name.lower():
+                        tasks.append(search_folder(item["id"], f"{path}/{_folder_name(a)}", depth + 1))
+                        continue
+                    display_name = a.get("displayName", "")
+                    if query in display_name.lower():
                         results.append({
                             "name": display_name,
-                            "path": item_path,
+                            "path": f"{path}/{display_name}",
                             "id": item["id"],
                             "last_modified": a.get("lastModifiedTime"),
                             "modified_by": a.get("lastModifiedUserName"),
@@ -1680,7 +1698,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 await asyncio.gather(*tasks)
 
             await asyncio.gather(*[
-                search_folder(f["id"], f["attributes"]["displayName"]) for f in start_folders
+                search_folder(f["id"], _folder_name(f["attributes"])) for f in start_folders
             ])
             results.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
             return [TextContent(type="text", text=json.dumps({
@@ -1723,11 +1741,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 for item in r.json().get("data", []):
                     if item["type"] != "folders":
                         continue
-                    display_name = item["attributes"].get("displayName", "")
-                    item_path = f"{path}/{display_name}"
-                    if query in display_name.lower():
+                    folder_name = _folder_name(item["attributes"])
+                    item_path = f"{path}/{folder_name}"
+                    if query in folder_name.lower():
                         results.append({
-                            "name": display_name,
+                            "name": folder_name,
                             "path": item_path,
                             "id": item["id"],
                         })
@@ -1735,7 +1753,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 await asyncio.gather(*tasks)
 
             await asyncio.gather(*[
-                search_folders(f["id"], f["attributes"]["displayName"]) for f in start_folders
+                search_folders(f["id"], _folder_name(f["attributes"])) for f in start_folders
             ])
             return [TextContent(type="text", text=json.dumps({
                 "project": resolved_name, "query": query,
