@@ -50,6 +50,39 @@ def test_resolve_role_id_empty_map():
 
 
 # ---------------------------------------------------------------------------
+# _folder_name / _folder_name_matches  (Forma uses `name` as the UI label)
+# ---------------------------------------------------------------------------
+
+def test_folder_name_prefers_name_over_display_name():
+    attrs = {"name": "Drawings", "displayName": "Drawings (internal)"}
+    assert aps_mcp._folder_name(attrs) == "Drawings"
+
+
+def test_folder_name_falls_back_to_display_name():
+    attrs = {"displayName": "Only Display"}
+    assert aps_mcp._folder_name(attrs) == "Only Display"
+
+
+def test_folder_name_empty_when_neither_present():
+    assert aps_mcp._folder_name({}) == ""
+
+
+def test_fmt_folder_returns_name():
+    folder = {"id": "urn:folder:1", "attributes": {"name": "Drawings", "displayName": "Drawings (internal)"}}
+    assert aps_mcp._fmt_folder(folder) == {"id": "urn:folder:1", "name": "Drawings", "type": "folder"}
+
+
+def test_folder_name_matches_either_label_case_insensitive():
+    attrs = {"name": "Drawings", "displayName": "Drawings (internal)"}
+    # matches on the UI `name`
+    assert aps_mcp._folder_name_matches(attrs, "drawings")
+    # also still matches a path typed from the old `displayName`
+    assert aps_mcp._folder_name_matches(attrs, "drawings (internal)")
+    # non-match
+    assert not aps_mcp._folder_name_matches(attrs, "models")
+
+
+# ---------------------------------------------------------------------------
 # _write_audit_csv
 # ---------------------------------------------------------------------------
 
