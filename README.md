@@ -161,6 +161,20 @@ All five bulk tools default to **`dry_run: true`** — Claude always shows a pre
 | `clone_user_access` | Copy one user's full project access to another user | 3-legged + `account:write` |
 | `bulk_assign_company_users` | Add all members of an ACC company to a project | 3-legged + `account:write` |
 
+### Bulk folder operations
+
+Three composable primitives for reorganising folder structures at scale (e.g. standardising the subfolders across hundreds of building folders in one project). They are deliberately **dumb and general** — a Claude instance does the orchestration and judgment (audit → decide what to create/delete → surface anomalies and stuck files); no reorg policy is baked into the tools. The two mutating tools default to **`dry_run: true`**.
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `bulk_list_folder_contents` | Audit engine (read-only): list the immediate contents of many folders — or of every subfolder of one parent — in a single call, returning subfolders (name + id) and files | 3-legged |
+| `bulk_create_folders` | Idempotent batch create: `{parent, name}` items; `skip_if_exists` (default) reports `exists` instead of duplicating | 3-legged |
+| `bulk_delete_folders` | File-safe batch soft-delete: never deletes a folder with any file in its subtree — reports it as `skipped_has_files` with `file_count` + `sample_files` | 3-legged |
+| `bulk_move_files` | Batch-move files into new folders (no re-upload); idempotent (`already_there`); C4R models that 403 are reported `skipped_unmovable` | 3-legged |
+| `bulk_move_folders` | Batch-move folders (with contents) under new parents; idempotent (`already_there`) | 3-legged |
+
+> **File safety is absolute.** `bulk_delete_folders` applies the same subtree-file check as the single `delete_folder` and only ever soft-deletes (admin-reversible). The `skipped_has_files` rows are the "stuck files" (typically cloud-workshared Revit/C4R models the API can't move) for a human to relocate in the ACC UI. Both mutating tools support `continue_on_error` (default true), a `max_concurrency` cap (default 8), and survive a mid-batch token expiry (a 401 triggers a one-time token refresh).
+
 ---
 
 ## Tools & API endpoints
@@ -214,6 +228,14 @@ flowchart LR
         T17(remove_users_from_projects)
         T18(clone_user_access)
         T19(bulk_assign_company_users)
+    end
+
+    subgraph BULKF["Bulk Folder Ops · 3-legged OAuth · dry_run=true by default"]
+        T27(bulk_list_folder_contents)
+        T28(bulk_create_folders)
+        T29(bulk_delete_folders)
+        T30(bulk_move_files)
+        T31(bulk_move_folders)
     end
 
     E1["GET /project/v1/hubs"]
@@ -272,7 +294,17 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26 tool
+    T27 --> E4
+    T28 --> E4
+    T28 --> E19
+    T29 --> E4
+    T29 --> E17
+    T30 --> E4
+    T30 --> E20
+    T31 --> E4
+    T31 --> E17
+
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
     class E10,E11,E12,E14,E18,E19 post
     class E15,E17,E20 patch
@@ -322,6 +354,17 @@ Update the role of all Acme Engineering members in "Central Station" to Viewer
 Show me a dry run of adding Acme Engineering to the "Riverside Bridge" project
 ```
 
+### Bulk folder reorg (always previewed before execution)
+
+```
+Audit every building folder under Project Files in "AS-IS Buildings" (children_of, regex ^B-B-)
+For each building, create the missing standard subfolders and delete the empty legacy ones — dry run first
+Delete the legacy 0. WIP / 1. SHARED / 2. PUBLISHED / 3. ARCHIVED folders, but skip any that still hold files
+Move every file out of each building's 0. WIP into its User A folder, then delete the empty WIP folders
+Move the B-B-7xx building folders under Project Files/Archive
+Re-run the create + delete as a dry run to prove the reorg is idempotent (zero would-change rows)
+```
+
 ### Permission auditing
 
 ```
@@ -356,6 +399,7 @@ Export the full permission matrix for Project Files in "Northgate Tower"
 
 - **User last-activity date** — the `last_sign_in` field is only populated for **BIM360 projects**. The underlying ACC Account Admin API does not return this field for Forma projects, so activity timestamps will be absent for those users.
 - **APS rate / quota limits** — Autodesk enforces per-app API quotas. When one is hit, a tool returns a clean `quota_exceeded` result (HTTP 429) with the `Retry-After` hint instead of hanging — wait the suggested time and retry. Transient rate spikes are retried automatically a few times with a short back-off; only a persistent quota error surfaces to you.
+- **Cloud-workshared Revit models can't be moved by API** — C4R models (`C4RModel`) return 403 on a move and cannot be relocated programmatically. During a `bulk_delete_folders` reorg they are what keeps a folder from being deleted: it is reported as `skipped_has_files` so a human can move them in the Revit/ACC UI first.
 
 ---
 
@@ -383,7 +427,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 26 tools
+├── aps_mcp.py                  # MCP server — 31 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MCP (Model Context Protocol) stdio server for managing an Autodesk Construction Cloud (ACC) environment via the Autodesk Platform Services (APS) API. Runs as a stdio subprocess registered in Claude Code's MCP config.
 
-- **`aps_mcp.py`** — 26 tools for navigation, folder/file operations, permission auditing, and bulk user management
+- **`aps_mcp.py`** — 31 tools for navigation, folder/file operations, permission auditing, bulk user management, and bulk folder reorg
 
 ## Commands
 
@@ -40,13 +40,15 @@ Environment variables required: `APS_CLIENT_ID`, `APS_CLIENT_SECRET`.
 
 ### `aps_mcp.py` (2,000+ lines)
 
-All 26 tools are registered via `@app.call_tool`. The key layers:
+All 31 tools are registered via `@app.call_tool`. The key layers:
 
 - **Name → ID resolution**: `resolve_hub()`, `resolve_project()` (fuzzy matching: exact first, then partial), `_resolve_folder_with_hub()` (recursive path traversal)
 - **Pagination**: `get_all_pages()` handles limit/offset + `meta.pagination` endpoints (200 items/page). `get_all_folder_contents()` handles the Data Management `folders/{id}/contents` endpoint, which instead pages via JSON:API `links.next` — every folder-listing/lookup site (`list_folder_contents`, folder-path resolution, file lookups in `rename_file`/`move_file`, `find_files`/`find_folder`, permission walker) routes through it so folders with >200 items aren't truncated
-- **Rate/quota limits (429)**: `_request_with_retry()` retries transient 429s with a short capped back-off, but fails fast with `APSQuotaError` on a hard quota ("Quota limit exceeded") or once retries are exhausted. `call_tool()` wraps the whole dispatch and converts any 429 into a `CallToolResult` with `isError=True` and a readable `quota_exceeded` JSON body (incl. `retry_after_seconds`) — so the client LLM is told it can't proceed (and why) instead of hanging, and the failure is flagged at the protocol level rather than looking like a successful call
+- **Rate/quota limits (429), 503, token expiry (401)**: `_request_with_retry()` retries transient 429s/503s with a short capped back-off, but fails fast with `APSQuotaError` on a hard quota ("Quota limit exceeded") or once retries are exhausted. With an `on_unauthorized` callback (used by the bulk folder tools via `_bearer_refresher`), a single 401 triggers a one-time token refresh — mutating a shared headers dict in place — then retries, so a long batch can outlive a token (`_force_refresh_access_token()` force-refreshes ignoring the cached-token window). `call_tool()` wraps the whole dispatch and converts any 429 into a `CallToolResult` with `isError=True` and a readable `quota_exceeded` JSON body (incl. `retry_after_seconds`) — so the client LLM is told it can't proceed (and why) instead of hanging, and the failure is flagged at the protocol level rather than looking like a successful call
 - **Permission tree walker**: `_walk_folder_tree()` recurses with an asyncio semaphore to limit concurrency; `_get_folder_perms()` fetches per-folder
 - **Bulk user tools**: `_execute_bulk_assign()` is the shared core for `bulk_assign_users`, `clone_user_access`, and `bulk_assign_company_users`. All bulk tools default to `dry_run=True` and generate a timestamped audit CSV when run live.
+- **Bulk folder tools**: `bulk_list_folder_contents` (read-only audit; `children_of` lists every immediate subfolder's contents in one call), `bulk_create_folders` (idempotent; `skip_if_exists` lists each parent once and reports `exists` instead of duplicating), `bulk_delete_folders` (file-safe soft-delete via `_subtree_file_info()`, which counts/samples files in a subtree — `skipped_has_files` rows surface the stuck cloud-workshared models). Deliberately policy-free primitives: the orchestrating prompt decides which folders are standard/legacy/anomaly. Both mutating tools default to `dry_run=True`, take `continue_on_error` (default true) and a `max_concurrency` cap (default 8, via `_gather_bounded()`), and share the single tools' create/hide payload builders (`_folder_create_payload`/`_folder_hide_payload`).
+- **Bulk move tools**: `bulk_move_files` and `bulk_move_folders` reparent items/folders via the shared `_reparent_payload()` (also used by the single `move_file`/`move_folder`). Both resolve+list unique source/destination folders once up front, then fan out the PATCHes bounded. Idempotent: a file/folder already at its destination is reported `already_there`. `bulk_move_files` surfaces a 403 on a file move as `skipped_unmovable` (cloud-workshared C4R models the API can't relocate) rather than a generic error; files can be addressed by raw `item_id` or by `source`+`name`.
 
 ### Tests
 
