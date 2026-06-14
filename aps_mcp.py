@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import csv
 import zipfile
 import base64
@@ -188,6 +189,50 @@ def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _force_refresh_access_token() -> str:
+    """Force a fresh 3-legged access token, ignoring the cached-token window.
+
+    Used when APS returns 401 mid-batch: a long bulk run can outlive a token
+    even though our cached `expires_at` hasn't elapsed (e.g. the token was
+    revoked). Refreshes via the stored refresh token; falls back to the full
+    `get_access_token` flow (browser re-auth) if no refresh token is available.
+    """
+    stored = _load_tokens()
+    if stored.get("refresh_token"):
+        data = await _refresh_tokens(stored["refresh_token"])
+        now = time.time()
+        stored = {
+            "access_token": data["access_token"],
+            "refresh_token": data.get("refresh_token", stored["refresh_token"]),
+            "expires_at": now + data.get("expires_in", 3600),
+        }
+        _save_tokens(stored)
+        return stored["access_token"]
+    return await get_access_token()
+
+
+def _bearer_refresher(hdrs: dict):
+    """Return an async callback that force-refreshes the 3-legged token and
+    updates `hdrs['Authorization']` in place.
+
+    Pass the result as `on_unauthorized` to `_request_with_retry` (directly or
+    via `get_all_folder_contents`) so a single shared headers dict keeps working
+    across a token expiry without re-resolving anything. Guarded by an internal
+    lock so concurrent bulk requests trigger at most one refresh."""
+    lock = asyncio.Lock()
+
+    async def _refresh() -> None:
+        async with lock:
+            current = hdrs.get("Authorization")
+            new_token = await _force_refresh_access_token()
+            new_auth = f"Bearer {new_token}"
+            # If another concurrent request already refreshed, don't refresh again.
+            if hdrs.get("Authorization") == current:
+                hdrs["Authorization"] = new_auth
+
+    return _refresh
+
+
 def _to_bare_id(aps_id: str) -> str:
     """Strip the 'b.' prefix from APS hub/project IDs."""
     return aps_id.removeprefix("b.")
@@ -331,6 +376,7 @@ async def get_all_folder_contents(
     headers: dict,
     *,
     raise_on_error: bool = True,
+    on_unauthorized=None,
 ) -> list:
     """Return ALL items in a folder, following JSON:API `links.next` pagination.
 
@@ -347,7 +393,10 @@ async def get_all_folder_contents(
     params: dict | None = {"page[limit]": 200}
     items: list = []
     while url:
-        res = await _request_with_retry(client, "get", url, headers=headers, params=params)
+        res = await _request_with_retry(
+            client, "get", url, headers=headers, params=params,
+            on_unauthorized=on_unauthorized,
+        )
         if not res.is_success:
             if raise_on_error:
                 res.raise_for_status()
@@ -371,16 +420,33 @@ async def _request_with_retry(
     url: str,
     *,
     max_retries: int = 3,
+    on_unauthorized=None,
     **kwargs,
 ) -> httpx.Response:
-    """Issue an HTTP request, retrying transient 429s with a short, capped backoff.
+    """Issue an HTTP request, retrying transient 429s/503s with a short, capped backoff.
 
     Fails fast with a clear `APSQuotaError` when APS signals a hard quota limit
     (retrying within seconds can't clear it) or when the retries are exhausted —
     so the caller surfaces a "can't proceed" message instead of hanging.
+
+    When `on_unauthorized` is given (an async callback), a single 401 triggers it
+    once — typically to refresh an expired token by mutating the shared headers
+    dict in place — then the request is retried with the updated credentials. This
+    lets a long bulk batch outlive a token. Without the callback, a 401 is returned
+    unchanged (existing behaviour).
     """
+    refreshed = False
     for attempt in range(max_retries + 1):
         r = await getattr(client, method)(url, **kwargs)
+        # One-time token refresh on 401 (long batches can outlive a token).
+        if r.status_code == 401 and on_unauthorized is not None and not refreshed:
+            await on_unauthorized()
+            refreshed = True
+            continue
+        # Transient 503 → brief, capped back-off, then retry.
+        if r.status_code == 503 and attempt < max_retries:
+            await asyncio.sleep(min(2 ** attempt, 10))
+            continue
         if r.status_code != 429:
             return r
         # Hard quota, or out of retries → stop now with a clear message.
@@ -539,6 +605,110 @@ async def _subtree_has_files(
             if await _subtree_has_files(client, project_id, item["id"], hdrs):
                 return True
     return False
+
+
+async def _subtree_file_info(
+    client: httpx.AsyncClient,
+    project_id: str,
+    folder_id: str,
+    hdrs: dict,
+    *,
+    sample_limit: int = 5,
+    on_unauthorized=None,
+) -> tuple[int, list[str]]:
+    """Count files anywhere in a folder's subtree and collect up to `sample_limit`
+    file names. Returns (file_count, sample_names).
+
+    Used by `bulk_delete_folders` to populate the `skipped_has_files` rows the
+    orchestrator surfaces to the user. The common case (an empty legacy folder)
+    costs a single listing that returns no files and recurses into empty
+    subfolders only; folders that DO hold files are the minority and are skipped,
+    so the full count walk there is acceptable.
+    """
+    count = 0
+    sample: list[str] = []
+    contents = await get_all_folder_contents(
+        client, project_id, folder_id, hdrs, on_unauthorized=on_unauthorized
+    )
+    for item in contents:
+        if item["type"] == "items":
+            count += 1
+            if len(sample) < sample_limit:
+                sample.append(item.get("attributes", {}).get("displayName") or item["id"])
+    for item in contents:
+        if item["type"] == "folders":
+            sub_count, sub_sample = await _subtree_file_info(
+                client, project_id, item["id"], hdrs,
+                sample_limit=sample_limit, on_unauthorized=on_unauthorized,
+            )
+            count += sub_count
+            for name in sub_sample:
+                if len(sample) < sample_limit:
+                    sample.append(name)
+    return count, sample
+
+
+async def _gather_bounded(max_concurrency: int, factories: list) -> list:
+    """Run a list of zero-arg async factories concurrently, capped at
+    `max_concurrency` in flight at once, preserving input order in the results."""
+    sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run(factory):
+        async with sem:
+            return await factory()
+
+    return await asyncio.gather(*[_run(f) for f in factories])
+
+
+def _folder_create_payload(folder_name: str, parent_id: str) -> dict:
+    """JSON:API body to create a folder under `parent_id` (shared by the single
+    `create_folder` tool and `bulk_create_folders`)."""
+    return {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "attributes": {
+                "name": folder_name,
+                "displayName": folder_name,
+                "extension": {
+                    "type": "folders:autodesk.bim360:Folder",
+                    "version": "1.0",
+                },
+            },
+            "relationships": {
+                "parent": {"data": {"type": "folders", "id": parent_id}},
+            },
+        },
+    }
+
+
+def _folder_hide_payload(folder_id: str) -> dict:
+    """JSON:API body to soft-delete (hide) a folder (shared by the single
+    `delete_folder` tool and `bulk_delete_folders`)."""
+    return {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": "folders",
+            "id": folder_id,
+            "attributes": {"hidden": True},
+        },
+    }
+
+
+def _reparent_payload(entity_type: str, entity_id: str, dest_parent_id: str) -> dict:
+    """JSON:API body to move an item or folder by changing its parent (shared by
+    the single `move_file`/`move_folder` tools and their bulk counterparts).
+    `entity_type` is "items" (file) or "folders"."""
+    return {
+        "jsonapi": {"version": "1.0"},
+        "data": {
+            "type": entity_type,
+            "id": entity_id,
+            "relationships": {
+                "parent": {"data": {"type": "folders", "id": dest_parent_id}},
+            },
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1369,6 +1539,182 @@ async def list_tools() -> list[Tool]:
                 "required": ["company_name", "project_names", "default_role"],
             },
         ),
+        Tool(
+            name="bulk_list_folder_contents",
+            description=(
+                "Audit engine (read-only): list the immediate contents of many folders in one call. "
+                "Either pass an explicit `folders` list (slash-separated paths and/or raw folder URNs), "
+                "OR pass `children_of` to list the contents of EVERY immediate subfolder of that folder "
+                "(e.g. audit all building folders under 'Project Files' in a single call). "
+                "Returns each folder's subfolders (name + id) and files, so an orchestrator can diff "
+                "against a desired template without extra lookups. No dry_run (read-only)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folders": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Explicit folders to list (slash-separated paths or raw folder URNs). Use this OR children_of.",
+                    },
+                    "children_of": {
+                        "type": "string",
+                        "description": "List the contents of every immediate subfolder of this folder (path or URN). Use this OR folders.",
+                    },
+                    "include_regex": {
+                        "type": "string",
+                        "description": "With children_of: only audit subfolders whose display name matches this regex (e.g. '^B-B-').",
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Subfolder display names to skip (exact, case-insensitive).",
+                    },
+                    "include_files": {
+                        "type": "boolean",
+                        "description": "If true (default), return each folder's files; if false, return only subfolders + file_count.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max folders listed in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name"],
+            },
+        ),
+        Tool(
+            name="bulk_create_folders",
+            description=(
+                "Idempotent batch folder create. Each item is {parent, name} where parent is a "
+                "slash-separated path or a raw folder URN. With skip_if_exists=true (default), a child "
+                "folder whose name already exists under its parent is reported as 'exists' and never "
+                "duplicated — so re-running a partially-completed batch converges cleanly. "
+                "Set dry_run=true (default) to preview ('would_create' / 'would_exist')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "parent": {"type": "string", "description": "Parent folder path or URN."},
+                                "name": {"type": "string", "description": "Name for the new child folder."},
+                            },
+                            "required": ["parent", "name"],
+                        },
+                        "description": "Folders to create.",
+                    },
+                    "skip_if_exists": {"type": "boolean", "description": "If true (default), never create a duplicate same-named child."},
+                    "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
+                    "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "max_concurrency": {"type": "integer", "description": "Max creates in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "items"],
+            },
+        ),
+        Tool(
+            name="bulk_delete_folders",
+            description=(
+                "File-safe batch soft-delete (hide) of many folders. Each target is a slash-separated "
+                "path or a raw folder URN. Identical safety to the single delete_folder: a folder with "
+                "any file anywhere in its subtree is NEVER deleted — it is reported as 'skipped_has_files' "
+                "with file_count + sample_files (these are the 'stuck files', typically cloud-workshared "
+                "Revit models, for a human to move). Empty folders are soft-deleted (admin-reversible). "
+                "Set dry_run=true (default) to preview ('would_delete')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folders": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Folders to soft-delete (slash-separated paths or raw folder URNs).",
+                    },
+                    "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
+                    "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "max_concurrency": {"type": "integer", "description": "Max folders processed in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "folders"],
+            },
+        ),
+        Tool(
+            name="bulk_move_files",
+            description=(
+                "Batch-move many files into new folders (changes each file's parent; no re-upload, "
+                "version history preserved). Each item gives a destination plus EITHER a raw `item_id` "
+                "(e.g. a file id from bulk_list_folder_contents) OR a `source` folder + `name` to look it "
+                "up by. Idempotent: a file already in its destination is reported 'already_there'. "
+                "Cloud-workshared Revit models (C4RModel) return 403 and are reported 'skipped_unmovable' "
+                "(move them in the Revit/ACC UI). Set dry_run=true (default) to preview ('would_move')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "item_id": {"type": "string", "description": "Raw file (item) URN. Use this OR source+name."},
+                                "source": {"type": "string", "description": "Folder (path or URN) currently containing the file. Use with name."},
+                                "name": {"type": "string", "description": "File display name within source (exact, case-insensitive)."},
+                                "destination": {"type": "string", "description": "Target folder (path or URN)."},
+                            },
+                            "required": ["destination"],
+                        },
+                        "description": "Files to move.",
+                    },
+                    "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
+                    "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "max_concurrency": {"type": "integer", "description": "Max moves in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "items"],
+            },
+        ),
+        Tool(
+            name="bulk_move_folders",
+            description=(
+                "Batch-move many folders (with all their contents) under new parent folders by changing "
+                "each folder's parent. Each item gives a `folder` to move (path or URN) and a `destination` "
+                "parent (path or URN). Idempotent: a folder already directly under its destination is "
+                "reported 'already_there'. Set dry_run=true (default) to preview ('would_move')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "folder": {"type": "string", "description": "Folder to move (path or URN)."},
+                                "destination": {"type": "string", "description": "Target parent folder (path or URN)."},
+                            },
+                            "required": ["folder", "destination"],
+                        },
+                        "description": "Folders to move.",
+                    },
+                    "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
+                    "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "max_concurrency": {"type": "integer", "description": "Max moves in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name", "items"],
+            },
+        ),
     ]
 
 
@@ -1620,16 +1966,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     "dry_run": True,
                 }, indent=2))]
 
-            payload = {
-                "jsonapi": {"version": "1.0"},
-                "data": {
-                    "type": "items",
-                    "id": item_id,
-                    "relationships": {
-                        "parent": {"data": {"type": "folders", "id": dest_folder_id}},
-                    },
-                },
-            }
+            payload = _reparent_payload("items", item_id, dest_folder_id)
             patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             r = await client.patch(
                 f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}",
@@ -1678,16 +2015,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     "dry_run": True,
                 }, indent=2))]
 
-            payload = {
-                "jsonapi": {"version": "1.0"},
-                "data": {
-                    "type": "folders",
-                    "id": folder_id,
-                    "relationships": {
-                        "parent": {"data": {"type": "folders", "id": dest_parent_id}},
-                    },
-                },
-            }
+            payload = _reparent_payload("folders", folder_id, dest_parent_id)
             patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             r = await client.patch(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}",
@@ -1720,23 +2048,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             parent_id, _ = await _resolve_folder(client, token, hub_id, project_id, parent_path)
 
-            payload = {
-                "jsonapi": {"version": "1.0"},
-                "data": {
-                    "type": "folders",
-                    "attributes": {
-                        "name": folder_name,
-                        "displayName": folder_name,
-                        "extension": {
-                            "type": "folders:autodesk.bim360:Folder",
-                            "version": "1.0",
-                        },
-                    },
-                    "relationships": {
-                        "parent": {"data": {"type": "folders", "id": parent_id}},
-                    },
-                },
-            }
+            payload = _folder_create_payload(folder_name, parent_id)
             post_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             r = await client.post(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders",
@@ -1792,14 +2104,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     "Remove all files first, then retry."
                 )
 
-            payload = {
-                "jsonapi": {"version": "1.0"},
-                "data": {
-                    "type": "folders",
-                    "id": folder_id,
-                    "attributes": {"hidden": True},
-                },
-            }
+            payload = _folder_hide_payload(folder_id)
             patch_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             r = await client.patch(
                 f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}",
@@ -2926,6 +3231,495 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "users_found": len(company_emails),
                 "summary": summary, "results": results,
                 "warnings": warnings, "audit_file": audit_file,
+            }, indent=2))]
+
+        if name == "bulk_list_folder_contents":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            # One shared headers dict, mutated in place by the refresher on a 401,
+            # so a long batch outlives a token without re-resolving anything.
+            b_hdrs = dict(hdrs)
+            refresher = _bearer_refresher(b_hdrs)
+
+            include_files = arguments.get("include_files", True)
+            max_conc = arguments.get("max_concurrency") or 8
+            exclude_lower = {e.strip().lower() for e in (arguments.get("exclude") or [])}
+            children_of = arguments.get("children_of")
+            explicit = arguments.get("folders")
+            if bool(children_of) == bool(explicit):
+                raise ValueError("Provide exactly one of 'children_of' or 'folders'.")
+
+            targets: list[dict] = []  # {label, id|None, path|None}
+            if children_of:
+                parent_id, _ = await _resolve_folder(client, token, hub_id, project_id, children_of)
+                contents = await get_all_folder_contents(
+                    client, project_id, parent_id, b_hdrs, on_unauthorized=refresher
+                )
+                rx = re.compile(arguments["include_regex"]) if arguments.get("include_regex") else None
+                for it in contents:
+                    if it["type"] != "folders":
+                        continue
+                    nm = _folder_name(it["attributes"])
+                    if rx and not rx.search(nm):
+                        continue
+                    if nm.lower() in exclude_lower:
+                        continue
+                    targets.append({"label": nm, "id": it["id"], "path": None})
+            else:
+                for f in explicit:
+                    targets.append({"label": f, "id": None, "path": f})
+
+            async def _list_one(t):
+                try:
+                    if t["id"]:
+                        fid, fname = t["id"], t["label"]
+                    else:
+                        fid, fname = await _resolve_folder(client, token, hub_id, project_id, t["path"])
+                    items = await get_all_folder_contents(
+                        client, project_id, fid, b_hdrs, on_unauthorized=refresher
+                    )
+                    files = [i for i in items if i["type"] == "items"]
+                    row = {
+                        "folder": fname,
+                        "folder_id": fid,
+                        "subfolders": [
+                            {"name": _folder_name(i["attributes"]), "id": i["id"]}
+                            for i in items if i["type"] == "folders"
+                        ],
+                        "file_count": len(files),
+                    }
+                    if include_files:
+                        row["files"] = [{
+                            "name": i.get("attributes", {}).get("displayName"),
+                            "id": i["id"],
+                            "last_modified": i.get("attributes", {}).get("lastModifiedTime"),
+                            "created_by": i.get("attributes", {}).get("createUserName"),
+                        } for i in files]
+                    return ("ok", row)
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    return ("error", {"folder": t["label"], "error": str(e)})
+
+            outcomes = await _gather_bounded(max_conc, [lambda t=t: _list_one(t) for t in targets])
+            results = [p for s, p in outcomes if s == "ok"]
+            errors = [p for s, p in outcomes if s == "error"]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "summary": {"folders_listed": len(results), "errors": len(errors)},
+                "results": results,
+                "errors": errors,
+            }, indent=2))]
+
+        if name == "bulk_create_folders":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            refresher = _bearer_refresher(b_hdrs)
+
+            skip_if_exists = arguments.get("skip_if_exists", True)
+            dry_run = arguments.get("dry_run", True)
+            cont = arguments.get("continue_on_error", True)
+            max_conc = arguments.get("max_concurrency") or 8
+
+            # Dedupe identical (parent, name) pairs (case-insensitive), keeping first.
+            seen: set = set()
+            deduped: list[dict] = []
+            for it in (arguments.get("items") or []):
+                parent = (it.get("parent") or "").strip()
+                nm = (it.get("name") or "").strip()
+                key = (parent, nm.lower())
+                if not parent or not nm or key in seen:
+                    continue
+                seen.add(key)
+                deduped.append({"parent": parent, "name": nm})
+
+            # Resolve each unique parent once; cache its child names for skip_if_exists.
+            parents: dict = {}
+            for parent in {d["parent"] for d in deduped}:
+                try:
+                    pid, _ = await _resolve_folder(client, token, hub_id, project_id, parent)
+                    names: set = set()
+                    if skip_if_exists:
+                        contents = await get_all_folder_contents(
+                            client, project_id, pid, b_hdrs, on_unauthorized=refresher
+                        )
+                        for c in contents:
+                            if c["type"] == "folders":
+                                for k in ("name", "displayName"):
+                                    v = c["attributes"].get(k)
+                                    if v:
+                                        names.add(v.lower())
+                    parents[parent] = {"id": pid, "names": names, "error": None}
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    parents[parent] = {"id": None, "names": set(), "error": str(e)}
+
+            results = []
+            to_create = []
+            for d in deduped:
+                p = parents[d["parent"]]
+                if p["error"]:
+                    results.append({"parent": d["parent"], "name": d["name"], "action": "error", "folder_id": None, "error": p["error"]})
+                    continue
+                if skip_if_exists and d["name"].lower() in p["names"]:
+                    results.append({"parent": d["parent"], "name": d["name"], "action": ("would_exist" if dry_run else "exists"), "folder_id": None, "error": None})
+                    continue
+                if dry_run:
+                    results.append({"parent": d["parent"], "name": d["name"], "action": "would_create", "folder_id": None, "error": None})
+                    continue
+                to_create.append(d)
+
+            if to_create:
+                async def _create_one(d):
+                    p = parents[d["parent"]]
+                    try:
+                        r = await _request_with_retry(
+                            client, "post", f"{APS_BASE}/data/v1/projects/{project_id}/folders",
+                            headers=b_hdrs, json=_folder_create_payload(d["name"], p["id"]),
+                            on_unauthorized=refresher,
+                        )
+                        if not r.is_success:
+                            msg = f"HTTP {r.status_code}: {json.dumps(_error_body(r))[:300]}"
+                            if not cont:
+                                raise RuntimeError(msg)
+                            return {"parent": d["parent"], "name": d["name"], "action": "error", "folder_id": None, "error": msg}
+                        return {"parent": d["parent"], "name": d["name"], "action": "created", "folder_id": r.json().get("data", {}).get("id"), "error": None}
+                    except APSQuotaError:
+                        raise
+                    except Exception as e:
+                        if not cont:
+                            raise
+                        return {"parent": d["parent"], "name": d["name"], "action": "error", "folder_id": None, "error": str(e)}
+
+                results.extend(await _gather_bounded(max_conc, [lambda d=d: _create_one(d) for d in to_create]))
+
+            summary = {"created": 0, "exists": 0, "errors": 0}
+            for r in results:
+                a = r["action"]
+                if a in ("created", "would_create"):
+                    summary["created"] += 1
+                elif a in ("exists", "would_exist"):
+                    summary["exists"] += 1
+                else:
+                    summary["errors"] += 1
+            return [TextContent(type="text", text=json.dumps({
+                "dry_run": dry_run, "project": resolved_name,
+                "summary": summary, "results": results,
+            }, indent=2))]
+
+        if name == "bulk_delete_folders":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            refresher = _bearer_refresher(b_hdrs)
+
+            dry_run = arguments.get("dry_run", True)
+            cont = arguments.get("continue_on_error", True)
+            max_conc = arguments.get("max_concurrency") or 8
+
+            def _err_row(target, fid, fname, exc):
+                return {"folder": fname or target, "folder_id": fid, "action": "error",
+                        "file_count": 0, "sample_files": [], "error": str(exc)}
+
+            def _not_found(target):
+                return {"folder": target, "folder_id": None, "action": "not_found",
+                        "file_count": 0, "sample_files": [], "error": None}
+
+            async def _del_one(target):
+                # Resolve (path or URN). Misses → not_found; other failures → error.
+                try:
+                    fid, fname = await _resolve_folder(client, token, hub_id, project_id, target)
+                except APSQuotaError:
+                    raise
+                except ValueError as e:
+                    if "not found" in str(e).lower():
+                        return _not_found(target)
+                    if not cont:
+                        raise
+                    return _err_row(target, None, None, e)
+                except httpx.HTTPStatusError as e:
+                    if e.response is not None and e.response.status_code == 404:
+                        return _not_found(target)
+                    if not cont:
+                        raise
+                    return _err_row(target, None, None, e)
+                except Exception as e:
+                    if not cont:
+                        raise
+                    return _err_row(target, None, None, e)
+
+                try:
+                    count, sample = await _subtree_file_info(
+                        client, project_id, fid, b_hdrs, on_unauthorized=refresher
+                    )
+                    if count > 0:
+                        return {"folder": fname, "folder_id": fid, "action": "skipped_has_files",
+                                "file_count": count, "sample_files": sample, "error": None}
+                    if dry_run:
+                        return {"folder": fname, "folder_id": fid, "action": "would_delete",
+                                "file_count": 0, "sample_files": [], "error": None}
+                    r = await _request_with_retry(
+                        client, "patch", f"{APS_BASE}/data/v1/projects/{project_id}/folders/{fid}",
+                        headers=b_hdrs, json=_folder_hide_payload(fid), on_unauthorized=refresher,
+                    )
+                    if not r.is_success:
+                        msg = f"HTTP {r.status_code}: {json.dumps(_error_body(r))[:300]}"
+                        if not cont:
+                            raise RuntimeError(msg)
+                        return _err_row(target, fid, fname, msg)
+                    return {"folder": fname, "folder_id": fid, "action": "deleted",
+                            "file_count": 0, "sample_files": [], "error": None}
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    if not cont:
+                        raise
+                    return _err_row(target, fid, fname, e)
+
+            rows = await _gather_bounded(max_conc, [lambda t=t: _del_one(t) for t in (arguments.get("folders") or [])])
+            summary = {"deleted": 0, "skipped_has_files": 0, "not_found": 0, "errors": 0}
+            for r in rows:
+                a = r["action"]
+                if a in ("deleted", "would_delete"):
+                    summary["deleted"] += 1
+                elif a == "skipped_has_files":
+                    summary["skipped_has_files"] += 1
+                elif a == "not_found":
+                    summary["not_found"] += 1
+                else:
+                    summary["errors"] += 1
+            return [TextContent(type="text", text=json.dumps({
+                "dry_run": dry_run, "project": resolved_name,
+                "summary": summary, "results": rows,
+            }, indent=2))]
+
+        if name == "bulk_move_files":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            refresher = _bearer_refresher(b_hdrs)
+
+            dry_run = arguments.get("dry_run", True)
+            cont = arguments.get("continue_on_error", True)
+            max_conc = arguments.get("max_concurrency") or 8
+            items = arguments.get("items") or []
+
+            # Resolve + list every unique source/destination folder once. The
+            # files map enables source-by-name lookup AND 'already_there' idempotency.
+            unique_folders: set = set()
+            for it in items:
+                if it.get("destination"):
+                    unique_folders.add(it["destination"])
+                if it.get("source"):
+                    unique_folders.add(it["source"])
+            fcache: dict = {}
+            for s in unique_folders:
+                try:
+                    fid, _ = await _resolve_folder(client, token, hub_id, project_id, s)
+                    contents = await get_all_folder_contents(
+                        client, project_id, fid, b_hdrs, on_unauthorized=refresher
+                    )
+                    by_name: dict = {}
+                    ids: set = set()
+                    for i in contents:
+                        if i["type"] == "items":
+                            by_name[(i["attributes"].get("displayName") or "").lower()] = i["id"]
+                            ids.add(i["id"])
+                    fcache[s] = {"id": fid, "error": None, "by_name": by_name, "ids": ids}
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    fcache[s] = {"id": None, "error": str(e), "by_name": {}, "ids": set()}
+
+            def _mv_row(it, item_id, action, error=None):
+                return {"file": it.get("name") or item_id, "item_id": item_id,
+                        "from": it.get("source"), "to": it.get("destination"),
+                        "action": action, "error": error}
+
+            results = []
+            to_move = []  # (it, item_id, dest_id)
+            for it in items:
+                dest = it.get("destination")
+                dentry = fcache.get(dest)
+                if not dest or dentry is None or dentry["error"]:
+                    results.append(_mv_row(it, it.get("item_id"), "error",
+                                           (dentry["error"] if dentry else "destination missing")))
+                    continue
+                item_id = it.get("item_id")
+                if item_id:
+                    if item_id in dentry["ids"]:
+                        results.append(_mv_row(it, item_id, "already_there"))
+                        continue
+                else:
+                    src, nm = it.get("source"), it.get("name")
+                    if not src or not nm:
+                        results.append(_mv_row(it, None, "error", "Provide item_id or source+name."))
+                        continue
+                    sentry = fcache.get(src)
+                    if sentry is None or sentry["error"]:
+                        results.append(_mv_row(it, None, "error", sentry["error"] if sentry else "source missing"))
+                        continue
+                    key = nm.strip().lower()
+                    if key in sentry["by_name"]:
+                        item_id = sentry["by_name"][key]
+                    elif key in dentry["by_name"]:
+                        results.append(_mv_row(it, dentry["by_name"][key], "already_there"))
+                        continue
+                    else:
+                        results.append(_mv_row(it, None, "not_found"))
+                        continue
+                if dry_run:
+                    results.append(_mv_row(it, item_id, "would_move"))
+                    continue
+                to_move.append((it, item_id, dentry["id"]))
+
+            if to_move:
+                async def _move_one(it, item_id, dest_id):
+                    try:
+                        r = await _request_with_retry(
+                            client, "patch", f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}",
+                            headers=b_hdrs, json=_reparent_payload("items", item_id, dest_id),
+                            on_unauthorized=refresher,
+                        )
+                        if r.status_code == 403:
+                            return _mv_row(it, item_id, "skipped_unmovable",
+                                           "403 — likely a cloud-workshared C4R model; move it in the Revit/ACC UI.")
+                        if not r.is_success:
+                            msg = f"HTTP {r.status_code}: {json.dumps(_error_body(r))[:300]}"
+                            if not cont:
+                                raise RuntimeError(msg)
+                            return _mv_row(it, item_id, "error", msg)
+                        return _mv_row(it, item_id, "moved")
+                    except APSQuotaError:
+                        raise
+                    except Exception as e:
+                        if not cont:
+                            raise
+                        return _mv_row(it, item_id, "error", str(e))
+
+                results.extend(await _gather_bounded(max_conc, [lambda a=a: _move_one(*a) for a in to_move]))
+
+            summary = {"moved": 0, "already_there": 0, "skipped_unmovable": 0, "not_found": 0, "errors": 0}
+            for r in results:
+                a = r["action"]
+                if a in ("moved", "would_move"):
+                    summary["moved"] += 1
+                elif a == "already_there":
+                    summary["already_there"] += 1
+                elif a == "skipped_unmovable":
+                    summary["skipped_unmovable"] += 1
+                elif a == "not_found":
+                    summary["not_found"] += 1
+                else:
+                    summary["errors"] += 1
+            return [TextContent(type="text", text=json.dumps({
+                "dry_run": dry_run, "project": resolved_name,
+                "summary": summary, "results": results,
+            }, indent=2))]
+
+        if name == "bulk_move_folders":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
+            refresher = _bearer_refresher(b_hdrs)
+
+            dry_run = arguments.get("dry_run", True)
+            cont = arguments.get("continue_on_error", True)
+            max_conc = arguments.get("max_concurrency") or 8
+            items = arguments.get("items") or []
+
+            # Resolve + list every unique destination once; its subfolder ids give
+            # 'already_there' idempotency.
+            dcache: dict = {}
+            for s in {it["destination"] for it in items if it.get("destination")}:
+                try:
+                    did, _ = await _resolve_folder(client, token, hub_id, project_id, s)
+                    contents = await get_all_folder_contents(
+                        client, project_id, did, b_hdrs, on_unauthorized=refresher
+                    )
+                    dcache[s] = {"id": did, "error": None,
+                                 "sub_ids": {i["id"] for i in contents if i["type"] == "folders"}}
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    dcache[s] = {"id": None, "error": str(e), "sub_ids": set()}
+
+            def _mvf_row(folder_label, fid, dest, action, error=None):
+                return {"folder": folder_label, "folder_id": fid, "to": dest,
+                        "action": action, "error": error}
+
+            async def _movef_one(it):
+                folder, dest = it.get("folder"), it.get("destination")
+                dentry = dcache.get(dest)
+                if not folder or not dest or dentry is None or dentry["error"]:
+                    return _mvf_row(folder, None, dest, "error",
+                                    (dentry["error"] if dentry else "destination missing"))
+                try:
+                    fid, fname = await _resolve_folder(client, token, hub_id, project_id, folder)
+                except APSQuotaError:
+                    raise
+                except ValueError as e:
+                    if "not found" in str(e).lower():
+                        return _mvf_row(folder, None, dest, "not_found")
+                    if not cont:
+                        raise
+                    return _mvf_row(folder, None, dest, "error", str(e))
+                except httpx.HTTPStatusError as e:
+                    if e.response is not None and e.response.status_code == 404:
+                        return _mvf_row(folder, None, dest, "not_found")
+                    if not cont:
+                        raise
+                    return _mvf_row(folder, None, dest, "error", str(e))
+                except Exception as e:
+                    if not cont:
+                        raise
+                    return _mvf_row(folder, None, dest, "error", str(e))
+
+                if fid in dentry["sub_ids"]:
+                    return _mvf_row(fname, fid, dest, "already_there")
+                if dry_run:
+                    return _mvf_row(fname, fid, dest, "would_move")
+                try:
+                    r = await _request_with_retry(
+                        client, "patch", f"{APS_BASE}/data/v1/projects/{project_id}/folders/{fid}",
+                        headers=b_hdrs, json=_reparent_payload("folders", fid, dentry["id"]),
+                        on_unauthorized=refresher,
+                    )
+                    if not r.is_success:
+                        msg = f"HTTP {r.status_code}: {json.dumps(_error_body(r))[:300]}"
+                        if not cont:
+                            raise RuntimeError(msg)
+                        return _mvf_row(fname, fid, dest, "error", msg)
+                    return _mvf_row(fname, fid, dest, "moved")
+                except APSQuotaError:
+                    raise
+                except Exception as e:
+                    if not cont:
+                        raise
+                    return _mvf_row(fname, fid, dest, "error", str(e))
+
+            rows = await _gather_bounded(max_conc, [lambda it=it: _movef_one(it) for it in items])
+            summary = {"moved": 0, "already_there": 0, "not_found": 0, "errors": 0}
+            for r in rows:
+                a = r["action"]
+                if a in ("moved", "would_move"):
+                    summary["moved"] += 1
+                elif a == "already_there":
+                    summary["already_there"] += 1
+                elif a == "not_found":
+                    summary["not_found"] += 1
+                else:
+                    summary["errors"] += 1
+            return [TextContent(type="text", text=json.dumps({
+                "dry_run": dry_run, "project": resolved_name,
+                "summary": summary, "results": rows,
             }, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
