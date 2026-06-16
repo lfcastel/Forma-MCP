@@ -405,7 +405,7 @@ Export the full permission matrix for Project Files in "Northgate Tower"
 
 ## License
 
-Released under the [Creative Commons Zero v1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/) (CC0) license — you may use, copy, modify, and distribute this work without restriction.
+Licensed under the [GNU Lesser General Public License v3.0](https://www.gnu.org/licenses/lgpl-3.0.html) (LGPL-3.0).
 
 ---
 
