@@ -1,1 +1,5 @@
+# Default owner for everything; required by the branch ruleset's
+# "require code owner review" rule.
+* @lfcastel
+
 CLAUDE.md @lfcastel
