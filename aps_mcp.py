@@ -1575,6 +1575,16 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true (default), return each folder's files; if false, return only subfolders + file_count.",
                     },
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["files", "subfolders"]},
+                        "description": "Restrict each folder row to these sections (default: both). When provided, file entries are returned lean (id + name only, dropping last_modified/created_by) — ideal when you only need URNs to feed into a move.",
+                    },
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only folders that have files or subfolders (empties dropped). 'full' echoes every folder. 'summary' returns only the counts (the always-present 'errors' array still surfaces any folder that failed to list). Counts are accurate regardless.",
+                    },
                     "max_concurrency": {"type": "integer", "description": "Max folders listed in parallel (default 8)."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
@@ -1638,6 +1648,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
                     "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only the rows needing attention (skipped_has_files + errors; the deleted/would_delete/not_found no-ops are dropped). 'full' echoes every row. 'summary' returns only the counts, but failures (skipped_has_files + errors) are still surfaced via a 'failures' array. Counts are accurate regardless.",
+                    },
                     "max_concurrency": {"type": "integer", "description": "Max folders processed in parallel (default 8)."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
@@ -1675,6 +1690,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
                     "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only the rows needing attention (errors + skipped_unmovable + not_found; the moved/would_move/already_there no-ops are dropped). 'full' echoes every row. 'summary' returns only the counts, but failures (errors + skipped_unmovable + not_found) are still surfaced via a 'failures' array. Counts are accurate regardless.",
+                    },
                     "max_concurrency": {"type": "integer", "description": "Max moves in parallel (default 8)."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
@@ -1708,6 +1728,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "dry_run": {"type": "boolean", "description": "If true (default), preview without making changes."},
                     "continue_on_error": {"type": "boolean", "description": "If true (default), one failing item never aborts the batch."},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only the rows needing attention (errors + not_found; the moved/would_move/already_there no-ops are dropped). 'full' echoes every row. 'summary' returns only the counts, but failures (errors + not_found) are still surfaced via a 'failures' array. Counts are accurate regardless.",
+                    },
                     "max_concurrency": {"type": "integer", "description": "Max moves in parallel (default 8)."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'BAC - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
@@ -1734,6 +1759,36 @@ def _quota_error_result(message: str, retry_after: "int | None") -> CallToolResu
             "retry_after_seconds": retry_after,
         }, indent=2))],
     )
+
+
+def _shape_bulk_response(payload: dict, results: list, detail: "str | None",
+                         noteworthy, failure=None) -> dict:
+    """Gate a bulk tool's per-item `results` array on `response_detail`, leaving the
+    already-computed `summary` counts untouched.
+
+    - "full": echo every row (legacy behaviour).
+    - "changes" (default): keep only rows for which `noteworthy(row)` is true — the
+      no-op/success-noise (moved/already_there/deleted/empty folders) is dropped.
+    - "summary": omit `results` entirely, but NEVER drop failures: any row matching
+      `failure(row)` is still surfaced under a `failures` array (so a summary run
+      still returns the locked/unmovable list a caller must act on).
+
+    `failure` defaults to `noteworthy` (for the mutating tools every noteworthy row
+    is a problem); pass an explicit predicate where the two differ (the audit tool:
+    a non-empty folder is noteworthy but not a failure).
+    """
+    detail = detail or "changes"
+    if failure is None:
+        failure = noteworthy
+    if detail == "full":
+        payload["results"] = results
+    elif detail == "summary":
+        fails = [r for r in results if failure(r)]
+        if fails:
+            payload["failures"] = fails
+    else:  # "changes"
+        payload["results"] = [r for r in results if noteworthy(r)]
+    return payload
 
 
 @app.call_tool()
@@ -3245,6 +3300,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             include_files = arguments.get("include_files", True)
             max_conc = arguments.get("max_concurrency") or 8
             exclude_lower = {e.strip().lower() for e in (arguments.get("exclude") or [])}
+            fields_arg = arguments.get("fields")
+            fields_set = {f.strip().lower() for f in fields_arg} if fields_arg else None
+            lean_files = fields_set is not None  # caller signalled they want minimal rows
+            want_subfolders = fields_set is None or "subfolders" in fields_set
+            want_files = include_files and (fields_set is None or "files" in fields_set)
             children_of = arguments.get("children_of")
             explicit = arguments.get("folders")
             if bool(children_of) == bool(explicit):
@@ -3283,19 +3343,26 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     row = {
                         "folder": fname,
                         "folder_id": fid,
-                        "subfolders": [
-                            {"name": _folder_name(i["attributes"]), "id": i["id"]}
-                            for i in items if i["type"] == "folders"
-                        ],
                         "file_count": len(files),
                     }
-                    if include_files:
-                        row["files"] = [{
-                            "name": i.get("attributes", {}).get("displayName"),
-                            "id": i["id"],
-                            "last_modified": i.get("attributes", {}).get("lastModifiedTime"),
-                            "created_by": i.get("attributes", {}).get("createUserName"),
-                        } for i in files]
+                    if want_subfolders:
+                        row["subfolders"] = [
+                            {"name": _folder_name(i["attributes"]), "id": i["id"]}
+                            for i in items if i["type"] == "folders"
+                        ]
+                    if want_files:
+                        if lean_files:
+                            row["files"] = [{
+                                "name": i.get("attributes", {}).get("displayName"),
+                                "id": i["id"],
+                            } for i in files]
+                        else:
+                            row["files"] = [{
+                                "name": i.get("attributes", {}).get("displayName"),
+                                "id": i["id"],
+                                "last_modified": i.get("attributes", {}).get("lastModifiedTime"),
+                                "created_by": i.get("attributes", {}).get("createUserName"),
+                            } for i in files]
                     return ("ok", row)
                 except APSQuotaError:
                     raise
@@ -3305,12 +3372,19 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             outcomes = await _gather_bounded(max_conc, [lambda t=t: _list_one(t) for t in targets])
             results = [p for s, p in outcomes if s == "ok"]
             errors = [p for s, p in outcomes if s == "error"]
-            return [TextContent(type="text", text=json.dumps({
+            # A non-empty folder is noteworthy (keep under 'changes'); failures are
+            # carried by the always-present 'errors' array, so under 'summary' the
+            # 'results' array is simply omitted (failure=None).
+            payload = {
                 "project": resolved_name,
                 "summary": {"folders_listed": len(results), "errors": len(errors)},
-                "results": results,
-                "errors": errors,
-            }, indent=2))]
+            }
+            _shape_bulk_response(
+                payload, results, arguments.get("response_detail"),
+                noteworthy=lambda r: r.get("file_count", 0) > 0 or bool(r.get("subfolders")),
+            )
+            payload["errors"] = errors
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_create_folders":
             hub_id, project_id, resolved_name = await resolve_project(
@@ -3493,10 +3567,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     summary["not_found"] += 1
                 else:
                     summary["errors"] += 1
-            return [TextContent(type="text", text=json.dumps({
-                "dry_run": dry_run, "project": resolved_name,
-                "summary": summary, "results": rows,
-            }, indent=2))]
+            payload = {"dry_run": dry_run, "project": resolved_name, "summary": summary}
+            _shape_bulk_response(
+                payload, rows, arguments.get("response_detail"),
+                noteworthy=lambda r: r["action"] in ("skipped_has_files", "error"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_move_files":
             hub_id, project_id, resolved_name = await resolve_project(
@@ -3618,10 +3694,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     summary["not_found"] += 1
                 else:
                     summary["errors"] += 1
-            return [TextContent(type="text", text=json.dumps({
-                "dry_run": dry_run, "project": resolved_name,
-                "summary": summary, "results": results,
-            }, indent=2))]
+            payload = {"dry_run": dry_run, "project": resolved_name, "summary": summary}
+            _shape_bulk_response(
+                payload, results, arguments.get("response_detail"),
+                noteworthy=lambda r: r["action"] in ("error", "skipped_unmovable", "not_found"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_move_folders":
             hub_id, project_id, resolved_name = await resolve_project(
@@ -3717,10 +3795,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     summary["not_found"] += 1
                 else:
                     summary["errors"] += 1
-            return [TextContent(type="text", text=json.dumps({
-                "dry_run": dry_run, "project": resolved_name,
-                "summary": summary, "results": rows,
-            }, indent=2))]
+            payload = {"dry_run": dry_run, "project": resolved_name, "summary": summary}
+            _shape_bulk_response(
+                payload, rows, arguments.get("response_detail"),
+                noteworthy=lambda r: r["action"] in ("error", "not_found"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
 

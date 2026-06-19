@@ -90,6 +90,7 @@ async def test_bulk_move_files_dry_run_would_move():
                 "destination": "Project Files/B-B-704/User A",
             }],
             "dry_run": True,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -114,6 +115,7 @@ async def test_bulk_move_files_live_moves():
             "items": [{"source": "Project Files/B-B-704/0. WIP", "name": "model.nwc",
                        "destination": "Project Files/B-B-704/User A"}],
             "dry_run": False,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -156,6 +158,7 @@ async def test_bulk_move_files_already_there_is_idempotent():
             "items": [{"source": "Project Files/B-B-704/0. WIP", "name": "model.nwc",
                        "destination": "Project Files/B-B-704/User A"}],
             "dry_run": False,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -203,6 +206,7 @@ async def test_bulk_move_folders_dry_run_would_move():
             "project_name": PROJECT_NAME,
             "items": [{"folder": "Project Files/B-B-704", "destination": "Project Files/Archive"}],
             "dry_run": True,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -222,6 +226,7 @@ async def test_bulk_move_folders_live_moves():
             "project_name": PROJECT_NAME,
             "items": [{"folder": "Project Files/B-B-704", "destination": "Project Files/Archive"}],
             "dry_run": False,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -239,6 +244,7 @@ async def test_bulk_move_folders_already_there_is_idempotent():
             "project_name": PROJECT_NAME,
             "items": [{"folder": "Project Files/B-B-704", "destination": "Project Files/Archive"}],
             "dry_run": False,
+            "response_detail": "full",
         })
 
     data = _parse(result)

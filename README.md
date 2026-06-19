@@ -175,6 +175,20 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 
 > **File safety is absolute.** `bulk_delete_folders` applies the same subtree-file check as the single `delete_folder` and only ever soft-deletes (admin-reversible). The `skipped_has_files` rows are the "stuck files" (typically cloud-workshared Revit/C4R models the API can't move) for a human to relocate in the ACC UI. Both mutating tools support `continue_on_error` (default true), a `max_concurrency` cap (default 8), and survive a mid-batch token expiry (a 401 triggers a one-time token refresh).
 
+#### Output verbosity — `response_detail`
+
+`bulk_move_files`, `bulk_move_folders`, `bulk_delete_folders`, and `bulk_list_folder_contents` take a `response_detail` parameter that shapes the returned `results` array **without changing what the tool does** (the `summary` counts are always computed before filtering and stay accurate at every level):
+
+| Value | Returns |
+|-------|---------|
+| `full` | Every row (legacy behaviour — nothing dropped). |
+| `changes` *(default)* | Summary + only the rows that need attention — moves keep `error` / `skipped_unmovable` / `not_found`; deletes keep `skipped_has_files` / `error`; the audit keeps only folders with files or subfolders. The success/no-op noise (`moved`, `already_there`, `deleted`, empty folders) is dropped. |
+| `summary` | Only the summary counts — the per-item `results` array is omitted. **Failures are never lost:** any locked/unmovable/stuck row is still surfaced under a small `failures` array (and the audit's separate `errors` array is always present). |
+
+`changes` is the default because in a typical batch almost everything succeeds silently and only the locked/conflict cases need action — returning just those is the bulk of the token saving. Pass `response_detail: "full"` to get the old echo-everything behaviour.
+
+> **Lean audits — `fields`.** `bulk_list_folder_contents` also takes `fields: ["files", "subfolders"]` to restrict each folder row to just those sections. When `fields` is given, file entries are returned **lean** (`id` + `name` only, dropping `last_modified` / `created_by`) — ideal when you only need URNs to feed straight into a `bulk_move_files` call.
+
 ---
 
 ## Tools & API endpoints
