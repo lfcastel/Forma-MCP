@@ -221,6 +221,7 @@ async def test_bulk_delete_dry_run_would_delete_empty():
             "project_name": PROJECT_NAME,
             "folders": ["Project Files/B-B-704/Sensitive"],
             "dry_run": True,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -242,6 +243,7 @@ async def test_bulk_delete_live_soft_deletes_empty():
             "project_name": PROJECT_NAME,
             "folders": ["Project Files/B-B-704/Sensitive"],
             "dry_run": False,
+            "response_detail": "full",
         })
 
     data = _parse(result)
@@ -260,6 +262,7 @@ async def test_bulk_delete_missing_folder_is_not_found():
             "project_name": PROJECT_NAME,
             "folders": ["Project Files/B-B-704/Does Not Exist"],
             "dry_run": True,
+            "response_detail": "full",
         })
 
     data = _parse(result)
