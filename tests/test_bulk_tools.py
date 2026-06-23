@@ -405,14 +405,14 @@ async def test_clone_reference_not_found_returns_error():
          patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
 
         result = await aps_mcp.call_tool("clone_user_access", {
-            "reference_user_email": "nobody@bac.be",
+            "reference_user_email": "nobody@example.com",
             "target_user_emails": [USER_B_EMAIL],
             "dry_run": True,
         })
 
     data = _parse(result)
     assert "error" in data
-    assert "nobody@bac.be" in data["error"]
+    assert "nobody@example.com" in data["error"]
 
 
 @respx.mock
@@ -484,7 +484,7 @@ async def test_company_assign_unknown_company_returns_error():
 
 @respx.mock
 async def test_company_assign_dry_run_resolves_company_members():
-    """Both BAC users belong to COMPANY_NAME — both should appear as would_add."""
+    """Both test users belong to COMPANY_NAME — both should appear as would_add."""
     _mock_common(respx)
 
     with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \

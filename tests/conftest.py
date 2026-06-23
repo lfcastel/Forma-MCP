@@ -32,12 +32,12 @@ ROLE_ID_EDITOR = "role-editor-id"
 ROLE_NAME_VIEWER = "Viewer"
 ROLE_NAME_EDITOR = "Editor"
 
-USER_A_EMAIL = "alice@bac.be"
+USER_A_EMAIL = "alice@example.com"
 USER_A_ID = "user-id-alice"
-USER_B_EMAIL = "bob@bac.be"
+USER_B_EMAIL = "bob@example.com"
 USER_B_ID = "user-id-bob"
 
-COMPANY_NAME = "BAC Internal"
+COMPANY_NAME = "Acme Corp"
 
 
 # ---------------------------------------------------------------------------

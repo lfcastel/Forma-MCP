@@ -82,7 +82,7 @@ async def test_bulk_list_children_of_filters_and_returns_subfolders_and_files():
     ])
     _contents_route(respx, B704_ID, [
         _folder(WIP704_ID, "0. WIP"),
-        _folder(STD704_ID, "BAC CAD Standard Plans"),
+        _folder(STD704_ID, "Standard Plans"),
         _item("urn:adsk.wipemea:fs.file:co.f1", "house_BIM-model.nwc"),
     ])
 
@@ -101,7 +101,7 @@ async def test_bulk_list_children_of_filters_and_returns_subfolders_and_files():
     assert row["folder"] == "B-B-704"
     assert row["file_count"] == 1
     names = {s["name"] for s in row["subfolders"]}
-    assert names == {"0. WIP", "BAC CAD Standard Plans"}
+    assert names == {"0. WIP", "Standard Plans"}
     assert row["files"][0]["name"] == "house_BIM-model.nwc"
     assert row["files"][0]["created_by"] == "Alice"
 
@@ -136,13 +136,13 @@ async def test_bulk_create_dry_run_skips_existing():
     _mock_base(respx)
     # parent path 'Project Files/B-B-704' → PF contents (find B704), then B704 children.
     _contents_route(respx, PF_ID, [_folder(B704_ID, "B-B-704")])
-    _contents_route(respx, B704_ID, [_folder(STD704_ID, "BAC CAD Standard Plans")])
+    _contents_route(respx, B704_ID, [_folder(STD704_ID, "Standard Plans")])
 
     with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
         result = await aps_mcp.call_tool("bulk_create_folders", {
             "project_name": PROJECT_NAME,
             "items": [
-                {"parent": "Project Files/B-B-704", "name": "BAC CAD Standard Plans"},
+                {"parent": "Project Files/B-B-704", "name": "Standard Plans"},
                 {"parent": "Project Files/B-B-704", "name": "Sensitive"},
             ],
             "dry_run": True,
@@ -152,7 +152,7 @@ async def test_bulk_create_dry_run_skips_existing():
     assert data["dry_run"] is True
     assert data["summary"] == {"created": 1, "exists": 1, "errors": 0}
     actions = {r["name"]: r["action"] for r in data["results"]}
-    assert actions["BAC CAD Standard Plans"] == "would_exist"
+    assert actions["Standard Plans"] == "would_exist"
     assert actions["Sensitive"] == "would_create"
 
 
@@ -160,7 +160,7 @@ async def test_bulk_create_dry_run_skips_existing():
 async def test_bulk_create_live_creates_missing():
     _mock_base(respx)
     _contents_route(respx, PF_ID, [_folder(B704_ID, "B-B-704")])
-    _contents_route(respx, B704_ID, [_folder(STD704_ID, "BAC CAD Standard Plans")])
+    _contents_route(respx, B704_ID, [_folder(STD704_ID, "Standard Plans")])
     respx.post(f"{BASE}/data/v1/projects/{PROJECT_ID}/folders").mock(
         return_value=httpx.Response(201, json={"data": {"id": SENS704_ID}}))
 
@@ -168,7 +168,7 @@ async def test_bulk_create_live_creates_missing():
         result = await aps_mcp.call_tool("bulk_create_folders", {
             "project_name": PROJECT_NAME,
             "items": [
-                {"parent": "Project Files/B-B-704", "name": "BAC CAD Standard Plans"},
+                {"parent": "Project Files/B-B-704", "name": "Standard Plans"},
                 {"parent": "Project Files/B-B-704", "name": "Sensitive"},
             ],
             "dry_run": False,

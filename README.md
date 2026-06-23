@@ -106,7 +106,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 ## Tools reference
 
-> **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "BAC - EU Hub"`. Without it, the first hub returned for the region is used.
+> **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "My Company - EU Hub"`. Without it, the first hub returned for the region is used.
 
 ### Navigation & file exploration
 
@@ -342,10 +342,10 @@ flowchart LR
 ```
 List all my ACC hubs
 Show all projects in my hub
-Show all projects in the "BAC - EU Hub" hub
+Show all projects in the "My Company - EU Hub" hub
 What are the top folders in "Northgate Tower"?
 List the contents of Project Files/Drawings/Structural in "Northgate Tower"
-List the contents of Project Files/Drawings in "Northgate Tower" in hub "BAC - EU Hub"
+List the contents of Project Files/Drawings in "Northgate Tower" in hub "My Company - EU Hub"
 Find all files named "facade" in "Northgate Tower"
 What files were modified in the last 7 days in "Northgate Tower"?
 ```
@@ -366,17 +366,6 @@ Clone the project access of john.doe@example.com to jane.smith@example.com
 Remove alice@contractor.com from all projects she's a member of
 Update the role of all Acme Engineering members in "Central Station" to Viewer
 Show me a dry run of adding Acme Engineering to the "Riverside Bridge" project
-```
-
-### Bulk folder reorg (always previewed before execution)
-
-```
-Audit every building folder under Project Files in "AS-IS Buildings" (children_of, regex ^B-B-)
-For each building, create the missing standard subfolders and delete the empty legacy ones — dry run first
-Delete the legacy 0. WIP / 1. SHARED / 2. PUBLISHED / 3. ARCHIVED folders, but skip any that still hold files
-Move every file out of each building's 0. WIP into its User A folder, then delete the empty WIP folders
-Move the B-B-7xx building folders under Project Files/Archive
-Re-run the create + delete as a dry run to prove the reorg is idempotent (zero would-change rows)
 ```
 
 ### Permission auditing

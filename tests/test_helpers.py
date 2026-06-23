@@ -94,16 +94,16 @@ def test_write_audit_csv_creates_file(tmp_path, monkeypatch):
     )
 
     rows = [
-        {"user": "alice@bac.be", "project": "Test Project", "role": "Viewer", "status": "success", "message": ""},
-        {"user": "bob@bac.be",   "project": "Test Project", "role": "Viewer", "status": "error",   "message": "HTTP 403"},
+        {"user": "alice@example.com", "project": "Test Project", "role": "Viewer", "status": "success", "message": ""},
+        {"user": "bob@example.com",   "project": "Test Project", "role": "Viewer", "status": "error",   "message": "HTTP 403"},
     ]
     filepath = aps_mcp._write_audit_csv(rows, "test_op")
 
     assert os.path.isfile(filepath)
     with open(filepath, encoding="utf-8") as f:
         content = f.read()
-    assert "alice@bac.be" in content
-    assert "bob@bac.be" in content
+    assert "alice@example.com" in content
+    assert "bob@example.com" in content
     assert "HTTP 403" in content
     # Header row must be present
     assert "user" in content
@@ -159,7 +159,7 @@ def test_extract_response_items_unknown_keys():
 # ---------------------------------------------------------------------------
 
 def test_norm_emails_lowercases_and_strips():
-    assert aps_mcp._norm_emails(["  ALICE@BAC.BE  ", "Bob@BAC.BE"]) == ["alice@bac.be", "bob@bac.be"]
+    assert aps_mcp._norm_emails(["  ALICE@EXAMPLE.COM  ", "Bob@EXAMPLE.COM"]) == ["alice@example.com", "bob@example.com"]
 
 
 def test_norm_region_defaults_to_emea():
