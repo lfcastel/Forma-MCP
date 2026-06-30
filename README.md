@@ -168,6 +168,7 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 | Tool | What it does | Auth |
 |------|-------------|------|
 | `bulk_list_folder_contents` | Audit engine (read-only): list the immediate contents of many folders — or of every subfolder of one parent — in a single call, returning subfolders (name + id) and files | 3-legged |
+| `audit_folder_naming_standards` | Naming-convention audit (read-only): walk a folder subtree (or the whole project) and report which naming standard each folder enforces, grouped by standard, and flag the folders with none | 3-legged |
 | `bulk_create_folders` | Idempotent batch create: `{parent, name}` items; `skip_if_exists` (default) reports `exists` instead of duplicating | 3-legged |
 | `bulk_delete_folders` | File-safe batch soft-delete: never deletes a folder with any file in its subtree — reports it as `skipped_has_files` with `file_count` + `sample_files` | 3-legged |
 | `bulk_move_files` | Batch-move files into new folders (no re-upload); idempotent (`already_there`); C4R models that 403 are reported `skipped_unmovable` | 3-legged |
@@ -177,17 +178,19 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 
 #### Output verbosity — `response_detail`
 
-`bulk_move_files`, `bulk_move_folders`, `bulk_delete_folders`, and `bulk_list_folder_contents` take a `response_detail` parameter that shapes the returned `results` array **without changing what the tool does** (the `summary` counts are always computed before filtering and stay accurate at every level):
+`bulk_move_files`, `bulk_move_folders`, `bulk_delete_folders`, `bulk_list_folder_contents`, and `audit_folder_naming_standards` take a `response_detail` parameter that shapes the returned `results` array **without changing what the tool does** (the `summary` counts are always computed before filtering and stay accurate at every level):
 
 | Value | Returns |
 |-------|---------|
 | `full` | Every row (legacy behaviour — nothing dropped). |
-| `changes` *(default)* | Summary + only the rows that need attention — moves keep `error` / `skipped_unmovable` / `not_found`; deletes keep `skipped_has_files` / `error`; the audit keeps only folders with files or subfolders. The success/no-op noise (`moved`, `already_there`, `deleted`, empty folders) is dropped. |
-| `summary` | Only the summary counts — the per-item `results` array is omitted. **Failures are never lost:** any locked/unmovable/stuck row is still surfaced under a small `failures` array (and the audit's separate `errors` array is always present). |
+| `changes` *(default)* | Summary + only the rows that need attention — moves keep `error` / `skipped_unmovable` / `not_found`; deletes keep `skipped_has_files` / `error`; the contents audit keeps only folders with files or subfolders; the naming-standards audit keeps only folders with no standard. The success/no-op noise (`moved`, `already_there`, `deleted`, empty folders, folders that already have a standard) is dropped. |
+| `summary` | Only the summary counts — the per-item `results` array is omitted. **Failures are never lost:** any locked/unmovable/stuck row (or no-standard folder) is still surfaced under a small `failures` array (and the contents audit's separate `errors` array is always present). |
 
 `changes` is the default because in a typical batch almost everything succeeds silently and only the locked/conflict cases need action — returning just those is the bulk of the token saving. Pass `response_detail: "full"` to get the old echo-everything behaviour.
 
 > **Lean audits — `fields`.** `bulk_list_folder_contents` also takes `fields: ["files", "subfolders"]` to restrict each folder row to just those sections. When `fields` is given, file entries are returned **lean** (`id` + `name` only, dropping `last_modified` / `created_by`) — ideal when you only need URNs to feed straight into a `bulk_move_files` call.
+
+> **Naming conventions in one pass — `include_naming_standard`.** The `folders/{f}/contents` payload already carries each subfolder's assigned naming standard, so `bulk_list_folder_contents` can surface it for free: pass `include_naming_standard: true` and every subfolder row gains a `naming_standard_ids` list (empty = none). Use this when you need both the listing **and** the conventions in a single sweep, instead of also calling `audit_folder_naming_standards` (which would re-fetch the same endpoint). Reach for `audit_folder_naming_standards` when you want a *recursive*, project-wide roll-up grouped by standard; reach for this flag when you're already listing folders and just want the convention tagged on.
 
 ---
 
@@ -250,6 +253,7 @@ flowchart LR
         T29(bulk_delete_folders)
         T30(bulk_move_files)
         T31(bulk_move_folders)
+        T32(audit_folder_naming_standards)
     end
 
     E1["GET /project/v1/hubs"]
@@ -272,6 +276,7 @@ flowchart LR
     E18["POST /data/v1/projects/{p}/versions?copyFrom=..."]
     E19["POST /data/v1/projects/{p}/folders"]
     E20["PATCH /data/v1/projects/{p}/items/{i}"]
+    E21["GET /data/v1/projects/{p}/folders/{f}"]
 
     T1 --> E1
     T2 --> E2
@@ -317,9 +322,12 @@ flowchart LR
     T30 --> E20
     T31 --> E4
     T31 --> E17
+    T32 --> E3
+    T32 --> E4
+    T32 --> E21
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13 get
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21 get
     class E10,E11,E12,E14,E18,E19 post
     class E15,E17,E20 patch
     class E16 del
@@ -372,6 +380,14 @@ Show me a dry run of adding Acme Engineering to the "Riverside Bridge" project
 
 ```
 Export the full permission matrix for Project Files in "Northgate Tower"
+```
+
+### Naming-convention auditing
+
+```
+Which folders in "Northgate Tower" have a naming standard assigned, and which have none?
+Audit the naming conventions under Project Files/Drawings in "Northgate Tower"
+Show me only the folders with no naming standard in "Northgate Tower"
 ```
 
 ---
@@ -430,7 +446,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 31 tools
+├── aps_mcp.py                  # MCP server — 32 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt

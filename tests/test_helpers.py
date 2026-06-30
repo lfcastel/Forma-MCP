@@ -83,6 +83,25 @@ def test_folder_name_matches_either_label_case_insensitive():
 
 
 # ---------------------------------------------------------------------------
+# _naming_standard_ids  (folder's assigned naming convention)
+# ---------------------------------------------------------------------------
+
+def test_naming_standard_ids_reads_from_extension_data():
+    attrs = {"extension": {"data": {"namingStandardIds": ["std-a"]}}}
+    assert aps_mcp._naming_standard_ids(attrs) == ["std-a"]
+
+
+def test_naming_standard_ids_empty_when_absent():
+    assert aps_mcp._naming_standard_ids({"name": "f"}) == []
+    assert aps_mcp._naming_standard_ids({"extension": {"data": {}}}) == []
+
+
+def test_naming_standard_ids_drops_falsy_entries():
+    attrs = {"extension": {"data": {"namingStandardIds": ["", None, "std-b"]}}}
+    assert aps_mcp._naming_standard_ids(attrs) == ["std-b"]
+
+
+# ---------------------------------------------------------------------------
 # _write_audit_csv
 # ---------------------------------------------------------------------------
 

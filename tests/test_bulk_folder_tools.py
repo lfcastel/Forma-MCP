@@ -127,6 +127,46 @@ async def test_bulk_list_include_files_false_omits_files():
     assert "files" not in row
 
 
+@respx.mock
+async def test_bulk_list_include_naming_standard_surfaces_ids_from_listing():
+    """include_naming_standard reads each subfolder's convention straight from the
+    same contents payload — no extra call — so a subfolder with a standard reports
+    its id and one without reports an empty list."""
+    _mock_base(respx)
+    _contents_route(respx, PF_ID, [_folder(B704_ID, "B-B-704")])
+    with_std = _folder(WIP704_ID, "0. WIP")
+    with_std["attributes"]["extension"] = {"data": {"namingStandardIds": ["std-a"]}}
+    no_std = _folder(STD704_ID, "Standard Plans")  # no extension → no standard
+    _contents_route(respx, B704_ID, [with_std, no_std])
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("bulk_list_folder_contents", {
+            "project_name": PROJECT_NAME,
+            "children_of": "Project Files",
+            "include_naming_standard": True,
+        })
+
+    subs = {s["name"]: s for s in _parse(result)["results"][0]["subfolders"]}
+    assert subs["0. WIP"]["naming_standard_ids"] == ["std-a"]
+    assert subs["Standard Plans"]["naming_standard_ids"] == []
+
+
+@respx.mock
+async def test_bulk_list_omits_naming_standard_by_default():
+    _mock_base(respx)
+    _contents_route(respx, PF_ID, [_folder(B704_ID, "B-B-704")])
+    _contents_route(respx, B704_ID, [_folder(WIP704_ID, "0. WIP")])
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("bulk_list_folder_contents", {
+            "project_name": PROJECT_NAME,
+            "children_of": "Project Files",
+        })
+
+    sub = _parse(result)["results"][0]["subfolders"][0]
+    assert "naming_standard_ids" not in sub
+
+
 # ===========================================================================
 # bulk_create_folders
 # ===========================================================================

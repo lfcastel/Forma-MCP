@@ -738,6 +738,19 @@ def _folder_name_matches(attrs: dict, target_lower: str) -> bool:
     return False
 
 
+def _naming_standard_ids(attrs: dict) -> list:
+    """Return the naming-standard IDs assigned to a folder (empty list if none).
+
+    ACC/Forma folders carry these under `extension.data.namingStandardIds`. A
+    folder with a configured naming convention has a non-empty list; a folder
+    without any has it absent or empty. Every subfolder's value is already
+    present in its parent's `contents` listing, so a tree audit reads it for
+    free — no per-folder GET needed."""
+    data = (attrs.get("extension") or {}).get("data") or {}
+    ids = data.get("namingStandardIds")
+    return [i for i in ids if i] if isinstance(ids, list) else []
+
+
 def _fmt_folder(f: dict) -> dict:
     return {"id": f["id"], "name": _folder_name(f["attributes"]), "type": "folder"}
 
@@ -803,6 +816,56 @@ async def _walk_folder_tree(
     for sub in await asyncio.gather(*tasks):
         results.extend(sub)
     return results
+
+
+async def _walk_naming_standards(
+    client: httpx.AsyncClient,
+    project_id: str,
+    folder_id: str,
+    folder_path: str,
+    folder_attrs: dict,
+    hdrs: dict,
+    max_depth: int,
+    sem: asyncio.Semaphore,
+    depth: int = 0,
+    *,
+    on_unauthorized=None,
+) -> list[dict]:
+    """Flatten a folder subtree into one row per folder describing its assigned
+    naming standard(s). The current folder's `folder_attrs` (carrying the
+    `namingStandardIds`) come from the parent's `contents` listing, so each
+    subfolder is read for free; only the listing call to enumerate children
+    costs a request, bounded by `sem`. A restricted subfolder (403) stops that
+    branch without aborting the audit (`raise_on_error=False`)."""
+    ids = _naming_standard_ids(folder_attrs)
+    rows = [{
+        "path": folder_path,
+        "folder_id": folder_id,
+        "naming_standard_ids": ids,
+        "has_standard": bool(ids),
+    }]
+    if depth >= max_depth:
+        return rows
+
+    async with sem:
+        contents = await get_all_folder_contents(
+            client, project_id, folder_id, hdrs,
+            raise_on_error=False, on_unauthorized=on_unauthorized,
+        )
+
+    tasks = [
+        _walk_naming_standards(
+            client, project_id, sf["id"],
+            f"{folder_path}/{_folder_name(sf['attributes'])}",
+            sf["attributes"], hdrs, max_depth, sem, depth + 1,
+            on_unauthorized=on_unauthorized,
+        )
+        for sf in contents
+        if sf["type"] == "folders"
+    ]
+    for sub in await asyncio.gather(*tasks):
+        rows.extend(sub)
+    return rows
 
 
 async def _fetch_project_roles(
@@ -1580,12 +1643,54 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string", "enum": ["files", "subfolders"]},
                         "description": "Restrict each folder row to these sections (default: both). When provided, file entries are returned lean (id + name only, dropping last_modified/created_by) — ideal when you only need URNs to feed into a move.",
                     },
+                    "include_naming_standard": {
+                        "type": "boolean",
+                        "description": "If true, each subfolder row also carries its assigned naming convention as `naming_standard_ids` (empty list = none). Free — the data is already in the listing — so you get folder contents and naming conventions in one pass instead of also calling audit_folder_naming_standards. Default false.",
+                    },
                     "response_detail": {
                         "type": "string",
                         "enum": ["summary", "changes", "full"],
                         "description": "Output verbosity. 'changes' (default) returns the summary plus only folders that have files or subfolders (empties dropped). 'full' echoes every folder. 'summary' returns only the counts (the always-present 'errors' array still surfaces any folder that failed to list). Counts are accurate regardless.",
                     },
                     "max_concurrency": {"type": "integer", "description": "Max folders listed in parallel (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_name"],
+            },
+        ),
+        Tool(
+            name="audit_folder_naming_standards",
+            description=(
+                "Read-only audit: walk a folder subtree and report which naming "
+                "convention (naming standard) each folder enforces, and which have "
+                "none. Reads each folder's assigned standard from its parent's "
+                "listing — no per-folder lookup. Pass `folder` (slash-separated path "
+                "or raw folder URN) to audit that folder and everything beneath it; "
+                "omit it to audit every top-level folder of the project. The summary "
+                "groups folders by standard id (`by_standard`) and counts the gaps; "
+                "the folders WITHOUT any standard are the noteworthy rows. No dry_run "
+                "(read-only). NOTE: a folder's assigned standard governs file naming "
+                "in that folder — this does not check whether existing files comply."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string"},
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder to audit (slash-separated path or raw folder URN), including its whole subtree. Omit to audit every top-level folder of the project.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "How many levels below the start folder(s) to descend (default 25 — effectively the whole tree). 0 audits only the start folder(s) themselves.",
+                    },
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only folders that have NO naming standard (the gaps to fix). 'full' echoes every folder with its standard id(s). 'summary' omits the per-folder rows but still surfaces the no-standard folders via a 'failures' array. The 'summary.by_standard' counts are accurate regardless.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max folder listings in flight at once (default 8)."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
@@ -3305,6 +3410,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             lean_files = fields_set is not None  # caller signalled they want minimal rows
             want_subfolders = fields_set is None or "subfolders" in fields_set
             want_files = include_files and (fields_set is None or "files" in fields_set)
+            # The contents payload already carries each subfolder's namingStandardIds,
+            # so surfacing them here is free — saves a second pass for an orchestrator
+            # that needs both the listing and the naming conventions.
+            include_naming = arguments.get("include_naming_standard", False)
             children_of = arguments.get("children_of")
             explicit = arguments.get("folders")
             if bool(children_of) == bool(explicit):
@@ -3346,10 +3455,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                         "file_count": len(files),
                     }
                     if want_subfolders:
-                        row["subfolders"] = [
-                            {"name": _folder_name(i["attributes"]), "id": i["id"]}
-                            for i in items if i["type"] == "folders"
-                        ]
+                        def _sub(i):
+                            s = {"name": _folder_name(i["attributes"]), "id": i["id"]}
+                            if include_naming:
+                                s["naming_standard_ids"] = _naming_standard_ids(i["attributes"])
+                            return s
+                        row["subfolders"] = [_sub(i) for i in items if i["type"] == "folders"]
                     if want_files:
                         if lean_files:
                             row["files"] = [{
@@ -3384,6 +3495,69 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 noteworthy=lambda r: r.get("file_count", 0) > 0 or bool(r.get("subfolders")),
             )
             payload["errors"] = errors
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "audit_folder_naming_standards":
+            hub_id, project_id, resolved_name = await resolve_project(
+                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
+            )
+            b_hdrs = dict(hdrs)
+            refresher = _bearer_refresher(b_hdrs)
+            max_depth = arguments.get("max_depth")
+            if max_depth is None:
+                max_depth = 25
+            sem = asyncio.Semaphore(max(1, arguments.get("max_concurrency") or 8))
+
+            # Build the list of start folders, each with its own attributes (which
+            # carry namingStandardIds) so the root of each subtree is audited too.
+            starts: list[tuple[str, str, dict]] = []  # (folder_id, name, attrs)
+            folder_arg = arguments.get("folder")
+            if folder_arg:
+                fid, _ = await _resolve_folder(client, token, hub_id, project_id, folder_arg)
+                r = await _request_with_retry(
+                    client, "get",
+                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{fid}",
+                    headers=b_hdrs, on_unauthorized=refresher,
+                )
+                r.raise_for_status()
+                attrs = r.json().get("data", {}).get("attributes", {})
+                starts.append((fid, _folder_name(attrs) or folder_arg, attrs))
+            else:
+                r = await client.get(
+                    f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
+                    headers=hdrs,
+                )
+                r.raise_for_status()
+                for f in r.json().get("data", []):
+                    starts.append((f["id"], _folder_name(f["attributes"]), f["attributes"]))
+
+            walked = await asyncio.gather(*[
+                _walk_naming_standards(
+                    client, project_id, fid, name_, attrs, b_hdrs, max_depth, sem,
+                    on_unauthorized=refresher,
+                )
+                for fid, name_, attrs in starts
+            ])
+            rows = [row for sub in walked for row in sub]
+
+            by_standard: dict[str, int] = {}
+            for row in rows:
+                for sid in row["naming_standard_ids"]:
+                    by_standard[sid] = by_standard.get(sid, 0) + 1
+            without = sum(1 for row in rows if not row["has_standard"])
+            payload = {
+                "project": resolved_name,
+                "summary": {
+                    "total_folders": len(rows),
+                    "with_standard": len(rows) - without,
+                    "without_standard": without,
+                    "by_standard": by_standard,
+                },
+            }
+            _shape_bulk_response(
+                payload, rows, arguments.get("response_detail"),
+                noteworthy=lambda r: not r["has_standard"],
+            )
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_create_folders":
