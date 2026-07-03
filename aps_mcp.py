@@ -1480,6 +1480,36 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="set_projects_status",
+            description=(
+                "Archive or unarchive one or more ACC/Forma projects (by name) via the HQ Admin API. "
+                "status='archived' hides the project from active lists; status='active' restores it. "
+                "Idempotent: projects already in the target status are skipped without a PATCH call. "
+                "Set dry_run=true (default) to preview before executing."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of project names (case-insensitive; substring match ok).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["archived", "active"],
+                        "description": "Target status. Defaults to 'archived'.",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), return a preview without making any changes.",
+                    },
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_names"],
+            },
+        ),
+        Tool(
             name="clone_user_access",
             description=(
                 "Copy all project memberships and roles from a reference user to one or more target users. "
