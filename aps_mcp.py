@@ -3228,6 +3228,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 return partial[0], None
 
             account_id = hub_id.removeprefix("b.")
+            app_token = await get_app_token()
             results: list[dict] = []
 
             for pname in project_names:
@@ -3253,7 +3254,6 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
 
                 # Execute path: PATCH via 2-legged app token
-                app_token = await get_app_token()
                 bare_pid = entry["id"].removeprefix("b.")
                 r = await client.patch(
                     f"{APS_BASE}/hq/v1/accounts/{account_id}/projects/{bare_pid}",
@@ -3287,14 +3287,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             if not dry_run and results:
                 audit_file = _write_audit_csv(results, "set_projects_status")
 
-            summary_keys = {
-                "success",
-                f"would_set_{target_status}",
-                f"already_{target_status}",
-                "not_found",
-                "error",
+            summary = {
+                k: sum(1 for r in results if r["status"] == k)
+                for k in ("success", f"would_set_{target_status}", f"already_{target_status}", "not_found", "error")
             }
-            summary = {k: sum(1 for r in results if r["status"] == k) for k in summary_keys}
             summary["total"] = len(results)
 
             return [TextContent(type="text", text=json.dumps({
