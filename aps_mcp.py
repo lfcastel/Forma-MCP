@@ -3183,6 +3183,130 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "audit_file": audit_file,
             }, indent=2))]
 
+        if name == "set_projects_status":
+            region = arguments.get("region", "EMEA")
+            dry_run = arguments.get("dry_run", True)
+            target_status = arguments.get("status", "archived")
+            if target_status not in ("archived", "active"):
+                return [TextContent(type="text", text=json.dumps({
+                    "operation": "set_projects_status",
+                    "error": f"status must be 'archived' or 'active', got: {target_status}",
+                }, indent=2))]
+
+            project_names = arguments["project_names"]
+
+            hub_id, _ = await resolve_hub(client, token, region)
+            all_projs = await get_all_pages(
+                client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
+            )
+
+            # Build a lookup index: name_lower -> {id, status, canonical_name}
+            # (reproduces resolve_project()'s fuzzy semantics locally to avoid
+            # re-fetching the project list once per requested name)
+            index: list[dict] = [
+                {
+                    "id": p["id"],
+                    "status": p["attributes"].get("status"),
+                    "name": p["attributes"]["name"],
+                    "name_lower": p["attributes"]["name"].lower(),
+                }
+                for p in all_projs
+            ]
+
+            def _match(query: str) -> tuple[dict | None, str | None]:
+                """Return (project_entry, error_message). One of them is None."""
+                q = query.lower()
+                exact = [e for e in index if e["name_lower"] == q]
+                if exact:
+                    return exact[0], None
+                partial = [e for e in index if q in e["name_lower"]]
+                if not partial:
+                    return None, f"Project '{query}' not found."
+                if len(partial) > 1:
+                    names = [e["name"] for e in partial]
+                    return None, f"Ambiguous project name '{query}'. Matches: {names}."
+                return partial[0], None
+
+            account_id = hub_id.removeprefix("b.")
+            results: list[dict] = []
+
+            for pname in project_names:
+                entry, err = _match(pname)
+                if err:
+                    results.append({"project": pname, "status": "not_found", "message": err})
+                    continue
+
+                if entry["status"] == target_status:
+                    results.append({
+                        "project": entry["name"],
+                        "status": f"already_{target_status}",
+                        "message": f"Already {target_status}",
+                    })
+                    continue
+
+                if dry_run:
+                    results.append({
+                        "project": entry["name"],
+                        "status": f"would_set_{target_status}",
+                        "message": f"Would set status to {target_status}",
+                    })
+                    continue
+
+                # Execute path: PATCH via 2-legged app token
+                app_token = await get_app_token()
+                bare_pid = entry["id"].removeprefix("b.")
+                r = await client.patch(
+                    f"{APS_BASE}/hq/v1/accounts/{account_id}/projects/{bare_pid}",
+                    headers={
+                        "Authorization": f"Bearer {app_token}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"status": target_status},
+                )
+                if r.is_success:
+                    results.append({
+                        "project": entry["name"],
+                        "status": "success",
+                        "message": f"HTTP {r.status_code}",
+                    })
+                else:
+                    try:
+                        body = r.json()
+                    except Exception:
+                        body = r.text
+                    body_str = str(body)[:300]
+                    results.append({
+                        "project": entry["name"],
+                        "status": "error",
+                        "message": f"HTTP {r.status_code}: {body_str}",
+                    })
+                # Soft rate limit — matches archive_projects.py
+                await asyncio.sleep(0.2)
+
+            audit_file = None
+            if not dry_run and results:
+                audit_file = _write_audit_csv(results, "set_projects_status")
+
+            summary_keys = {
+                "success",
+                f"would_set_{target_status}",
+                f"already_{target_status}",
+                "not_found",
+                "error",
+            }
+            summary = {k: sum(1 for r in results if r["status"] == k) for k in summary_keys}
+            summary["total"] = len(results)
+
+            return [TextContent(type="text", text=json.dumps({
+                "operation": "set_projects_status",
+                "dry_run": dry_run,
+                "target_status": target_status,
+                "region": region,
+                "summary": summary,
+                "results": results,
+                "audit_file": audit_file,
+            }, indent=2))]
+
         if name == "clone_user_access":
             region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
