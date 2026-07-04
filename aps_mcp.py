@@ -956,6 +956,96 @@ async def _get_project_members_map(
     return members
 
 
+async def _grant_admin_on_project(
+    client: httpx.AsyncClient,
+    project: dict,
+    user_email: str,
+    access_value: str,
+    dry_run: bool,
+    hdrs: dict,
+) -> dict:
+    """Grant `access_value` (e.g. 'projectAdmin') to `user_email` on a single project.
+
+    Behavior per project state:
+      - target is already admin  → status='already_admin'
+      - target is a member but not admin → PATCH .../users/{userId} (dry_run: would_update)
+      - target is not a member   → POST .../users:import (dry_run: would_add)
+
+    Returns: {"user", "project", "status", "message"} where status is one of
+    already_admin | would_add | would_update | added | updated | error.
+    """
+    pid = project["id"]
+    pname = project["name"]
+    bare_pid = pid.removeprefix("b.")
+    email_l = user_email.lower()
+    access_l = access_value.lower()
+
+    try:
+        members = await _get_project_members_map(client, pid, hdrs)
+    except httpx.HTTPError as e:
+        return {"user": user_email, "project": pname,
+                "status": "error", "message": f"members fetch failed: {e}"}
+
+    target = members.get(email_l)
+
+    if target is None:
+        if dry_run:
+            return {"user": user_email, "project": pname,
+                    "status": "would_add",
+                    "message": f"Would add as new member with accessLevels=['{access_value}']"}
+        r = await client.post(
+            f"{APS_BASE}/construction/admin/v2/projects/{bare_pid}/users:import",
+            headers=hdrs,
+            json={"users": [{
+                "email": user_email,
+                "accessLevels": [access_value],
+                "products": DEFAULT_PRODUCTS,
+            }], "suppressAdministrativeEmails": False},
+        )
+        if r.is_success:
+            return {"user": user_email, "project": pname,
+                    "status": "added",
+                    "message": f"Added with accessLevels=['{access_value}']"}
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return {"user": user_email, "project": pname,
+                "status": "error", "message": f"HTTP {r.status_code}: {body}"}
+
+    current_levels = [str(a) for a in (target.get("accessLevels") or [])]
+    if any(a.lower() == access_l for a in current_levels):
+        return {"user": user_email, "project": pname,
+                "status": "already_admin",
+                "message": f"Already has accessLevels={current_levels}"}
+
+    user_id = target.get("id") or target.get("userId") or target.get("autodeskId")
+    if not user_id:
+        return {"user": user_email, "project": pname,
+                "status": "error", "message": "Could not determine user ID from member record"}
+
+    if dry_run:
+        return {"user": user_email, "project": pname,
+                "status": "would_update",
+                "message": f"Would set accessLevels=['{access_value}'] (current: {current_levels})"}
+
+    r = await client.patch(
+        f"{APS_BASE}/construction/admin/v1/projects/{bare_pid}/users/{user_id}",
+        headers=hdrs,
+        json={"accessLevels": [access_value]},
+    )
+    if r.is_success:
+        return {"user": user_email, "project": pname,
+                "status": "updated",
+                "message": f"accessLevels: {current_levels} → ['{access_value}']"}
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    return {"user": user_email, "project": pname,
+            "status": "error", "message": f"HTTP {r.status_code}: {body}"}
+
+
 async def _get_account_users_map(
     client: httpx.AsyncClient, account_id: str, app_token: str
 ) -> dict[str, dict]:
@@ -1634,6 +1724,50 @@ async def list_tools() -> list[Tool]:
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["project_names"],
+            },
+        ),
+        Tool(
+            name="make_project_admin",
+            description=(
+                "Grant a user Project Admin access (accessLevels=[projectAdmin] by default) on "
+                "one or more ACC projects. Per project: already-admin → skip; member without "
+                "admin → PATCH accessLevels; not a member → add via users:import with "
+                "accessLevels + docs/insight product access. If project_names is omitted, "
+                "applies to every ACTIVE project in the hub. dry_run=true by default."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_email": {
+                        "type": "string",
+                        "description": "Email of the user to grant Project Admin access.",
+                    },
+                    "project_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "List of project names (partial match ok). Omit to apply to every "
+                            "active project in the hub."
+                        ),
+                    },
+                    "access_value": {
+                        "type": "string",
+                        "description": (
+                            "Exact accessLevels enum value to grant. Default 'projectAdmin'. "
+                            "Change only if the account uses a different admin enum value."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true (default), preview per-project actions without any writes.",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": "Number of projects processed in parallel (default 5, max 10).",
+                    },
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["user_email"],
             },
         ),
         Tool(
@@ -3516,6 +3650,79 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "max_files_per_project": max_files,
                 "summary": summary,
                 "results": results,
+            }, indent=2))]
+
+        if name == "make_project_admin":
+            region = arguments.get("region", "EMEA")
+            dry_run = arguments.get("dry_run", True)
+            user_email = arguments["user_email"].lower().strip()
+            access_value = arguments.get("access_value", "projectAdmin")
+            concurrency = min(max(int(arguments.get("concurrency", 5)), 1), 10)
+            project_names = arguments.get("project_names")
+
+            hub_id, _ = await resolve_hub(client, token, region)
+
+            resolved_projects: list[dict] = []
+            not_found: list[dict] = []
+            if project_names:
+                for pname in project_names:
+                    try:
+                        _, pid, rname = await resolve_project(
+                            client, token, pname, hub_id=hub_id
+                        )
+                        resolved_projects.append({"id": pid, "name": rname})
+                    except ValueError as e:
+                        not_found.append({
+                            "user": user_email, "project": pname,
+                            "status": "error", "message": str(e),
+                        })
+            else:
+                all_projs = await get_all_pages(
+                    client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
+                )
+                resolved_projects = [
+                    {"id": p["id"], "name": p["attributes"]["name"]}
+                    for p in all_projs
+                    if (p["attributes"].get("status") or "").lower() == "active"
+                ]
+
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _run_one(project: dict) -> dict:
+                async with sem:
+                    return await _grant_admin_on_project(
+                        client, project, user_email, access_value, dry_run, hdrs,
+                    )
+
+            results = list(await asyncio.gather(*(_run_one(p) for p in resolved_projects)))
+            results.extend(not_found)
+
+            order = {"error": 0, "would_add": 1, "would_update": 2,
+                     "added": 3, "updated": 4, "already_admin": 5}
+            results.sort(key=lambda r: (order.get(r["status"], 9), r["project"]))
+
+            audit_file = None
+            if not dry_run and results:
+                audit_file = _write_audit_csv(results, "make_project_admin")
+
+            summary = {
+                k: sum(1 for r in results if r["status"] == k)
+                for k in ("added", "updated", "already_admin",
+                          "would_add", "would_update", "error")
+            }
+            summary["total"] = len(results)
+
+            return [TextContent(type="text", text=json.dumps({
+                "operation": "make_project_admin",
+                "dry_run": dry_run,
+                "user_email": user_email,
+                "access_value": access_value,
+                "region": region,
+                "concurrency": concurrency,
+                "scope": "explicit" if project_names else "all_active",
+                "summary": summary,
+                "results": results,
+                "audit_file": audit_file,
             }, indent=2))]
 
         if name == "clone_user_access":
