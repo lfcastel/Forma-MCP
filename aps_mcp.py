@@ -460,6 +460,39 @@ async def _request_with_retry(
     return r  # unreachable; keeps type-checkers happy
 
 
+async def _list_all_projects_admin(
+    client: httpx.AsyncClient, account_id: str, app_token: str
+) -> list[dict]:
+    """List every project in the account via ACC Admin API (2-legged), including archived.
+
+    The Data Management /project/v1/hubs/{hub_id}/projects endpoint hides archived
+    projects, which makes unarchive-by-name impossible via that route.
+    """
+    items: list[dict] = []
+    offset = 0
+    limit = 200
+    while True:
+        r = await client.get(
+            f"{APS_BASE}/construction/admin/v1/accounts/{account_id}/projects",
+            headers=auth_headers(app_token),
+            params={
+                "filter[status]": "active,archived,pending,suspended",
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+        r.raise_for_status()
+        body = r.json()
+        batch = body.get("results", []) if isinstance(body, dict) else []
+        if not batch:
+            break
+        items.extend(batch)
+        if len(batch) < limit:
+            break
+        offset += limit
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Name → ID resolver layer
 # ---------------------------------------------------------------------------
@@ -803,6 +836,64 @@ async def _walk_folder_tree(
     for sub in await asyncio.gather(*tasks):
         results.extend(sub)
     return results
+
+
+async def _count_project_files(
+    client: httpx.AsyncClient,
+    hub_id: str,
+    project_id: str,
+    hdrs: dict,
+    sample_limit: int = 5,
+    max_files: int | None = None,
+) -> dict:
+    """Walk every folder in a project and count files (items).
+
+    Returns: {"file_count": int, "sample_files": [str], "folder_count": int, "error": str|None}
+    Stops early if max_files is set and reached.
+    """
+    try:
+        r = await client.get(
+            f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
+            headers=hdrs,
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return {"file_count": 0, "sample_files": [], "folder_count": 0,
+                "error": f"topFolders HTTP {e.response.status_code}"}
+    except Exception as e:  # noqa
+        return {"file_count": 0, "sample_files": [], "folder_count": 0, "error": f"topFolders: {e}"}
+
+    stack: list[tuple[str, str]] = [
+        (f["id"], f["attributes"].get("displayName", "?"))
+        for f in r.json().get("data", [])
+    ]
+    file_count = 0
+    folder_count = len(stack)
+    sample_files: list[str] = []
+
+    while stack:
+        folder_id, path = stack.pop()
+        rr = await client.get(
+            f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents",
+            headers=hdrs,
+        )
+        if not rr.is_success:
+            # Skip inaccessible subfolders, don't abort the whole project
+            continue
+        for it in rr.json().get("data", []):
+            if it.get("type") == "folders":
+                folder_count += 1
+                stack.append((it["id"], f"{path}/{it['attributes'].get('displayName', '?')}"))
+            elif it.get("type") == "items":
+                file_count += 1
+                if len(sample_files) < sample_limit:
+                    sample_files.append(f"{path}/{it['attributes'].get('displayName', '?')}")
+                if max_files is not None and file_count >= max_files:
+                    return {"file_count": file_count, "sample_files": sample_files,
+                            "folder_count": folder_count, "error": None}
+
+    return {"file_count": file_count, "sample_files": sample_files,
+            "folder_count": folder_count, "error": None}
 
 
 async def _fetch_project_roles(
@@ -1503,6 +1594,42 @@ async def list_tools() -> list[Tool]:
                     "dry_run": {
                         "type": "boolean",
                         "description": "If true (default), return a preview without making any changes.",
+                    },
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["project_names"],
+            },
+        ),
+        Tool(
+            name="check_projects_empty",
+            description=(
+                "Check whether one or more projects contain any files. Recursively walks every "
+                "top-level folder and its sub-folders and counts items. Use before archiving to "
+                "verify projects are safe to archive (no unexpected content). "
+                "Runs checks concurrently (default 8 in-flight)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of project names (case-insensitive; substring match ok).",
+                    },
+                    "sample_limit": {
+                        "type": "integer",
+                        "description": "Max sample file paths to return per project (default 5).",
+                    },
+                    "max_files_per_project": {
+                        "type": "integer",
+                        "description": (
+                            "Stop counting after this many files per project. Useful for large "
+                            "projects when you only need to know 'has files'. Omit for full count."
+                        ),
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "description": "Number of projects to check in parallel (default 8, max 20).",
                     },
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
@@ -3196,19 +3323,22 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             project_names = arguments["project_names"]
 
             hub_id, _ = await resolve_hub(client, token, region)
-            all_projs = await get_all_pages(
-                client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
-            )
+            account_id = hub_id.removeprefix("b.")
+            app_token = await get_app_token()
+
+            # ACC Admin listing (not Data Management) — includes archived projects,
+            # required for unarchive-by-name.
+            all_projs = await _list_all_projects_admin(client, account_id, app_token)
 
             # Build a lookup index: name_lower -> {id, status, canonical_name}
             # (reproduces resolve_project()'s fuzzy semantics locally to avoid
             # re-fetching the project list once per requested name)
             index: list[dict] = [
                 {
-                    "id": p["id"],
-                    "status": p["attributes"].get("status"),
-                    "name": p["attributes"]["name"],
-                    "name_lower": p["attributes"]["name"].lower(),
+                    "id": f"b.{p['id']}",
+                    "status": p.get("status"),
+                    "name": p["name"],
+                    "name_lower": p["name"].lower(),
                 }
                 for p in all_projs
             ]
@@ -3227,8 +3357,6 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     return None, f"Ambiguous project name '{query}'. Matches: {names}."
                 return partial[0], None
 
-            account_id = hub_id.removeprefix("b.")
-            app_token = await get_app_token()
             results: list[dict] = []
 
             for pname in project_names:
@@ -3301,6 +3429,93 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "summary": summary,
                 "results": results,
                 "audit_file": audit_file,
+            }, indent=2))]
+
+        if name == "check_projects_empty":
+            region = arguments.get("region", "EMEA")
+            project_names = arguments["project_names"]
+            sample_limit = int(arguments.get("sample_limit", 5))
+            max_files = arguments.get("max_files_per_project")
+            if max_files is not None:
+                max_files = int(max_files)
+            concurrency = min(max(int(arguments.get("concurrency", 8)), 1), 20)
+
+            hub_id, _ = await resolve_hub(client, token, region)
+            all_projs = await get_all_pages(
+                client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
+            )
+            index = [
+                {"id": p["id"], "name": p["attributes"]["name"],
+                 "name_lower": p["attributes"]["name"].lower()}
+                for p in all_projs
+            ]
+
+            def _match(query: str) -> tuple[dict | None, str | None]:
+                q = query.lower()
+                exact = [e for e in index if e["name_lower"] == q]
+                if exact:
+                    return exact[0], None
+                partial = [e for e in index if q in e["name_lower"]]
+                if not partial:
+                    return None, f"Project '{query}' not found."
+                if len(partial) > 1:
+                    return None, f"Ambiguous project name '{query}'. Matches: {[e['name'] for e in partial]}."
+                return partial[0], None
+
+            resolved: list[tuple[str, dict]] = []
+            not_found: list[dict] = []
+            for pname in project_names:
+                entry, err = _match(pname)
+                if err:
+                    not_found.append({
+                        "project": pname, "status": "not_found",
+                        "file_count": 0, "sample_files": [], "message": err,
+                    })
+                else:
+                    resolved.append((pname, entry))
+
+            sem = asyncio.Semaphore(concurrency)
+
+            async def _check_one(query: str, entry: dict) -> dict:
+                async with sem:
+                    res = await _count_project_files(
+                        client, hub_id, entry["id"], hdrs,
+                        sample_limit=sample_limit, max_files=max_files,
+                    )
+                if res["error"]:
+                    return {
+                        "project": entry["name"], "status": "error",
+                        "file_count": res["file_count"], "sample_files": res["sample_files"],
+                        "folder_count": res["folder_count"], "message": res["error"],
+                    }
+                return {
+                    "project": entry["name"],
+                    "status": "has_files" if res["file_count"] > 0 else "empty",
+                    "file_count": res["file_count"],
+                    "sample_files": res["sample_files"],
+                    "folder_count": res["folder_count"],
+                }
+
+            results = await asyncio.gather(*(_check_one(q, e) for q, e in resolved))
+            results = list(results) + not_found
+
+            order = {"has_files": 0, "error": 1, "empty": 2, "not_found": 3}
+            results.sort(key=lambda r: (order.get(r["status"], 9), r["project"]))
+
+            summary = {
+                k: sum(1 for r in results if r["status"] == k)
+                for k in ("has_files", "empty", "error", "not_found")
+            }
+            summary["total"] = len(results)
+
+            return [TextContent(type="text", text=json.dumps({
+                "operation": "check_projects_empty",
+                "region": region,
+                "concurrency": concurrency,
+                "sample_limit": sample_limit,
+                "max_files_per_project": max_files,
+                "summary": summary,
+                "results": results,
             }, indent=2))]
 
         if name == "clone_user_access":
