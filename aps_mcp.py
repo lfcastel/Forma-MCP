@@ -955,6 +955,69 @@ async def _get_account_users_map(
     return users
 
 
+async def _get_account_companies(
+    client: httpx.AsyncClient, account_id: str, app_token: str
+) -> list[dict]:
+    """Return all companies in the account (ACC Admin GET companies, 2-legged).
+
+    Pages `construction/admin/v1/accounts/{id}/companies`, which returns a
+    `{pagination, results}` envelope (limit max 200). Used both to expose the
+    account company directory (`list_account_companies`) and to resolve a
+    company name → id for `bulk_add_hub_users`."""
+    companies: list[dict] = []
+    offset = 0
+    limit = 200
+    while True:
+        r = await client.get(
+            f"{APS_BASE}/construction/admin/v1/accounts/{account_id}/companies",
+            headers=auth_headers(app_token),
+            params={"limit": limit, "offset": offset},
+        )
+        if not r.is_success:
+            break
+        page = _extract_response_items(r.json())
+        if not page:
+            break
+        companies.extend(page)
+        if len(page) < limit:
+            break
+        offset += limit
+    return companies
+
+
+def _resolve_company_id(companies: list[dict], name: str) -> "str | None":
+    """Case-insensitive company name → id lookup (exact match on `name`)."""
+    name_lower = name.lower().strip()
+    for c in companies:
+        if (c.get("name") or "").lower().strip() == name_lower:
+            return c.get("id")
+    return None
+
+
+def _import_item_key(item: "Any", key_field: str) -> str:
+    """Best-effort extract the identifying key (e.g. 'email' or 'name') from a
+    success/failure entry in an HQ bulk-import envelope, tolerating both flat
+    ({email: ...}) and nested ({item: {email: ...}}) shapes. Lower-cased."""
+    if not isinstance(item, dict):
+        return ""
+    if item.get(key_field):
+        return str(item[key_field]).lower().strip()
+    inner = item.get("item") or item.get("data") or {}
+    if isinstance(inner, dict) and inner.get(key_field):
+        return str(inner[key_field]).lower().strip()
+    return ""
+
+
+def _import_item_error(item: "Any") -> str:
+    """Best-effort human-readable error from a failure entry in an import envelope."""
+    if not isinstance(item, dict):
+        return "import failed"
+    errs = item.get("errors") or item.get("error")
+    if errs:
+        return errs if isinstance(errs, str) else json.dumps(errs)
+    return json.dumps(item)
+
+
 def _resolve_role_id(role_name: str, role_map: dict[str, str]) -> str | None:
     """Case-insensitive role name → role ID lookup."""
     name_lower = role_name.lower()
@@ -971,8 +1034,11 @@ def _write_audit_csv(rows: list[dict], operation: str) -> str:
     os.makedirs(audit_dir, exist_ok=True)
     filepath = os.path.join(audit_dir, f"audit_{operation}_{timestamp}.csv")
     if rows:
+        # Union of keys across all rows (first-seen order) so heterogeneous rows
+        # — e.g. only error rows carry a "message" — don't trip DictWriter.
+        fieldnames = list(dict.fromkeys(k for row in rows for k in row.keys()))
         with open(filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
             writer.writeheader()
             writer.writerows(rows)
     return filepath
@@ -1600,6 +1666,178 @@ async def list_tools() -> list[Tool]:
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["company_name", "project_names", "default_role"],
+            },
+        ),
+        Tool(
+            name="list_account_companies",
+            description=(
+                "List every company in the hub's company directory (account-level), "
+                "with id, name, trade and status. Read-only. Use this to find a "
+                "company's id, to check whether a company already exists before "
+                "importing, or to see the trades in use. Account-wide — not the "
+                "project-scoped `list_project_companies`."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="bulk_add_hub_users",
+            description=(
+                "Onboard users to the HUB member directory in bulk (account-level), "
+                "each with a company and an optional default role. This is the "
+                "account-onboarding step that must happen BEFORE a user can be added "
+                "to a project — distinct from `bulk_assign_users`, which assigns "
+                "already-existing hub members to projects. Idempotent: emails already "
+                "in the hub are reported `already_exists` and skipped. `company_name` "
+                "is required and resolved to a company id via the account directory "
+                "(run `bulk_add_hub_companies` / `list_account_companies` first if the "
+                "company does not exist yet). Batches of 50 per API call. "
+                "Set dry_run=true (default) to preview. Note: this cannot elevate a "
+                "user to account admin."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_emails": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Emails of the users to add to the hub.",
+                    },
+                    "company_name": {
+                        "type": "string",
+                        "description": "Company to assign to every new user (required; resolved to a company id via the account directory).",
+                    },
+                    "default_role": {
+                        "type": "string",
+                        "description": "Optional default role string applied to every new user.",
+                    },
+                    "names": {
+                        "type": "object",
+                        "description": "Optional map of email -> {\"first_name\": ..., \"last_name\": ...} to set display names.",
+                    },
+                    "dry_run": {"type": "boolean"},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only rows that were added or errored (drops already_exists no-ops). 'full' echoes every row. 'summary' omits results but keeps a failures array. Counts are accurate regardless.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max import batches in flight at once (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["user_emails", "company_name"],
+            },
+        ),
+        Tool(
+            name="bulk_add_hub_companies",
+            description=(
+                "Import partner companies into the hub's company directory in bulk "
+                "(account-level). Idempotent: a company whose name already exists is "
+                "reported `already_exists` and skipped. Each company needs a `name` "
+                "and a `trade`; optional address/contact fields are passed through. "
+                "Batches of 50 per API call. Set dry_run=true (default) to preview."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "companies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "trade": {"type": "string"},
+                                "address_line_1": {"type": "string"},
+                                "address_line_2": {"type": "string"},
+                                "city": {"type": "string"},
+                                "state_or_province": {"type": "string"},
+                                "postal_code": {"type": "string"},
+                                "country": {"type": "string"},
+                                "phone": {"type": "string"},
+                                "website_url": {"type": "string"},
+                                "description": {"type": "string"},
+                                "erp_id": {"type": "string"},
+                                "tax_id": {"type": "string"},
+                            },
+                            "required": ["name", "trade"],
+                        },
+                        "description": "Companies to import. Each requires name + trade.",
+                    },
+                    "dry_run": {"type": "boolean"},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only rows that were added or errored (drops already_exists no-ops). 'full' echoes every row. 'summary' omits results but keeps a failures array. Counts are accurate regardless.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max import batches in flight at once (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["companies"],
+            },
+        ),
+        Tool(
+            name="deactivate_hub_users",
+            description=(
+                "Offboard users from the hub by setting their account status to "
+                "inactive (account-level). The HQ API has no hard delete, so this is "
+                "the soft-offboard path. Idempotent-ish: an email not found in the hub "
+                "is reported `not_found`. Set dry_run=true (default) to preview."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "user_emails": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Emails of the hub users to deactivate.",
+                    },
+                    "dry_run": {"type": "boolean"},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only rows that were deactivated or errored. 'full' echoes every row. 'summary' omits results but keeps a failures array.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max PATCHes in flight at once (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["user_emails"],
+            },
+        ),
+        Tool(
+            name="deactivate_hub_companies",
+            description=(
+                "Deactivate companies in the hub's company directory by setting their "
+                "status to inactive (account-level). Soft-offboard path (no hard "
+                "delete). A company name not found is reported `not_found`. "
+                "Set dry_run=true (default) to preview."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "company_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Names of the companies to deactivate.",
+                    },
+                    "dry_run": {"type": "boolean"},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns the summary plus only rows that were deactivated or errored. 'full' echoes every row. 'summary' omits results but keeps a failures array.",
+                    },
+                    "max_concurrency": {"type": "integer", "description": "Max PATCHes in flight at once (default 8)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["company_names"],
             },
         ),
         Tool(
@@ -3392,6 +3630,332 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "summary": summary, "results": results,
                 "warnings": warnings, "audit_file": audit_file,
             }, indent=2))]
+
+        if name == "list_account_companies":
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            app_token = await get_app_token()
+            companies = await _get_account_companies(client, account_id, app_token)
+            listing = [
+                {
+                    "company_id": c.get("id"),
+                    "name": c.get("name"),
+                    "trade": c.get("trade"),
+                    "status": c.get("status"),
+                }
+                for c in companies
+            ]
+            return [TextContent(type="text", text=json.dumps({
+                "count": len(listing), "companies": listing,
+            }, indent=2))]
+
+        if name == "bulk_add_hub_users":
+            dry_run = arguments.get("dry_run", True)
+            user_emails = _norm_emails(arguments.get("user_emails") or [])
+            company_name = arguments["company_name"]
+            default_role = arguments.get("default_role") or ""
+            names = {k.lower().strip(): v for k, v in (arguments.get("names") or {}).items()}
+            detail = arguments.get("response_detail")
+            max_conc = arguments.get("max_concurrency", 8)
+
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            app_token = await get_app_token()
+
+            # Company is required on every hub user — resolve name → id up front.
+            companies = await _get_account_companies(client, account_id, app_token)
+            company_id = _resolve_company_id(companies, company_name)
+            if company_id is None:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": f"Company '{company_name}' not found in the hub directory. "
+                             f"Create it first with bulk_add_hub_companies, or check "
+                             f"list_account_companies for the exact name.",
+                }, indent=2))]
+
+            existing = await _get_account_users_map(client, account_id, app_token)
+
+            results: list[dict] = []
+            to_add: list[dict] = []
+            for email in user_emails:
+                if email in existing:
+                    results.append({"email": email, "company": company_name, "role": default_role, "status": "already_exists"})
+                    continue
+                if dry_run:
+                    results.append({"email": email, "company": company_name, "role": default_role, "status": "would_add"})
+                    continue
+                obj = {"email": email, "company_id": company_id}
+                if default_role:
+                    obj["default_role"] = default_role
+                nm = names.get(email) or {}
+                if nm.get("first_name"):
+                    obj["first_name"] = nm["first_name"]
+                if nm.get("last_name"):
+                    obj["last_name"] = nm["last_name"]
+                to_add.append(obj)
+
+            api_calls_made = False
+            if not dry_run and to_add:
+                BATCH = 50  # HQ users/import accepts max 50 per call
+                batches = [to_add[i:i + BATCH] for i in range(0, len(to_add), BATCH)]
+
+                async def _import_users_batch(batch):
+                    r = await client.post(
+                        f"{APS_BASE}/hq/v1/accounts/{account_id}/users/import",
+                        headers={**auth_headers(app_token), "Content-Type": "application/json"},
+                        json=batch,
+                    )
+                    return batch, r
+
+                api_calls_made = True
+                responses = await _gather_bounded(
+                    max_conc, [(lambda b=b: _import_users_batch(b)) for b in batches]
+                )
+                for batch, r in responses:
+                    if not r.is_success:
+                        for obj in batch:
+                            results.append({"email": obj["email"], "company": company_name, "role": default_role,
+                                            "status": "error", "message": f"HTTP {r.status_code}: {_error_body(r)}"})
+                        continue
+                    body = r.json() if r.content else {}
+                    failures = {_import_item_key(it, "email"): it for it in (body.get("failure_items") or [])}
+                    for obj in batch:
+                        em = obj["email"]
+                        if em in failures:
+                            results.append({"email": em, "company": company_name, "role": default_role,
+                                            "status": "error", "message": _import_item_error(failures[em])})
+                        else:
+                            results.append({"email": em, "company": company_name, "role": default_role, "status": "added"})
+
+            audit_file = None
+            if not dry_run and api_calls_made:
+                audit_file = _write_audit_csv(results, "add_hub_users")
+
+            summary = {}
+            for r in results:
+                summary[r["status"]] = summary.get(r["status"], 0) + 1
+            summary["total"] = len(results)
+
+            payload = {
+                "dry_run": dry_run, "operation": "bulk_add_hub_users",
+                "company": company_name, "summary": summary, "audit_file": audit_file,
+            }
+            _shape_bulk_response(
+                payload, results, detail,
+                noteworthy=lambda r: r["status"] in ("added", "would_add", "error"),
+                failure=lambda r: r["status"] == "error",
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "bulk_add_hub_companies":
+            dry_run = arguments.get("dry_run", True)
+            companies_in = arguments.get("companies") or []
+            detail = arguments.get("response_detail")
+            max_conc = arguments.get("max_concurrency", 8)
+
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            app_token = await get_app_token()
+
+            existing = await _get_account_companies(client, account_id, app_token)
+            existing_names = {(c.get("name") or "").lower().strip() for c in existing}
+
+            results = []
+            to_add = []
+            for comp in companies_in:
+                nm = (comp.get("name") or "").strip()
+                trade = (comp.get("trade") or "").strip()
+                if not nm or not trade:
+                    results.append({"name": nm, "trade": trade, "status": "error",
+                                    "message": "both name and trade are required"})
+                    continue
+                if nm.lower() in existing_names:
+                    results.append({"name": nm, "trade": trade, "status": "already_exists"})
+                    continue
+                if dry_run:
+                    results.append({"name": nm, "trade": trade, "status": "would_add"})
+                    continue
+                to_add.append(comp)
+
+            api_calls_made = False
+            if not dry_run and to_add:
+                BATCH = 50  # HQ companies/import accepts max 50 per call
+                batches = [to_add[i:i + BATCH] for i in range(0, len(to_add), BATCH)]
+
+                async def _import_companies_batch(batch):
+                    r = await client.post(
+                        f"{APS_BASE}/hq/v1/accounts/{account_id}/companies/import",
+                        headers={**auth_headers(app_token), "Content-Type": "application/json"},
+                        json=batch,
+                    )
+                    return batch, r
+
+                api_calls_made = True
+                responses = await _gather_bounded(
+                    max_conc, [(lambda b=b: _import_companies_batch(b)) for b in batches]
+                )
+                for batch, r in responses:
+                    if not r.is_success:
+                        for comp in batch:
+                            results.append({"name": comp.get("name"), "trade": comp.get("trade"),
+                                            "status": "error", "message": f"HTTP {r.status_code}: {_error_body(r)}"})
+                        continue
+                    body = r.json() if r.content else {}
+                    failures = {_import_item_key(it, "name"): it for it in (body.get("failure_items") or [])}
+                    for comp in batch:
+                        key = (comp.get("name") or "").lower().strip()
+                        if key in failures:
+                            results.append({"name": comp.get("name"), "trade": comp.get("trade"),
+                                            "status": "error", "message": _import_item_error(failures[key])})
+                        else:
+                            results.append({"name": comp.get("name"), "trade": comp.get("trade"), "status": "added"})
+
+            audit_file = None
+            if not dry_run and api_calls_made:
+                audit_file = _write_audit_csv(results, "add_hub_companies")
+
+            summary = {}
+            for r in results:
+                summary[r["status"]] = summary.get(r["status"], 0) + 1
+            summary["total"] = len(results)
+
+            payload = {
+                "dry_run": dry_run, "operation": "bulk_add_hub_companies",
+                "summary": summary, "audit_file": audit_file,
+            }
+            _shape_bulk_response(
+                payload, results, detail,
+                noteworthy=lambda r: r["status"] in ("added", "would_add", "error"),
+                failure=lambda r: r["status"] == "error",
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "deactivate_hub_users":
+            dry_run = arguments.get("dry_run", True)
+            user_emails = _norm_emails(arguments.get("user_emails") or [])
+            detail = arguments.get("response_detail")
+            max_conc = arguments.get("max_concurrency", 8)
+
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            app_token = await get_app_token()
+
+            existing = await _get_account_users_map(client, account_id, app_token)
+            results = []
+            targets = []
+            for email in user_emails:
+                u = existing.get(email)
+                if not u:
+                    results.append({"email": email, "status": "not_found"})
+                    continue
+                if dry_run:
+                    results.append({"email": email, "status": "would_deactivate"})
+                    continue
+                targets.append((email, u.get("id")))
+
+            api_calls_made = False
+            if not dry_run and targets:
+                async def _deactivate_user(email, uid):
+                    r = await client.patch(
+                        f"{APS_BASE}/hq/v1/accounts/{account_id}/users/{uid}",
+                        headers={**auth_headers(app_token), "Content-Type": "application/json"},
+                        json={"status": "inactive"},
+                    )
+                    return email, r
+
+                api_calls_made = True
+                responses = await _gather_bounded(
+                    max_conc, [(lambda e=e, i=i: _deactivate_user(e, i)) for e, i in targets]
+                )
+                for email, r in responses:
+                    if r.is_success:
+                        results.append({"email": email, "status": "deactivated"})
+                    else:
+                        results.append({"email": email, "status": "error",
+                                        "message": f"HTTP {r.status_code}: {_error_body(r)}"})
+
+            audit_file = None
+            if not dry_run and api_calls_made:
+                audit_file = _write_audit_csv(results, "deactivate_hub_users")
+
+            summary = {}
+            for r in results:
+                summary[r["status"]] = summary.get(r["status"], 0) + 1
+            summary["total"] = len(results)
+
+            payload = {
+                "dry_run": dry_run, "operation": "deactivate_hub_users",
+                "summary": summary, "audit_file": audit_file,
+            }
+            _shape_bulk_response(
+                payload, results, detail,
+                noteworthy=lambda r: r["status"] in ("deactivated", "would_deactivate", "error", "not_found"),
+                failure=lambda r: r["status"] in ("error", "not_found"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "deactivate_hub_companies":
+            dry_run = arguments.get("dry_run", True)
+            company_names = arguments.get("company_names") or []
+            detail = arguments.get("response_detail")
+            max_conc = arguments.get("max_concurrency", 8)
+
+            hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            app_token = await get_app_token()
+
+            companies = await _get_account_companies(client, account_id, app_token)
+            results = []
+            targets = []
+            for nm in company_names:
+                cid = _resolve_company_id(companies, nm)
+                if not cid:
+                    results.append({"name": nm, "status": "not_found"})
+                    continue
+                if dry_run:
+                    results.append({"name": nm, "status": "would_deactivate"})
+                    continue
+                targets.append((nm, cid))
+
+            api_calls_made = False
+            if not dry_run and targets:
+                async def _deactivate_company(cname, cid):
+                    r = await client.patch(
+                        f"{APS_BASE}/hq/v1/accounts/{account_id}/companies/{cid}",
+                        headers={**auth_headers(app_token), "Content-Type": "application/json"},
+                        json={"status": "inactive"},
+                    )
+                    return cname, r
+
+                api_calls_made = True
+                responses = await _gather_bounded(
+                    max_conc, [(lambda n=n, i=i: _deactivate_company(n, i)) for n, i in targets]
+                )
+                for cname, r in responses:
+                    if r.is_success:
+                        results.append({"name": cname, "status": "deactivated"})
+                    else:
+                        results.append({"name": cname, "status": "error",
+                                        "message": f"HTTP {r.status_code}: {_error_body(r)}"})
+
+            audit_file = None
+            if not dry_run and api_calls_made:
+                audit_file = _write_audit_csv(results, "deactivate_hub_companies")
+
+            summary = {}
+            for r in results:
+                summary[r["status"]] = summary.get(r["status"], 0) + 1
+            summary["total"] = len(results)
+
+            payload = {
+                "dry_run": dry_run, "operation": "deactivate_hub_companies",
+                "summary": summary, "audit_file": audit_file,
+            }
+            _shape_bulk_response(
+                payload, results, detail,
+                noteworthy=lambda r: r["status"] in ("deactivated", "would_deactivate", "error", "not_found"),
+                failure=lambda r: r["status"] in ("error", "not_found"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_list_folder_contents":
             hub_id, project_id, resolved_name = await resolve_project(

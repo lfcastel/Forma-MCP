@@ -23,7 +23,7 @@ Used for account-level operations that don't require a user context: listing all
 
 - **How it works:** The server exchanges your Client ID + Secret directly for an access token. No browser login required. The token is cached in memory per process.
 - **Required scope:** `account:read`
-- **When it's used:** `list_account_users`, `list_project_companies`
+- **When it's used:** `list_account_users`, `list_project_companies`, `list_account_companies`, and the hub-directory write tools (`bulk_add_hub_users`, `bulk_add_hub_companies`, `deactivate_hub_users`, `deactivate_hub_companies`)
 
 ### 3-legged OAuth (user context)
 
@@ -134,6 +134,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `list_account_users` | List all users in the ACC account | 2-legged |
 | `list_project_roles` | List all roles defined in a project | 3-legged |
 | `list_project_companies` | List companies linked to a project | 2-legged |
+| `list_account_companies` | List every company in the hub's directory (account-level) with id, trade, status | 2-legged |
 
 ### Permissions
 
@@ -160,6 +161,19 @@ All five bulk tools default to **`dry_run: true`** — Claude always shows a pre
 | `remove_users_from_projects` | Remove users from one or more projects | 3-legged + `account:write` |
 | `clone_user_access` | Copy one user's full project access to another user | 3-legged + `account:write` |
 | `bulk_assign_company_users` | Add all members of an ACC company to a project | 3-legged + `account:write` |
+
+### Hub-level directory & onboarding
+
+These operate on the **hub member/company directory** (account level), not on a single project — the onboarding step that must happen *before* a user can be assigned to a project. All four default to **`dry_run: true`**, write a timestamped audit CSV on live runs, batch imports at ≤50 per API call, and support `response_detail`. Distinct from the bulk tools above, which assign *already-existing* hub members to projects.
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `bulk_add_hub_users` | Onboard users to the hub in bulk, each with a company (required) + optional default role; idempotent (`already_exists`) | 2-legged (`account:write`) |
+| `bulk_add_hub_companies` | Import partner companies into the hub directory (name + trade required); idempotent (`already_exists`) | 2-legged (`account:write`) |
+| `deactivate_hub_users` | Soft-offboard hub users (`status: inactive`; the API has no hard delete) | 2-legged (`account:write`) |
+| `deactivate_hub_companies` | Deactivate companies in the hub directory (`status: inactive`) | 2-legged (`account:write`) |
+
+> **Onboarding, not project assignment.** `bulk_add_hub_users` creates the hub account; `bulk_assign_users` grants project access. A typical joiner flow is: `bulk_add_hub_companies` (if the company is new) → `bulk_add_hub_users` → `bulk_assign_users`. `bulk_add_hub_users` resolves `company_name` against the hub directory and errors if the company doesn't exist yet, so create it first.
 
 ### Bulk folder operations
 
@@ -227,6 +241,7 @@ flowchart LR
         T8(list_account_users)
         T9(list_project_roles)
         T10(list_project_companies)
+        T33(list_account_companies)
     end
 
     subgraph PERMS["Permissions · 3-legged OAuth"]
@@ -245,6 +260,13 @@ flowchart LR
         T17(remove_users_from_projects)
         T18(clone_user_access)
         T19(bulk_assign_company_users)
+    end
+
+    subgraph HUBDIR["Hub Directory & Onboarding · 2-legged account:write · dry_run=true by default"]
+        T34(bulk_add_hub_users)
+        T35(bulk_add_hub_companies)
+        T36(deactivate_hub_users)
+        T37(deactivate_hub_companies)
     end
 
     subgraph BULKF["Bulk Folder Ops · 3-legged OAuth · dry_run=true by default"]
@@ -277,6 +299,11 @@ flowchart LR
     E19["POST /data/v1/projects/{p}/folders"]
     E20["PATCH /data/v1/projects/{p}/items/{i}"]
     E21["GET /data/v1/projects/{p}/folders/{f}"]
+    E22["GET /construction/admin/v1/accounts/{a}/companies"]
+    E23["POST /hq/v1/accounts/{a}/users/import"]
+    E24["POST /hq/v1/accounts/{a}/companies/import"]
+    E25["PATCH /hq/v1/accounts/{a}/users/{u}"]
+    E26["PATCH /hq/v1/accounts/{a}/companies/{c}"]
 
     T1 --> E1
     T2 --> E2
@@ -313,6 +340,17 @@ flowchart LR
     T19 --> E6
     T19 --> E14
 
+    T33 --> E22
+    T34 --> E22
+    T34 --> E6
+    T34 --> E23
+    T35 --> E22
+    T35 --> E24
+    T36 --> E6
+    T36 --> E25
+    T37 --> E22
+    T37 --> E26
+
     T27 --> E4
     T28 --> E4
     T28 --> E19
@@ -326,10 +364,10 @@ flowchart LR
     T32 --> E4
     T32 --> E21
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21 get
-    class E10,E11,E12,E14,E18,E19 post
-    class E15,E17,E20 patch
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22 get
+    class E10,E11,E12,E14,E18,E19,E23,E24 post
+    class E15,E17,E20,E25,E26 patch
     class E16 del
 ```
 
@@ -364,6 +402,15 @@ What files were modified in the last 7 days in "Northgate Tower"?
 Who are the members of the "Riverside Bridge" project?
 List all users in the account who work for Acme Engineering
 What roles exist in the "Central Station" project?
+```
+
+### Hub onboarding (always previewed before execution)
+
+```
+List all companies in the hub directory
+Onboard john.doe@acme.com and jane.roe@acme.com to the hub under company "Acme Engineering"
+Import a new company "Beta Builders" (Electrical) into the hub
+Deactivate leaver@acme.com in the hub
 ```
 
 ### Bulk operations (always previewed before execution)
@@ -409,7 +456,7 @@ Show me only the folders with no naming standard in "Northgate Tower"
 | 403 on folder or permission calls | Token expired | Delete `tokens.json` to force re-login |
 | MCP server not listed | Config path wrong or venv not set up | Run `claude mcp list`; check paths in `~/.claude.json` |
 | Browser doesn't open for login | Port 8080 already in use | Free up port 8080 and retry |
-| Company not found | Not yet added to ACC account | Account Admin must add it via **ACC Account Admin → Companies** |
+| Company not found | Not yet added to ACC account | Add it via `bulk_add_hub_companies`, or Account Admin adds it via **ACC Account Admin → Companies** |
 | Company not in project | Added to account but not linked to project | Project Admin adds it via **ACC Admin → Project Admin → Companies** |
 
 ---
@@ -419,6 +466,8 @@ Show me only the folders with no naming standard in "Northgate Tower"
 - **User last-activity date** — the `last_sign_in` field is only populated for **BIM360 projects**. The underlying ACC Account Admin API does not return this field for Forma projects, so activity timestamps will be absent for those users.
 - **APS rate / quota limits** — Autodesk enforces per-app API quotas. When one is hit, a tool returns a clean `quota_exceeded` result (HTTP 429) with the `Retry-After` hint instead of hanging — wait the suggested time and retry. Transient rate spikes are retried automatically a few times with a short back-off; only a persistent quota error surfaces to you.
 - **Cloud-workshared Revit models can't be moved by API** — C4R models (`C4RModel`) return 403 on a move and cannot be relocated programmatically. During a `bulk_delete_folders` reorg they are what keeps a folder from being deleted: it is reported as `skipped_has_files` so a human can move them in the Revit/ACC UI first.
+- **No hard delete for hub users or companies** — the HQ API only supports soft-offboarding, so `deactivate_hub_users` / `deactivate_hub_companies` set `status: inactive` rather than removing the record. Deactivated entries remain visible (as inactive) in the account directory.
+- **Hub onboarding can't grant account-admin** — `bulk_add_hub_users` sets each user's company and (optional) default role, but the underlying `users/import` endpoint cannot elevate someone to **account administrator**; do that in the ACC Account Admin UI.
 
 ---
 
@@ -446,7 +495,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 32 tools
+├── aps_mcp.py                  # MCP server — 37 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt

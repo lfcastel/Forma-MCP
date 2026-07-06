@@ -38,6 +38,11 @@ USER_B_EMAIL = "bob@example.com"
 USER_B_ID = "user-id-bob"
 
 COMPANY_NAME = "Acme Corp"
+COMPANY_ID = "company-acme-id"
+
+# Hub-onboarding test fixtures
+NEW_USER_EMAIL = "carol@example.com"      # not in ACCOUNT_USERS_RESPONSE
+NEW_COMPANY_NAME = "Beta Builders"        # not in ACCOUNT_COMPANIES_RESPONSE
 
 
 # ---------------------------------------------------------------------------
@@ -61,11 +66,11 @@ PROJECTS_RESPONSE = {
 
 ACCOUNT_USERS_RESPONSE = [
     {
-        "email": USER_A_EMAIL, "first_name": "Alice", "last_name": "Test",
+        "id": USER_A_ID, "email": USER_A_EMAIL, "first_name": "Alice", "last_name": "Test",
         "company_name": COMPANY_NAME, "status": "active", "last_sign_in": "2026-04-01",
     },
     {
-        "email": USER_B_EMAIL, "first_name": "Bob", "last_name": "Test",
+        "id": USER_B_ID, "email": USER_B_EMAIL, "first_name": "Bob", "last_name": "Test",
         "company_name": COMPANY_NAME, "status": "active", "last_sign_in": "2026-04-10",
     },
 ]
@@ -107,3 +112,24 @@ IMPORT_SUCCESS_RESPONSE = [
     {"email": USER_A_EMAIL, "success": True, "message": ""},
     {"email": USER_B_EMAIL, "success": True, "message": ""},
 ]
+
+# Account company directory: GET construction/admin/v1/accounts/{id}/companies
+# returns a {pagination, results} envelope.
+ACCOUNT_COMPANIES_RESPONSE = {
+    "pagination": {"limit": 200, "offset": 0, "totalResults": 1},
+    "results": [
+        {"id": COMPANY_ID, "name": COMPANY_NAME, "trade": "General Contractor", "status": "active"},
+    ],
+}
+
+# HQ bulk-import envelope (POST users/import and companies/import share this shape).
+USER_IMPORT_SUCCESS_RESPONSE = {
+    "success": 1, "failure": 0,
+    "success_items": [{"email": NEW_USER_EMAIL}],
+    "failure_items": [],
+}
+COMPANY_IMPORT_SUCCESS_RESPONSE = {
+    "success": 1, "failure": 0,
+    "success_items": [{"name": NEW_COMPANY_NAME}],
+    "failure_items": [],
+}
