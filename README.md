@@ -126,6 +126,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `move_folder` | Move a folder (and its contents) into another parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
 | `list_all_files` | Recursively list **every** file in a project (or a folder + subfolders) with full paths | 3-legged |
+| `export_deliverables_manifest` | Compact **filename-only** recursive list (deduped, sorted, no metadata) for cross-checking against an external deliverable list | 3-legged |
 | `find_folder` | Search for folders by name across a project | 3-legged |
 | `delete_folder` | Soft-delete (hide) an empty folder | 3-legged |
 | `find_recent_activity` | Show files modified since a given date | 3-legged |
@@ -238,6 +239,7 @@ flowchart LR
         T5(find_recent_activity)
         T6(find_files)
         T39(list_all_files)
+        T40(export_deliverables_manifest)
         T23(find_folder)
         T24(delete_folder)
     end
@@ -328,6 +330,8 @@ flowchart LR
     T6 --> E4
     T39 --> E3
     T39 --> E4
+    T40 --> E3
+    T40 --> E4
     T23 --> E4
     T24 --> E17
 
@@ -376,7 +380,7 @@ flowchart LR
     T32 --> E4
     T32 --> E21
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27 get
     class E10,E11,E12,E14,E18,E19,E23,E24 post
     class E15,E17,E20,E25,E26 patch

@@ -1702,6 +1702,31 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="export_deliverables_manifest",
+            description=(
+                "Return a compact, plain-text list of every file NAME under a project (or one "
+                "folder and all its subfolders), deduplicated and sorted A→Z, one per line. "
+                "Purpose-built for cross-checking what's actually present against an external "
+                "deliverable list (e.g. an Excel checklist): it strips all metadata (no ids, "
+                "paths, dates, or owners) so the output stays token-lean even for large trees. "
+                "Optionally filter to specific file extensions. Omit folder_path for the whole "
+                "project; pass it to scope to a subtree. For full per-file detail (paths/URNs/"
+                "dates) use list_all_files instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "folder_path": {"type": "string", "description": "Limit to this folder and its subfolders (optional). Slash-separated path or a raw folder URN. Omit for the entire project."},
+                    "extensions": {"type": "array", "items": {"type": "string"}, "description": "Optional list of file extensions to include (e.g. ['rvt','ifc','pdf']). Leading dots and case are ignored. Omit to include every file."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="list_project_roles",
             description=(
                 "List all roles defined in an ACC project and show which members hold each role. "
@@ -3042,6 +3067,33 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "scope": folder_path or "(entire project)",
                 "result_count": len(results), "files": results,
             }, indent=2))]
+
+        if name == "export_deliverables_manifest":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            folder_path = arguments.get("folder_path")
+            # Normalise the optional extension filter to a lowercase, dot-prefixed set.
+            raw_exts = arguments.get("extensions") or []
+            exts = {("." + e.lstrip(".")).lower() for e in raw_exts if e and e.strip()}
+            predicate = None
+            if exts:
+                predicate = lambda n: any(n.endswith(e) for e in exts)  # noqa: E731
+            start_folders = await _resolve_start_folders(
+                client, token, hdrs, hub_id, project_id, folder_path
+            )
+            results = await _walk_project_files(
+                client, project_id, hdrs, start_folders, predicate=predicate
+            )
+            total = len(results)
+            names = sorted({r["name"] for r in results}, key=str.lower)
+            scope = folder_path or "(entire project)"
+            header = (
+                f"project: {resolved_name} | scope: {scope} | "
+                f"{total} files ({len(names)} unique names)"
+            )
+            if exts:
+                header += f" | extensions: {', '.join(sorted(exts))}"
+            body = "\n".join(names) if names else "(no files found)"
+            return [TextContent(type="text", text=f"{header}\n\n{body}")]
 
         if name == "find_folder":
             hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
