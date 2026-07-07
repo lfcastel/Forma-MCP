@@ -238,6 +238,31 @@ def _to_bare_id(aps_id: str) -> str:
     return aps_id.removeprefix("b.")
 
 
+def _ensure_b_prefix(aps_id: str) -> str:
+    """Re-add the 'b.' prefix used by Data-Management hub/project IDs (idempotent)."""
+    return aps_id if aps_id.startswith("b.") else f"b.{aps_id}"
+
+
+_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+)
+
+
+def _extract_uuid(query: str) -> str | None:
+    """Return the first UUID found in a bare ID, 'b.'-ID, or ACC URL — else None.
+
+    A UUID means the query is an ID/URL (fast Admin-API path); its absence means
+    the query is a project name (fan-out-by-name path)."""
+    if not query:
+        return None
+    m = _UUID_RE.search(query)
+    return m.group(0).lower() if m else None
+
+
+def _is_url(query: str) -> bool:
+    return "://" in (query or "")
+
+
 def _extract_response_items(data: "Any") -> list:
     """Extract an item list from APS responses that use 'results', 'data', or bare lists."""
     if isinstance(data, list):
@@ -414,6 +439,73 @@ async def get_all_folder_contents(
     return items
 
 
+async def _resolve_start_folders(
+    client: httpx.AsyncClient,
+    token: str,
+    headers: dict,
+    hub_id: str,
+    project_id: str,
+    folder_path: str | None,
+) -> list:
+    """Return the folder(s) a recursive walk should start from: the resolved
+    `folder_path` when given, else the project's top-level folders. Shared by
+    `find_files`, `find_folder`, and `list_all_files`."""
+    if folder_path:
+        folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
+        return [{"id": folder_id, "attributes": {"displayName": folder_path}}]
+    res = await client.get(
+        f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
+        headers=headers,
+    )
+    res.raise_for_status()
+    return res.json().get("data", [])
+
+
+async def _walk_project_files(
+    client: httpx.AsyncClient,
+    project_id: str,
+    headers: dict,
+    start_folders: list,
+    predicate=None,
+    max_depth: int = 8,
+) -> list[dict]:
+    """Recursively collect files under each start folder (depth-bounded), returning
+    file dicts with full display-name paths, newest first. `predicate(name_lower)`
+    filters files; None keeps every file. Sub-folder listing errors are skipped
+    (best-effort walk). Shared by `find_files` (substring predicate) and
+    `list_all_files` (no predicate)."""
+    results: list[dict] = []
+
+    async def walk(folder_id: str, path: str, depth: int):
+        if depth > max_depth:
+            return
+        contents = await get_all_folder_contents(
+            client, project_id, folder_id, headers, raise_on_error=False
+        )
+        tasks = []
+        for item in contents:
+            a = item.get("attributes", {})
+            if item["type"] == "folders":
+                tasks.append(walk(item["id"], f"{path}/{_folder_name(a)}", depth + 1))
+                continue
+            display_name = a.get("displayName", "")
+            if predicate is None or predicate(display_name.lower()):
+                results.append({
+                    "name": display_name,
+                    "path": f"{path}/{display_name}",
+                    "id": item["id"],
+                    "last_modified": a.get("lastModifiedTime"),
+                    "modified_by": a.get("lastModifiedUserName"),
+                })
+        await asyncio.gather(*tasks)
+
+    await asyncio.gather(*[
+        walk(f["id"], _folder_name(f["attributes"]), 0) for f in start_folders
+    ])
+    results.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
+    return results
+
+
 async def _request_with_retry(
     client: httpx.AsyncClient,
     method: str,
@@ -527,6 +619,211 @@ async def resolve_project(
 
     project = candidates[0]
     return hub_id, project["id"], project["attributes"]["name"]
+
+
+async def _get_all_hubs(client: httpx.AsyncClient, token: str) -> list:
+    """Return the raw hub list (data array) the account can see."""
+    res = await client.get(f"{APS_BASE}/project/v1/hubs", headers=auth_headers(token))
+    res.raise_for_status()
+    return res.json().get("data", [])
+
+
+def _project_ref(project_id: str, project_name: str, hub: dict | None,
+                 platform: str | None, matched_by: str) -> dict:
+    """Assemble a ProjectRef, always emitting 'b.'-prefixed IDs (see spec)."""
+    hub = hub or {}
+    hub_id = hub.get("id")
+    attrs = hub.get("attributes", {})
+    return {
+        "project_id": _ensure_b_prefix(project_id),
+        "project_name": project_name,
+        "hub_id": _ensure_b_prefix(hub_id) if hub_id else None,
+        "hub_name": attrs.get("name"),
+        "region": attrs.get("region"),
+        "platform": platform,
+        "matched_by": matched_by,
+    }
+
+
+async def _resolve_project_ref(
+    client: httpx.AsyncClient,
+    token: str,
+    query: str,
+    region: str = "EMEA",
+    hub_name: str | None = None,
+    allow_multiple: bool = False,
+) -> dict:
+    """Resolve a project from a name, bare/'b.'-prefixed ID, or ACC URL, together
+    with its owning hub. Returns a ProjectRef dict, or — for a name matching more
+    than one project when ``allow_multiple`` — ``{"ambiguous": True, "candidates": [...]}``.
+
+    ID/URL queries take the ACC Admin fast path (one call, auto-routed, no hub
+    iteration). Name queries fan out across hubs. Raises ValueError on not-found
+    and on ambiguity when ``allow_multiple`` is False."""
+    if not query or not query.strip():
+        raise ValueError("Empty project query — provide a project name, ID, or ACC URL.")
+    query = query.strip()
+
+    uuid = _extract_uuid(query)
+    if uuid:
+        return await _resolve_by_id(client, token, uuid, is_url=_is_url(query))
+    return await _resolve_by_name(
+        client, token, query, region=region, hub_name=hub_name, allow_multiple=allow_multiple
+    )
+
+
+async def _resolve_by_id(
+    client: httpx.AsyncClient, token: str, bare_uuid: str, is_url: bool
+) -> dict:
+    """ID/URL fast path: ask the ACC Admin API for the project's owning account
+    (hub) directly. 2-legged token, NO Region header (auto-routes across regions)."""
+    app_token = await get_app_token()
+    r = await client.get(
+        f"{APS_BASE}/construction/admin/v1/projects/{bare_uuid}",
+        params={"fields": "accountId,name,platform"},
+        headers=auth_headers(app_token),
+    )
+    if r.status_code == 404:
+        raise ValueError(
+            f"Project {bare_uuid} not found — check the ID or your token's account access."
+        )
+    if r.status_code in (401, 403):
+        # Token lacks account:read for the Admin GET — fall back to matching the id
+        # across the hubs the 3-legged user token can see.
+        return await _resolve_id_by_enumeration(client, token, bare_uuid, is_url=is_url)
+    r.raise_for_status()
+    data = r.json()
+
+    account_id = data.get("accountId")
+    hub = None
+    if account_id:
+        hubs = await _get_all_hubs(client, token)
+        hub = next((h for h in hubs if _to_bare_id(h["id"]) == account_id), None)
+        if hub is None:
+            # Admin can see the project but the user token can't list the hub — still
+            # emit the hub id we know, without a display name/region.
+            hub = {"id": _ensure_b_prefix(account_id), "attributes": {}}
+    return _project_ref(
+        _ensure_b_prefix(bare_uuid),
+        data.get("name"),
+        hub,
+        data.get("platform"),
+        "url" if is_url else "id",
+    )
+
+
+async def _resolve_id_by_enumeration(
+    client: httpx.AsyncClient, token: str, bare_uuid: str, is_url: bool
+) -> dict:
+    """Fallback ID resolver: scan every hub's project list for a matching project id."""
+    hubs = await _get_all_hubs(client, token)
+    results = await _gather_bounded(
+        8,
+        [
+            (lambda h=h: get_all_pages(
+                client, f"{APS_BASE}/project/v1/hubs/{h['id']}/projects", auth_headers(token)
+            ))
+            for h in hubs
+        ],
+    )
+    for hub, projects in zip(hubs, results):
+        for p in projects:
+            if _to_bare_id(p["id"]) == bare_uuid:
+                return _project_ref(
+                    p["id"], p["attributes"]["name"], hub, None, "url" if is_url else "id"
+                )
+    raise ValueError(
+        f"Project {bare_uuid} not found — check the ID or your token's account access."
+    )
+
+
+async def _resolve_by_name(
+    client: httpx.AsyncClient,
+    token: str,
+    query: str,
+    region: str = "EMEA",
+    hub_name: str | None = None,
+    allow_multiple: bool = False,
+) -> dict:
+    """Name path: fan out across hubs and partial-match the project name. Searching
+    every hub (not just the region's first) is the wrong-hub fix."""
+    hubs = await _get_all_hubs(client, token)
+    if not hubs:
+        raise ValueError("No hubs found for this account.")
+
+    search_hubs = hubs
+    if hub_name:
+        hn = hub_name.lower()
+        exact = [h for h in hubs if h["attributes"]["name"].lower() == hn]
+        partial = [h for h in hubs if hn in h["attributes"]["name"].lower()]
+        search_hubs = exact or partial
+        if not search_hubs:
+            available = [h["attributes"]["name"] for h in hubs]
+            raise ValueError(f"Hub '{hub_name}' not found. Available hubs: {available}")
+
+    project_lists = await _gather_bounded(
+        8,
+        [
+            (lambda h=h: get_all_pages(
+                client, f"{APS_BASE}/project/v1/hubs/{h['id']}/projects", auth_headers(token)
+            ))
+            for h in search_hubs
+        ],
+    )
+
+    name_lower = query.lower()
+    exact_matches, partial_matches = [], []
+    for hub, projects in zip(search_hubs, project_lists):
+        for p in projects:
+            pname = p["attributes"]["name"]
+            if pname.lower() == name_lower:
+                exact_matches.append((p, hub))
+            elif name_lower in pname.lower():
+                partial_matches.append((p, hub))
+
+    matches = exact_matches or partial_matches
+    if not matches:
+        searched = [h["attributes"]["name"] for h in search_hubs]
+        raise ValueError(f"Project '{query}' not found — searched hubs: {searched}")
+
+    if len(matches) > 1 and not exact_matches:
+        candidates = [
+            _project_ref(p["id"], p["attributes"]["name"], hub, None, "name")
+            for p, hub in matches
+        ]
+        if allow_multiple:
+            return {"ambiguous": True, "candidates": candidates}
+        names = [f"{c['project_name']} ({c['hub_name']})" for c in candidates]
+        raise ValueError(
+            f"Ambiguous project name '{query}'. Matches: {names}. Be more specific "
+            f"(pass a project ID/URL or hub_name)."
+        )
+
+    project, hub = matches[0]
+    return _project_ref(project["id"], project["attributes"]["name"], hub, None, "name")
+
+
+async def _resolve_project_arg(
+    client: httpx.AsyncClient, token: str, arguments: dict
+) -> tuple[str, str, str]:
+    """Entry-point resolver for project-scoped tools: accepts either the new
+    ``project`` param (name / ID / ACC URL) or the legacy ``project_name`` alias,
+    and returns the ``(hub_id, project_id, project_name)`` tuple every call site
+    already expects. Raises on not-found/ambiguous (single-project semantics)."""
+    query = arguments.get("project") or arguments.get("project_name")
+    if not query:
+        raise ValueError(
+            "Provide 'project' (project name, ID, or ACC URL) or 'project_name'."
+        )
+    ref = await _resolve_project_ref(
+        client,
+        token,
+        query,
+        region=_norm_region(arguments),
+        hub_name=arguments.get("hub_name"),
+        allow_multiple=False,
+    )
+    return ref["hub_id"], ref["project_id"], ref["project_name"]
 
 
 async def _resolve_folder_with_hub(
@@ -1072,6 +1369,24 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="resolve_project",
+            description=(
+                "Resolve an ACC project from a name, a project ID (b.xxxx or bare UUID), "
+                "or a full ACC URL, and return it together with its owning hub in one call. "
+                "For an ID/URL this is a single Admin-API call (auto-routed across regions, "
+                "no hub guessing) — the reliable way to pin a project when multiple hubs "
+                "share a region. A name matching more than one project returns candidates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Project name (partial ok), project ID (b.xxxx or bare UUID), or full ACC URL."},
+                    "region": {"type": "string", "description": "Hub region hint for name searches (e.g. EMEA, US). Defaults to EMEA; ignored for ID/URL queries."},
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
             name="list_top_folders",
             description=(
                 "List top-level folders of a project (e.g. 'Project Files', 'Plans'). "
@@ -1080,11 +1395,12 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string", "description": "Project name (partial match ok)."},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1096,12 +1412,13 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {"type": "string", "description": "Slash-separated path e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path"],
+                "required": ["folder_path"],
             },
         ),
         Tool(
@@ -1115,7 +1432,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {
                         "type": "string",
                         "description": "Slash-separated path e.g. 'Project Files/Drawings/My Folder', or a raw folder URN for faster resolution.",
@@ -1124,7 +1442,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path", "new_name"],
+                "required": ["folder_path", "new_name"],
             },
         ),
         Tool(
@@ -1140,7 +1458,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {
                         "type": "string",
                         "description": "Slash-separated path to the folder containing the file, or a raw folder URN for faster resolution.",
@@ -1150,7 +1469,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path", "file_name", "new_name"],
+                "required": ["folder_path", "file_name", "new_name"],
             },
         ),
         Tool(
@@ -1163,13 +1482,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "query": {"type": "string", "description": "Folder name substring to search for."},
                     "folder_path": {"type": "string", "description": "Limit search to this folder and its descendants (optional). Accepts a slash-separated path or a raw folder URN."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "query"],
+                "required": ["query"],
             },
         ),
         Tool(
@@ -1183,7 +1503,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "parent_folder_path": {
                         "type": "string",
                         "description": "Slash-separated path to the parent folder, e.g. 'Project Files/Drawings', or a raw folder URN for faster resolution.",
@@ -1192,7 +1513,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "parent_folder_path", "folder_name"],
+                "required": ["parent_folder_path", "folder_name"],
             },
         ),
         Tool(
@@ -1206,7 +1527,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {
                         "type": "string",
                         "description": "Slash-separated path e.g. 'Project Files/Drawings/Old Folder', or a raw folder URN.",
@@ -1218,7 +1540,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path"],
+                "required": ["folder_path"],
             },
         ),
         Tool(
@@ -1235,7 +1557,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "source_folder_path": {
                         "type": "string",
                         "description": "Slash-separated path to the folder currently containing the file, or a raw folder URN.",
@@ -1252,7 +1575,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "source_folder_path", "file_name", "destination_folder_path"],
+                "required": ["source_folder_path", "file_name", "destination_folder_path"],
             },
         ),
         Tool(
@@ -1267,7 +1590,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {
                         "type": "string",
                         "description": "Slash-separated path to the folder to move, e.g. 'Project Files/Drawings/My Folder', or a raw folder URN.",
@@ -1283,7 +1607,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path", "destination_parent_path"],
+                "required": ["folder_path", "destination_parent_path"],
             },
         ),
         Tool(
@@ -1295,11 +1619,12 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1326,13 +1651,14 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "since_date": {"type": "string", "description": "YYYY-MM-DD, defaults to 7 days ago"},
                     "limit": {"type": "integer", "description": "Max items (default 50)"},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1344,13 +1670,35 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "query": {"type": "string", "description": "Filename substring"},
                     "folder_path": {"type": "string", "description": "Limit search to this folder (optional). Accepts a slash-separated path or a raw folder URN."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
                 },
-                "required": ["project_name", "query"],
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="list_all_files",
+            description=(
+                "List every file in a project (or in one folder and all its subfolders), "
+                "recursively. Omit folder_path for the whole project; pass it to scope to a "
+                "subtree. Returns each file's full path, id, and last-modified info, newest "
+                "first. This is the unfiltered companion to find_files — use it to inventory "
+                "or export all file URNs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "folder_path": {"type": "string", "description": "Limit to this folder and its subfolders (optional). Slash-separated path or a raw folder URN. Omit for the entire project."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
+                },
+                "required": [],
             },
         ),
         Tool(
@@ -1364,11 +1712,12 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1380,11 +1729,12 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1404,7 +1754,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder_path": {
                         "type": "string",
                         "description": "Root folder to scan, e.g. 'Project Files/20_SHARED_Extern', or a raw folder URN for faster resolution.",
@@ -1416,7 +1767,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folder_path"],
+                "required": ["folder_path"],
             },
         ),
         Tool(
@@ -1433,7 +1784,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "send_email": {
                         "type": "boolean",
                         "description": "Send completion email. Default: true.",
@@ -1441,7 +1793,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1479,7 +1831,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "changes": {
                         "type": "array",
@@ -1507,7 +1860,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "changes"],
+                "required": ["changes"],
             },
         ),
         Tool(
@@ -1853,7 +2206,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folders": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1894,7 +2248,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1914,7 +2268,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folder": {
                         "type": "string",
                         "description": "Folder to audit (slash-separated path or raw folder URN), including its whole subtree. Omit to audit every top-level folder of the project.",
@@ -1932,7 +2287,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name"],
+                "required": [],
             },
         ),
         Tool(
@@ -1947,7 +2302,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "items": {
                         "type": "array",
                         "items": {
@@ -1967,7 +2323,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "items"],
+                "required": ["items"],
             },
         ),
         Tool(
@@ -1983,7 +2339,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "folders": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -2000,7 +2357,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "folders"],
+                "required": ["folders"],
             },
         ),
         Tool(
@@ -2016,7 +2373,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "items": {
                         "type": "array",
                         "items": {
@@ -2042,7 +2400,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "items"],
+                "required": ["items"],
             },
         ),
         Tool(
@@ -2056,7 +2414,8 @@ async def list_tools() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string"},
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
                     "items": {
                         "type": "array",
                         "items": {
@@ -2080,7 +2439,7 @@ async def list_tools() -> list[Tool]:
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
-                "required": ["project_name", "items"],
+                "required": ["items"],
             },
         ),
     ]
@@ -2179,8 +2538,18 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             return [TextContent(type="text", text=json.dumps([_fmt_project(p) for p in projects], indent=2))]
 
+        if name == "resolve_project":
+            try:
+                ref = await _resolve_project_ref(
+                    client, token, arguments["query"],
+                    region=_norm_region(arguments), allow_multiple=True,
+                )
+            except ValueError as e:
+                ref = {"error": "not_found", "message": str(e)}
+            return [TextContent(type="text", text=json.dumps(ref, indent=2))]
+
         if name == "list_top_folders":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             res = await client.get(
                 f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
                 headers=hdrs,
@@ -2192,7 +2561,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_folder_contents":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
             items = await get_all_folder_contents(client, project_id, folder_id, hdrs)
@@ -2204,9 +2573,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "rename_folder":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             new_name = arguments["new_name"].strip()
             if not new_name:
@@ -2243,9 +2610,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "rename_file":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             file_name = arguments["file_name"].strip()
             new_name = arguments["new_name"].strip()
@@ -2322,9 +2687,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "move_file":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             source_folder_path = arguments["source_folder_path"]
             file_name = arguments["file_name"].strip()
             destination_folder_path = arguments["destination_folder_path"]
@@ -2387,9 +2750,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "move_folder":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             destination_parent_path = arguments["destination_parent_path"]
             dry_run = arguments.get("dry_run", True)
@@ -2436,9 +2797,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "create_folder":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             parent_path = arguments["parent_folder_path"]
             folder_name = arguments["folder_name"].strip()
             if not folder_name:
@@ -2469,9 +2828,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "delete_folder":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             dry_run = arguments.get("dry_run", True)
 
@@ -2523,7 +2880,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_project_members":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             proj_id_clean = _to_bare_id(project_id)
             account_id = _to_bare_id(hub_id)
 
@@ -2609,7 +2966,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "find_recent_activity":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             limit = int(arguments.get("limit", 50))
             since_raw = arguments.get("since_date")
             since_dt = (
@@ -2658,72 +3015,40 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "find_files":
-            hub_id, project_id, resolved_name = await resolve_project(client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name"))
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             query = arguments["query"].lower()
-            folder_path = arguments.get("folder_path")
-
-            if folder_path:
-                folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
-                start_folders = [{"id": folder_id, "attributes": {"displayName": folder_path}}]
-            else:
-                res = await client.get(
-                    f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
-                    headers=hdrs,
-                )
-                res.raise_for_status()
-                start_folders = res.json().get("data", [])
-
-            results: list[dict] = []
-
-            async def search_folder(folder_id: str, path: str, depth: int = 0):
-                if depth > 8:
-                    return
-                contents = await get_all_folder_contents(
-                    client, project_id, folder_id, hdrs, raise_on_error=False
-                )
-                tasks = []
-                for item in contents:
-                    a = item.get("attributes", {})
-                    if item["type"] == "folders":
-                        tasks.append(search_folder(item["id"], f"{path}/{_folder_name(a)}", depth + 1))
-                        continue
-                    display_name = a.get("displayName", "")
-                    if query in display_name.lower():
-                        results.append({
-                            "name": display_name,
-                            "path": f"{path}/{display_name}",
-                            "id": item["id"],
-                            "last_modified": a.get("lastModifiedTime"),
-                            "modified_by": a.get("lastModifiedUserName"),
-                        })
-                await asyncio.gather(*tasks)
-
-            await asyncio.gather(*[
-                search_folder(f["id"], _folder_name(f["attributes"])) for f in start_folders
-            ])
-            results.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
+            start_folders = await _resolve_start_folders(
+                client, token, hdrs, hub_id, project_id, arguments.get("folder_path")
+            )
+            results = await _walk_project_files(
+                client, project_id, hdrs, start_folders, predicate=lambda n: query in n
+            )
             return [TextContent(type="text", text=json.dumps({
                 "project": resolved_name, "query": query,
                 "result_count": len(results), "files": results,
             }, indent=2))]
 
-        if name == "find_folder":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
-            query = arguments["query"].lower()
+        if name == "list_all_files":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments.get("folder_path")
+            start_folders = await _resolve_start_folders(
+                client, token, hdrs, hub_id, project_id, folder_path
+            )
+            results = await _walk_project_files(
+                client, project_id, hdrs, start_folders
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "scope": folder_path or "(entire project)",
+                "result_count": len(results), "files": results,
+            }, indent=2))]
 
-            if folder_path:
-                folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
-                start_folders = [{"id": folder_id, "attributes": {"displayName": folder_path}}]
-            else:
-                res = await client.get(
-                    f"{APS_BASE}/project/v1/hubs/{hub_id}/projects/{project_id}/topFolders",
-                    headers=hdrs,
-                )
-                res.raise_for_status()
-                start_folders = res.json().get("data", [])
+        if name == "find_folder":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            query = arguments["query"].lower()
+            start_folders = await _resolve_start_folders(
+                client, token, hdrs, hub_id, project_id, arguments.get("folder_path")
+            )
 
             results: list[dict] = []
 
@@ -2757,9 +3082,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_project_roles":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             bare_id = _to_bare_id(project_id)
             role_map: dict[str, str] = {}
             members = []
@@ -2795,9 +3118,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "list_project_companies":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             bare_project_id = _to_bare_id(project_id)
             account_id = _to_bare_id(hub_id)
             app_token = await get_app_token()
@@ -2824,9 +3145,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "export_permission_matrix":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             folder_path = arguments["folder_path"]
             max_depth = int(arguments.get("max_depth", 2))
             bare_id = _to_bare_id(project_id)
@@ -2929,9 +3248,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "create_role_data_export":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             account_id = _to_bare_id(hub_id)
             bare_project_id = _to_bare_id(project_id)
             payload = {
@@ -3048,9 +3365,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             ], indent=2))]
 
         if name == "apply_permission_changes":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             changes = arguments["changes"]
 
             applied = []
@@ -3958,9 +4273,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_list_folder_contents":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             # One shared headers dict, mutated in place by the refresher on a 401,
             # so a long batch outlives a token without re-resolving anything.
             b_hdrs = dict(hdrs)
@@ -4062,9 +4375,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "audit_folder_naming_standards":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             b_hdrs = dict(hdrs)
             refresher = _bearer_refresher(b_hdrs)
             max_depth = arguments.get("max_depth")
@@ -4125,9 +4436,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_create_folders":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             refresher = _bearer_refresher(b_hdrs)
 
@@ -4224,9 +4533,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "bulk_delete_folders":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             refresher = _bearer_refresher(b_hdrs)
 
@@ -4313,9 +4620,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_move_files":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             refresher = _bearer_refresher(b_hdrs)
 
@@ -4440,9 +4745,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
         if name == "bulk_move_folders":
-            hub_id, project_id, resolved_name = await resolve_project(
-                client, token, arguments["project_name"], region=_norm_region(arguments), hub_name=arguments.get("hub_name")
-            )
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
             b_hdrs = {**hdrs, "Content-Type": "application/vnd.api+json"}
             refresher = _bearer_refresher(b_hdrs)
 

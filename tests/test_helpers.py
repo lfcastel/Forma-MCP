@@ -154,6 +154,59 @@ def test_to_bare_id_double_prefix_strips_one():
 
 
 # ---------------------------------------------------------------------------
+# _ensure_b_prefix  (complement to _to_bare_id)
+# ---------------------------------------------------------------------------
+
+def test_ensure_b_prefix_adds_when_missing():
+    assert aps_mcp._ensure_b_prefix("abc123") == "b.abc123"
+
+
+def test_ensure_b_prefix_idempotent():
+    assert aps_mcp._ensure_b_prefix("b.abc123") == "b.abc123"
+
+
+def test_bare_prefix_round_trip():
+    uuid = "0123abcd-4567-89ef-0123-456789abcdef"
+    assert aps_mcp._to_bare_id(aps_mcp._ensure_b_prefix(uuid)) == uuid
+
+
+# ---------------------------------------------------------------------------
+# _extract_uuid / _is_url  (route a project query to the ID vs name path)
+# ---------------------------------------------------------------------------
+
+_UUID = "0123abcd-4567-89ef-0123-456789abcdef"
+
+
+def test_extract_uuid_from_bare_id():
+    assert aps_mcp._extract_uuid(_UUID) == _UUID
+
+
+def test_extract_uuid_from_b_prefixed_id():
+    assert aps_mcp._extract_uuid(f"b.{_UUID}") == _UUID
+
+
+def test_extract_uuid_from_url():
+    url = f"https://acc.autodesk.eu/docs/files/projects/{_UUID}"
+    assert aps_mcp._extract_uuid(url) == _UUID
+
+
+def test_extract_uuid_case_insensitive_lowercased():
+    assert aps_mcp._extract_uuid(_UUID.upper()) == _UUID
+
+
+def test_extract_uuid_none_for_name():
+    assert aps_mcp._extract_uuid("Test (BAC)") is None
+    assert aps_mcp._extract_uuid("") is None
+    assert aps_mcp._extract_uuid(None) is None
+
+
+def test_is_url():
+    assert aps_mcp._is_url("https://acc.autodesk.eu/x")
+    assert not aps_mcp._is_url("Test (BAC)")
+    assert not aps_mcp._is_url("")
+
+
+# ---------------------------------------------------------------------------
 # _extract_response_items
 # ---------------------------------------------------------------------------
 

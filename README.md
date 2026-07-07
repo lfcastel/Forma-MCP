@@ -107,6 +107,8 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 ## Tools reference
 
 > **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "My Company - EU Hub"`. Without it, the first hub returned for the region is used.
+>
+> **Paste a project ID or ACC URL instead.** Every single-project tool also accepts an optional `project` parameter — a project **name**, a **project ID** (`b.xxxx` or bare UUID), or a **full ACC URL**. When it contains an ID/URL the tool pins the exact owning hub in one Admin-API call (no region guessing, no wrong-hub risk), so you never need `hub_name`. The old `project_name` parameter keeps working as a name-only alias. Use the standalone `resolve_project` tool to turn any of these into `{project_id, hub_id, hub_name, region, platform}` up front.
 
 ### Navigation & file exploration
 
@@ -114,6 +116,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 |------|-------------|------|
 | `list_hubs` | List all ACC / BIM360 hubs on your account | 3-legged |
 | `list_projects` | List all projects in a hub | 3-legged |
+| `resolve_project` | Resolve a project from a name, ID (`b.xxx`/bare UUID), or ACC URL → project + owning hub in one call | 2-legged (ID/URL) / 3-legged (name) |
 | `list_top_folders` | List top-level folders in a project | 3-legged |
 | `list_folder_contents` | List files and subfolders at a given path | 3-legged |
 | `rename_folder` | Rename a folder by its display-name path | 3-legged |
@@ -122,6 +125,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 | `move_file` | Move a file into another folder (changes its parent; no re-upload) | 3-legged |
 | `move_folder` | Move a folder (and its contents) into another parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
+| `list_all_files` | Recursively list **every** file in a project (or a folder + subfolders) with full paths | 3-legged |
 | `find_folder` | Search for folders by name across a project | 3-legged |
 | `delete_folder` | Soft-delete (hide) an empty folder | 3-legged |
 | `find_recent_activity` | Show files modified since a given date | 3-legged |
@@ -223,6 +227,7 @@ flowchart LR
     subgraph NAV["Navigation & Files · 3-legged OAuth"]
         T1(list_hubs)
         T2(list_projects)
+        T38(resolve_project)
         T3(list_top_folders)
         T4(list_folder_contents)
         T20(rename_folder)
@@ -232,6 +237,7 @@ flowchart LR
         T26(move_folder)
         T5(find_recent_activity)
         T6(find_files)
+        T39(list_all_files)
         T23(find_folder)
         T24(delete_folder)
     end
@@ -304,9 +310,13 @@ flowchart LR
     E24["POST /hq/v1/accounts/{a}/companies/import"]
     E25["PATCH /hq/v1/accounts/{a}/users/{u}"]
     E26["PATCH /hq/v1/accounts/{a}/companies/{c}"]
+    E27["GET /construction/admin/v1/projects/{p}?fields=accountId,name,platform"]
 
     T1 --> E1
     T2 --> E2
+    T38 --> E27
+    T38 --> E1
+    T38 --> E2
     T3 --> E3
     T4 --> E4
     T20 --> E17
@@ -316,6 +326,8 @@ flowchart LR
     T26 --> E17
     T5 --> E4
     T6 --> E4
+    T39 --> E3
+    T39 --> E4
     T23 --> E4
     T24 --> E17
 
@@ -364,8 +376,8 @@ flowchart LR
     T32 --> E4
     T32 --> E21
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22 get
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27 get
     class E10,E11,E12,E14,E18,E19,E23,E24 post
     class E15,E17,E20,E25,E26 patch
     class E16 del
@@ -389,10 +401,14 @@ flowchart LR
 List all my ACC hubs
 Show all projects in my hub
 Show all projects in the "My Company - EU Hub" hub
+Resolve https://acc.autodesk.eu/docs/files/projects/<project-id> — which hub is it in?
+List the top folders of project b.<project-id> (paste the ID, no hub name needed)
 What are the top folders in "Northgate Tower"?
 List the contents of Project Files/Drawings/Structural in "Northgate Tower"
 List the contents of Project Files/Drawings in "Northgate Tower" in hub "My Company - EU Hub"
 Find all files named "facade" in "Northgate Tower"
+List every file in "Northgate Tower"
+List all files under Project Files/Drawings in "Northgate Tower" (including subfolders)
 What files were modified in the last 7 days in "Northgate Tower"?
 ```
 
@@ -495,7 +511,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 37 tools
+├── aps_mcp.py                  # MCP server — 39 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt
