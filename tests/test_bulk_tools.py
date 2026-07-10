@@ -90,7 +90,10 @@ async def test_bulk_assign_dry_run_returns_would_add():
 
 
 @respx.mock
-async def test_bulk_assign_dry_run_unknown_role_returns_error():
+async def test_bulk_assign_dry_run_unresolved_role_passes_through():
+    """A role the member-walk can't see (e.g. an empty/newly-created role given by
+    its ID) is no longer pre-rejected — dry-run reports would_add and the value is
+    left for the ACC API to validate on import."""
     _mock_common(respx)
 
     with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
@@ -98,15 +101,15 @@ async def test_bulk_assign_dry_run_unknown_role_returns_error():
 
         result = await aps_mcp.call_tool("bulk_assign_users", {
             "project_names": [PROJECT_NAME],
-            "user_emails": [USER_A_EMAIL],
-            "default_role": "NonExistentRole",
+            "user_emails": [USER_B_EMAIL],   # not a member yet → would_add
+            "default_role": "role-empty-ext-id",   # held by no member
             "dry_run": True,
         })
 
     data = _parse(result)
-    assert data["summary"]["error"] == 1
-    assert data["summary"]["would_add"] == 0
-    assert "NonExistentRole" in data["results"][0]["message"]
+    assert data["summary"]["error"] == 0
+    assert data["summary"]["would_add"] == 1
+    assert data["results"][0]["role"] == "role-empty-ext-id"
 
 
 @respx.mock
@@ -140,6 +143,33 @@ async def test_bulk_assign_execute_calls_import_endpoint():
     # products must be present
     assert users_sent[0].get("products")
     assert data["summary"]["success"] == 2
+
+
+@respx.mock
+async def test_bulk_assign_multiple_roles_per_user():
+    """default_role as a list assigns several roles at once — a resolvable name and a
+    raw role ID both land in the roleIds array (the endpoint supports multiple)."""
+    _mock_common(respx)
+    import_route = respx.post(
+        f"{BASE}/construction/admin/v2/projects/{BARE_PROJECT_ID}/users:import"
+    ).mock(return_value=httpx.Response(200, json=IMPORT_SUCCESS_RESPONSE))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+
+        result = await aps_mcp.call_tool("bulk_assign_users", {
+            "project_names": [PROJECT_NAME],
+            "user_emails": [USER_A_EMAIL],
+            "default_role": [ROLE_NAME_VIEWER, "role-empty-ext-id"],  # name + raw id
+            "dry_run": False,
+        })
+
+    data = _parse(result)
+    assert import_route.called
+    users_sent = json.loads(import_route.calls[0].request.content)["users"]
+    # Both roles present: the name resolved to its ID, the raw ID passed through
+    assert users_sent[0]["roleIds"] == [ROLE_ID_VIEWER, "role-empty-ext-id"]
+    assert data["summary"]["success"] >= 1
 
 
 @respx.mock
@@ -283,8 +313,13 @@ async def test_update_roles_execute_calls_patch():
 
 
 @respx.mock
-async def test_update_roles_unknown_role_returns_error():
+async def test_update_roles_unresolved_role_passes_through_to_api():
+    """An unresolved role value is sent to ACC as a raw role ID (no client-side
+    pre-check) — the API is the authority on whether the role exists."""
     _mock_common(respx)
+    patch_route = respx.patch(
+        f"{BASE}/construction/admin/v1/projects/{BARE_PROJECT_ID}/users/{USER_A_ID}"
+    ).mock(return_value=httpx.Response(200, json={"id": USER_A_ID}))
 
     with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
          patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
@@ -292,12 +327,15 @@ async def test_update_roles_unknown_role_returns_error():
         result = await aps_mcp.call_tool("update_user_roles", {
             "project_names": [PROJECT_NAME],
             "user_emails": [USER_A_EMAIL],
-            "default_role": "UnknownRole",
+            "default_role": "role-empty-ext-id",   # held by no member
             "dry_run": False,
         })
 
     data = _parse(result)
-    assert data["summary"]["error"] == 1
+    assert patch_route.called
+    body = json.loads(patch_route.calls.last.request.content)
+    assert body["roleIds"] == ["role-empty-ext-id"]
+    assert data["summary"]["success"] == 1
 
 
 # ===========================================================================
@@ -433,8 +471,9 @@ async def test_clone_dry_run_applies_reference_role():
     assert data["dry_run"] is True
     assert data["projects_cloned"] == 1
     assert data["summary"]["would_add"] == 1
-    # The cloned role should match the reference user's role
-    assert data["results"][0]["role"] == ROLE_NAME_VIEWER
+    # ALL of the reference user's roles are cloned (roleIds is an array), not just the first
+    cloned_roles = {r.strip() for r in data["results"][0]["role"].split(",")}
+    assert cloned_roles == {ROLE_NAME_VIEWER, ROLE_NAME_EDITOR}
 
 
 @respx.mock
@@ -546,3 +585,70 @@ async def test_company_assign_execute_calls_import():
     data = _parse(result)
     assert import_route.called
     assert data["summary"]["success"] == 2
+
+
+# ===========================================================================
+# Cross-hub project resolution (the two-EMEA-hubs fix)
+# ===========================================================================
+
+# Two EMEA hubs. resolve_hub() picks the FIRST one; the target project lives in
+# the SECOND. The old per-hub resolver searched only the first hub and failed
+# with "Project not found"; the modern _resolve_project_ref fans out across all
+# hubs, so the bulk-user tools now resolve the project without a hub_name hint.
+HUB_ONE_ID = "b.hub-one"
+HUB_TWO_ID = "b.hub-two"
+CROSS_PROJECT_ID = "b.cross-proj"
+CROSS_BARE_PROJECT_ID = "cross-proj"
+CROSS_PROJECT_NAME = "Cross Hub Project"
+
+TWO_HUBS_RESPONSE = {
+    "data": [
+        {"id": HUB_ONE_ID, "attributes": {
+            "name": "BAC - Default Hub", "region": "EMEA",
+            "hubType": "autodesk.bim360:Account"}},
+        {"id": HUB_TWO_ID, "attributes": {
+            "name": "BAC - EU Hub", "region": "EMEA",
+            "hubType": "autodesk.bim360:Account"}},
+    ]
+}
+
+
+@respx.mock
+async def test_remove_resolves_project_in_second_hub_without_hub_name():
+    """remove_users_from_projects finds a project living in a non-default EMEA
+    hub without a hub_name — proves the cross-hub resolver fix."""
+    respx.get(f"{BASE}/project/v1/hubs").mock(
+        return_value=httpx.Response(200, json=TWO_HUBS_RESPONSE)
+    )
+    # First hub has no matching project; the project lives in the second hub.
+    respx.get(f"{BASE}/project/v1/hubs/{HUB_ONE_ID}/projects").mock(
+        return_value=httpx.Response(200, json={
+            "data": [], "meta": {"pagination": {"totalResults": 0}}})
+    )
+    respx.get(f"{BASE}/project/v1/hubs/{HUB_TWO_ID}/projects").mock(
+        return_value=httpx.Response(200, json={
+            "data": [{"id": CROSS_PROJECT_ID,
+                      "attributes": {"name": CROSS_PROJECT_NAME}}],
+            "meta": {"pagination": {"totalResults": 1}}})
+    )
+    # Membership lookup for the resolved (second-hub) project.
+    respx.get(
+        f"{BASE}/construction/admin/v1/projects/{CROSS_BARE_PROJECT_ID}/users"
+    ).mock(return_value=httpx.Response(200, json=PROJECT_MEMBERS_RESPONSE))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+
+        result = await aps_mcp.call_tool("remove_users_from_projects", {
+            "project_names": [CROSS_PROJECT_NAME],
+            "user_emails": [USER_A_EMAIL],
+            "dry_run": True,
+        })
+
+    data = _parse(result)
+    # Project resolved across hubs → USER_A (a member) is flagged would_remove,
+    # NOT reported as a "Project not found" error.
+    assert data["summary"]["would_remove"] == 1
+    assert data["summary"]["error"] == 0
+    assert data["results"][0]["project"] == CROSS_PROJECT_NAME
+    assert data["results"][0]["status"] == "would_remove"

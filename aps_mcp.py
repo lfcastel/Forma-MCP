@@ -1642,6 +1642,33 @@ def _resolve_role_id(role_name: str, role_map: dict[str, str]) -> str | None:
     return None
 
 
+def _as_role_list(role_spec: "Any") -> list[str]:
+    """Normalize a role spec — a single role name/ID string, or a list of them — into a
+    de-duplicated, blank-stripped list. The project `users:import` `roleIds` field is an
+    array, so a user can hold several roles at once (not just one)."""
+    if role_spec is None:
+        return []
+    items = [role_spec] if isinstance(role_spec, str) else list(role_spec)
+    out: list[str] = []
+    for it in items:
+        s = str(it).strip()
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _resolve_role_ids(role_spec: "Any", role_map: dict[str, str]) -> list[str]:
+    """Resolve every role in the spec to its ID via the member-derived map, passing an
+    unresolved value straight through as a raw role ID (see _execute_bulk_assign — empty
+    roles aren't visible to the member walk, so the ACC API is the authority)."""
+    return [_resolve_role_id(name, role_map) or name for name in _as_role_list(role_spec)]
+
+
+def _role_display(role_spec: "Any") -> str:
+    """Human-readable rendering of a role spec (one or many) for result rows / audit CSV."""
+    return ", ".join(_as_role_list(role_spec))
+
+
 def _write_audit_csv(rows: list[dict], operation: str) -> str:
     """Write audit rows to a timestamped CSV in the audit_logs/ folder. Returns file path."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2116,13 +2143,18 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="create_role_data_export",
             description=(
-                "STEP 1 of 2 for Forma role resolution. "
-                "Create a one-time Data Connector export (admin service group) to retrieve "
-                "Forma project roles. Forma does not expose a direct roles endpoint — this "
-                "async export is the only supported approach. "
+                "STEP 1 of 2 to resolve the FULL project-roles catalog (id <-> name), "
+                "INCLUDING empty roles that are assigned to no members yet. Forma exposes no "
+                "project-roles endpoint, so this one-time Data Connector export (admin service "
+                "group) is the only supported way to see roles the members API can't. "
+                "Use the returned role IDs for EITHER use case: "
+                "(1) ASSIGN users to a role via bulk_assign_users / update_user_roles by passing "
+                "the role_id as the role — the only way to place the first person into an "
+                "empty/newly-created role; or "
+                "(2) LABEL role IDs with names in export_permission_matrix. "
                 "Rate limited to 24 jobs per hub per day. "
                 "After calling this, immediately call get_data_connector_requests (STEP 2) "
-                "to poll until the job is complete, then proceed to export_permission_matrix."
+                "with the returned request_id to poll until complete and download the role map."
             ),
             inputSchema={
                 "type": "object",
@@ -2142,13 +2174,14 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_data_connector_requests",
             description=(
-                "STEP 2 of 2 for Forma role resolution. "
+                "STEP 2 of 2 to resolve the full project-roles catalog (see create_role_data_export). "
                 "Lists Data Connector requests and, when a completed job is found, immediately "
                 "downloads and parses the role CSV from the signed ZIP URL (valid only 60 s). "
                 "Pass request_id (returned by create_role_data_export) to wait for that specific "
                 "job — the tool polls internally every 15 s (up to 10 min) so you never need to "
-                "call it repeatedly. Parsed roles are returned as a role_id→name map ready for "
-                "export_permission_matrix."
+                "call it repeatedly. Returns a role_id→name map (EMPTY roles included) ready to "
+                "feed into bulk_assign_users / update_user_roles (assign to a role by its id) or "
+                "export_permission_matrix (label role ids with names)."
             ),
             inputSchema={
                 "type": "object",
@@ -2228,12 +2261,13 @@ async def list_tools() -> list[Tool]:
                         "description": "List of user email addresses to add.",
                     },
                     "default_role": {
-                        "type": "string",
-                        "description": "Role name applied to all projects unless overridden by role_overrides.",
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "Role applied to all projects unless overridden by role_overrides. A role name OR role ID; pass a list to assign multiple roles per user, e.g. [\"Editor\", \"BIM Coordinator\"].",
                     },
                     "role_overrides": {
                         "type": "object",
-                        "description": "Per-project role map: {\"Project A\": \"Editor\", \"Project B\": \"Viewer\"}.",
+                        "description": "Per-project role map, e.g. {\"Project A\": \"Editor\", \"Project B\": [\"Viewer\", \"EXT Architect\"]}. Each value is a role name/ID or a list of them (multiple roles per user).",
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -2264,12 +2298,13 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                     },
                     "default_role": {
-                        "type": "string",
-                        "description": "New role name to apply across all projects unless overridden.",
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "New role(s) to apply across all projects unless overridden. A role name OR role ID; pass a list to set multiple roles per member. This REPLACES the member's existing roles.",
                     },
                     "role_overrides": {
                         "type": "object",
-                        "description": "Per-project role map: {\"Project A\": \"Admin\"}.",
+                        "description": "Per-project role map, e.g. {\"Project A\": \"Admin\", \"Project B\": [\"Editor\", \"Viewer\"]}. Each value is a role name/ID or a list of them.",
                     },
                     "dry_run": {"type": "boolean"},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
@@ -2350,8 +2385,15 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                     },
-                    "default_role": {"type": "string"},
-                    "role_overrides": {"type": "object"},
+                    "default_role": {
+                        "type": ["string", "array"],
+                        "items": {"type": "string"},
+                        "description": "Role(s) applied to every company member unless overridden. A role name OR role ID; pass a list for multiple roles per user.",
+                    },
+                    "role_overrides": {
+                        "type": "object",
+                        "description": "Per-project role map; each value is a role name/ID or a list of them.",
+                    },
                     "user_filter": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -4211,8 +4253,8 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
         async def _execute_bulk_assign(
             resolved_projects: list[dict],
             user_emails: list[str],
-            default_role: str,
-            role_overrides: dict[str, str],
+            default_role: "str | list[str]",
+            role_overrides: "dict[str, str | list[str]]",
             dry_run: bool,
         ) -> tuple[list[dict], list[str], bool]:
             """
@@ -4231,37 +4273,35 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 async with sem:
                     pid = proj["id"]
                     pname = proj["name"]
-                    role_name = role_overrides.get(pname.lower(), default_role)
+                    role_spec = role_overrides.get(pname.lower(), default_role)
+                    role_display = _role_display(role_spec) or "(none)"
                     proj_results: list[dict] = []
 
-                    role_id: str | None = None
-                    if role_name:
+                    role_ids: list[str] = []
+                    if _as_role_list(role_spec):
                         role_map = await _fetch_project_roles(client, pid, hdrs)
-                        role_id = _resolve_role_id(role_name, role_map)
-                        if not role_id:
-                            available = list(role_map.values()) or ["(none found — project may have no members yet)"]
-                            for email in user_emails:
-                                proj_results.append({
-                                    "user": email, "project": pname, "role": role_name,
-                                    "status": "error",
-                                    "message": f"Role '{role_name}' not found. Available: {available}",
-                                })
-                            return proj_results
+                        # Resolve each friendly role name to its ID when a project member
+                        # already holds it. Empty/newly-created roles aren't visible to
+                        # that member walk (ACC exposes no project-roles catalog), so
+                        # DON'T pre-reject an unresolved value — pass it through as a raw
+                        # role ID and let the ACC API validate it on import. roleIds is an
+                        # array, so a user can be given multiple roles at once.
+                        role_ids = _resolve_role_ids(role_spec, role_map)
 
                     if dry_run:
                         members = await _get_project_members_map(client, pid, hdrs)
                         for email in user_emails:
                             if email in members:
                                 proj_results.append({
-                                    "user": email, "project": pname, "role": role_name or "(none)",
+                                    "user": email, "project": pname, "role": role_display,
                                     "status": "already_member",
                                     "message": "Already a member — no change",
                                 })
                             else:
                                 proj_results.append({
-                                    "user": email, "project": pname, "role": role_name or "(none)",
+                                    "user": email, "project": pname, "role": role_display,
                                     "status": "would_add",
-                                    "message": f"Would add with role '{role_name}'" if role_name else "Would add (no role)",
+                                    "message": f"Would add with role(s) '{role_display}'" if role_ids else "Would add (no role)",
                                 })
                         return proj_results
 
@@ -4274,8 +4314,8 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                                 "email": email,
                                 "products": DEFAULT_PRODUCTS,
                             }
-                            if role_id:
-                                entry["roleIds"] = [role_id]
+                            if role_ids:
+                                entry["roleIds"] = role_ids
                             users_payload.append(entry)
 
                         api_calls_made_flag[0] = True
@@ -4293,21 +4333,21 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                                     ok = item.get("success", True)
                                     proj_results.append({
                                         "user": email_resp or "(unknown)",
-                                        "project": pname, "role": role_name or "(none)",
+                                        "project": pname, "role": role_display,
                                         "status": "success" if ok else "error",
                                         "message": item.get("message") or item.get("error") or "",
                                     })
                             else:
                                 for email in batch:
                                     proj_results.append({
-                                        "user": email, "project": pname, "role": role_name or "(none)",
+                                        "user": email, "project": pname, "role": role_display,
                                         "status": "success", "message": "",
                                     })
                         else:
                             body = _error_body(r)
                             for email in batch:
                                 proj_results.append({
-                                    "user": email, "project": pname, "role": role_name or "(none)",
+                                    "user": email, "project": pname, "role": role_display,
                                     "status": "error", "message": f"HTTP {r.status_code}: {body}",
                                 })
                     return proj_results
@@ -4335,8 +4375,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             project_errors: list[dict] = []
             for pname in project_names:
                 try:
-                    _, pid, rname = await resolve_project(client, token, pname, hub_id=hub_id)
-                    resolved_projects.append({"id": pid, "name": rname})
+                    ref = await _resolve_project_ref(
+                        client, token, pname, region=region, hub_name=arguments.get("hub_name")
+                    )
+                    resolved_projects.append({"id": ref["project_id"], "name": ref["project_name"]})
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
@@ -4358,17 +4400,17 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             for email in invalid_email_set:
                 for proj in resolved_projects:
-                    role_name = role_overrides.get(proj["name"].lower(), default_role)
+                    role_display = _role_display(role_overrides.get(proj["name"].lower(), default_role))
                     results.append({
-                        "user": email, "project": proj["name"], "role": role_name,
+                        "user": email, "project": proj["name"], "role": role_display,
                         "status": "error", "message": "Not found in account roster",
                     })
 
             for pentry in project_errors:
-                role_name = role_overrides.get(pentry["project"].lower(), default_role)
+                role_display = _role_display(role_overrides.get(pentry["project"].lower(), default_role))
                 for email in user_emails:
                     results.append({
-                        "user": email, "project": pentry["project"], "role": role_name,
+                        "user": email, "project": pentry["project"], "role": role_display,
                         "status": "error", "message": f"Project not found: {pentry['project']}",
                     })
 
@@ -4402,8 +4444,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             project_errors: list[dict] = []
             for pname in project_names:
                 try:
-                    _, pid, rname = await resolve_project(client, token, pname, hub_id=hub_id)
-                    resolved_projects.append({"id": pid, "name": rname})
+                    ref = await _resolve_project_ref(
+                        client, token, pname, region=region, hub_name=arguments.get("hub_name")
+                    )
+                    resolved_projects.append({"id": ref["project_id"], "name": ref["project_name"]})
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
@@ -4420,17 +4464,17 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             results: list[dict] = []
             for email in invalid_email_set:
                 for proj in resolved_projects:
-                    role_name = role_overrides.get(proj["name"].lower(), default_role)
+                    role_display = _role_display(role_overrides.get(proj["name"].lower(), default_role))
                     results.append({
-                        "user": email, "project": proj["name"], "role": role_name,
+                        "user": email, "project": proj["name"], "role": role_display,
                         "status": "error", "message": "Not found in account roster",
                     })
 
             for pentry in project_errors:
-                role_name = role_overrides.get(pentry["project"].lower(), default_role)
+                role_display = _role_display(role_overrides.get(pentry["project"].lower(), default_role))
                 for email in user_emails:
                     results.append({
-                        "user": email, "project": pentry["project"], "role": role_name,
+                        "user": email, "project": pentry["project"], "role": role_display,
                         "status": "error", "message": f"Project not found: {pentry['project']}",
                     })
 
@@ -4438,19 +4482,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             for proj in resolved_projects:
                 pid = proj["id"]
                 pname = proj["name"]
-                role_name = role_overrides.get(pname.lower(), default_role)
+                role_spec = role_overrides.get(pname.lower(), default_role)
+                role_display = _role_display(role_spec)
 
                 role_map = await _fetch_project_roles(client, pid, hdrs)
-                role_id = _resolve_role_id(role_name, role_map)
-                if not role_id:
-                    available = list(role_map.values()) or ["(none found)"]
-                    for email in valid_emails:
-                        results.append({
-                            "user": email, "project": pname, "role": role_name,
-                            "status": "error",
-                            "message": f"Role '{role_name}' not found. Available: {available}",
-                        })
-                    continue
+                # See _execute_bulk_assign: unresolved role names aren't pre-rejected
+                # (empty roles aren't visible via the member walk) — they pass through
+                # as raw role IDs and the ACC API is the authority. roleIds is an array,
+                # so a member can be given multiple roles at once.
+                role_ids = _resolve_role_ids(role_spec, role_map)
 
                 members = await _get_project_members_map(client, pid, hdrs)
                 bare_pid = _to_bare_id(pid)
@@ -4459,7 +4499,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     member = members.get(email)
                     if not member:
                         results.append({
-                            "user": email, "project": pname, "role": role_name,
+                            "user": email, "project": pname, "role": role_display,
                             "status": "skipped", "message": "Not a member of this project",
                         })
                         continue
@@ -4467,7 +4507,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     user_id = member.get("id") or member.get("userId") or member.get("autodeskId")
                     if not user_id:
                         results.append({
-                            "user": email, "project": pname, "role": role_name,
+                            "user": email, "project": pname, "role": role_display,
                             "status": "error", "message": "Could not determine user ID from member record",
                         })
                         continue
@@ -4476,9 +4516,9 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                         current_role_id = member.get("roleId") or member.get("role") or ""
                         current_role_name = role_map.get(current_role_id) or current_role_id or "(unknown)"
                         results.append({
-                            "user": email, "project": pname, "role": role_name,
+                            "user": email, "project": pname, "role": role_display,
                             "status": "would_update",
-                            "message": f"Would change role from '{current_role_name}' to '{role_name}'",
+                            "message": f"Would change role from '{current_role_name}' to '{role_display}'",
                         })
                         continue
 
@@ -4486,17 +4526,17 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     r = await client.patch(
                         f"{APS_BASE}/construction/admin/v1/projects/{bare_pid}/users/{user_id}",
                         headers=hdrs,
-                        json={"roleIds": [role_id], "products": DEFAULT_PRODUCTS},
+                        json={"roleIds": role_ids, "products": DEFAULT_PRODUCTS},
                     )
                     if r.is_success:
                         results.append({
-                            "user": email, "project": pname, "role": role_name,
+                            "user": email, "project": pname, "role": role_display,
                             "status": "success", "message": "",
                         })
                     else:
                         body = _error_body(r)
                         results.append({
-                            "user": email, "project": pname, "role": role_name,
+                            "user": email, "project": pname, "role": role_display,
                             "status": "error", "message": f"HTTP {r.status_code}: {body}",
                         })
 
@@ -4528,8 +4568,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             if project_names:
                 for pname in project_names:
                     try:
-                        _, pid, rname = await resolve_project(client, token, pname, hub_id=hub_id)
-                        resolved_projects_list.append({"id": pid, "name": rname})
+                        ref = await _resolve_project_ref(
+                            client, token, pname, region=region, hub_name=arguments.get("hub_name")
+                        )
+                        resolved_projects_list.append({"id": ref["project_id"], "name": ref["project_name"]})
                     except ValueError as e:
                         project_errors_list.append({"project": pname, "error": str(e)})
             else:
@@ -4643,23 +4685,18 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     "error": f"Reference user '{ref_email}' not found in any project.",
                 }, indent=2))]
 
-            # Build role_overrides using project names — role names come directly from the API
-            role_overrides: dict[str, str] = {}
+            # Build role_overrides using project names — role names come directly from the API.
+            # Clone ALL of the reference user's roles per project (roleIds is an array), not
+            # just the first.
+            role_overrides: dict[str, list[str]] = {}
             for entry in ref_project_roles:
                 role_names = entry["role_names"]
-                # Use the first role; warn below if the user holds multiple roles in a project
-                role_overrides[entry["name"].lower()] = role_names[0] if role_names else "Viewer"
+                role_overrides[entry["name"].lower()] = role_names or ["Viewer"]
 
             results, warnings, api_calls_made = await _execute_bulk_assign(
                 ref_project_roles, target_emails, "", role_overrides, dry_run
             )
             warnings.insert(0, f"Reference user '{ref_email}' found in {len(ref_project_roles)} projects.")
-            for entry in ref_project_roles:
-                if len(entry["role_names"]) > 1:
-                    warnings.append(
-                        f"Project '{entry['name']}': reference user holds multiple roles "
-                        f"{entry['role_names']} — only '{entry['role_names'][0]}' was cloned."
-                    )
 
             audit_file = None
             if not dry_run and api_calls_made:
@@ -4711,8 +4748,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             project_errors: list[dict] = []
             for pname in project_names:
                 try:
-                    _, pid, rname = await resolve_project(client, token, pname, hub_id=hub_id)
-                    resolved_projects.append({"id": pid, "name": rname})
+                    ref = await _resolve_project_ref(
+                        client, token, pname, region=region, hub_name=arguments.get("hub_name")
+                    )
+                    resolved_projects.append({"id": ref["project_id"], "name": ref["project_name"]})
                 except ValueError as e:
                     project_errors.append({"project": pname, "error": str(e)})
 
@@ -4721,10 +4760,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             )
             warnings.insert(0, f"Found {len(company_emails)} users for company '{arguments['company_name']}'.")
             for pentry in project_errors:
-                role_name = role_overrides.get(pentry["project"].lower(), default_role)
+                role_display = _role_display(role_overrides.get(pentry["project"].lower(), default_role))
                 for email in company_emails:
                     results.append({
-                        "user": email, "project": pentry["project"], "role": role_name,
+                        "user": email, "project": pentry["project"], "role": role_display,
                         "status": "error", "message": f"Project not found: {pentry['project']}",
                     })
 
