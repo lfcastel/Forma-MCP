@@ -29,6 +29,10 @@ SCOPES = "data:read data:write data:create account:read account:write"
 # One-line change here if a US hub is ever added.
 ISSUES_REGION = "EMEA"
 
+# The ACC Reviews (approval workflows) API is region-routed just like Issues; all
+# Brussels Airport traffic is EMEA. Sent as `x-ads-region` on every Reviews call.
+REVIEWS_REGION = "EMEA"
+
 # tokens.json sits next to this script
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 
@@ -896,6 +900,232 @@ async def _resolve_issue_ref(
     if not rows:
         raise ValueError(f"No issue with displayId {display_id} in this project.")
     return rows[0]["id"]
+
+
+# ---------------------------------------------------------------------------
+# Approval-workflow (ACC Reviews API) helpers
+# ---------------------------------------------------------------------------
+
+WORKFLOWS_URL = APS_BASE + "/construction/reviews/v1/projects/{pid}/workflows"
+
+
+async def _resolve_review_project(
+    client: httpx.AsyncClient, token: str, arguments: dict
+) -> tuple[str, str]:
+    """Resolve a project for the Reviews API → (bare project UUID, display name).
+    Same resolution as every other tool; the Reviews endpoints want the bare id."""
+    _, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+    return _to_bare_id(project_id), resolved_name
+
+
+async def _resolve_workflow_ref(
+    client: httpx.AsyncClient, wf_hdrs: dict, bare_project_id: str, arguments: dict
+) -> str:
+    """Return an approval workflow's UUID from ``workflow_id`` (a UUID, preferred)
+    or ``name`` (one list call, exact case-insensitive match). Raises ValueError if
+    neither is given, the name matches nothing, or it is ambiguous."""
+    workflow_id = arguments.get("workflow_id")
+    if workflow_id:
+        return workflow_id
+    name = arguments.get("name")
+    if not name:
+        raise ValueError("Provide 'workflow_id' (UUID) or 'name'.")
+    rows = await _get_all_issues(
+        client, WORKFLOWS_URL.format(pid=bare_project_id), wf_hdrs, page_limit=50
+    )
+    matches = [w for w in rows if (w.get("name") or "").lower() == name.lower()]
+    if not matches:
+        raise ValueError(f"No workflow named '{name}' in this project.")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple workflows named '{name}' — pass 'workflow_id' instead.")
+    return matches[0]["id"]
+
+
+def _looks_like_autodesk_id(value: str) -> bool:
+    """Heuristic: an opaque Autodesk ID (alphanumeric, ≥8 chars, contains a digit) —
+    distinguishes a pasted raw id from a person/role/company name (which rarely
+    contains a digit and often has spaces)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9]{8,}", value)) and any(c.isdigit() for c in value)
+
+
+async def _build_project_directory(
+    client: httpx.AsyncClient, token: str, bare_project_id: str
+) -> dict:
+    """Build case-insensitive lookup maps that resolve friendly reviewer references
+    (user names/emails, role names, company names) → the ``autodeskId`` values the
+    Reviews Workflows API requires for step candidates.
+
+    Two distinct ID spaces, so two distinct sources:
+
+    * **Users** — from the ACC Admin ``projects/{id}/users`` endpoint (3-legged, same
+      source as list_project_members). A user's opaque ``autodeskId`` there is exactly
+      what the Reviews API wants.
+    * **Roles & companies** — the Reviews API keys these by a *numeric* ``autodeskId``
+      that is **not** the project-role UUID from the Admin API, and Autodesk exposes no
+      endpoint to discover it. The only reliable source is the candidates already
+      embedded in the project's existing workflows, so we harvest role/company
+      name→autodeskId from them. Names unused by any existing workflow can't be
+      resolved (pass a raw autodeskId instead)."""
+    hdrs = auth_headers(token)
+    users_by_name: dict[str, str] = {}
+    users_by_email: dict[str, str] = {}
+    params: dict = {"limit": 200, "offset": 0}
+    while True:
+        r = await client.get(
+            f"{APS_BASE}/construction/admin/v1/projects/{bare_project_id}/users",
+            headers=hdrs, params=params,
+        )
+        if not r.is_success:
+            break
+        users = _extract_response_items(r.json())
+        for u in users:
+            aid = u.get("autodeskId")
+            if aid:
+                name = u.get("name") or f"{u.get('firstName','')} {u.get('lastName','')}".strip()
+                if name:
+                    users_by_name[name.lower()] = aid
+                email = u.get("email")
+                if email:
+                    users_by_email[email.lower()] = aid
+        if len(users) < params["limit"]:
+            break
+        params["offset"] += params["limit"]
+
+    # Harvest role/company autodeskIds from existing workflows' candidates (the only
+    # source in the Reviews ID space). Best-effort — a project with no workflows yet
+    # simply yields empty role/company maps, and those references must be raw ids.
+    roles_by_name: dict[str, str] = {}
+    companies_by_name: dict[str, str] = {}
+    try:
+        wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
+        workflows = await _get_all_issues(
+            client, WORKFLOWS_URL.format(pid=bare_project_id), wf_hdrs, page_limit=50
+        )
+        for wf in workflows:
+            for step in (wf.get("steps") or []):
+                cands = step.get("candidates") or {}
+                for role in cands.get("roles", []):
+                    if role.get("name") and role.get("autodeskId"):
+                        roles_by_name[role["name"].lower()] = role["autodeskId"]
+                for comp in cands.get("companies", []):
+                    if comp.get("name") and comp.get("autodeskId"):
+                        companies_by_name[comp["name"].lower()] = comp["autodeskId"]
+    except Exception:
+        pass  # harvesting is best-effort; unresolved names fall back to raw-id passthrough
+
+    return {
+        "users_by_name": users_by_name,
+        "users_by_email": users_by_email,
+        "roles_by_name": roles_by_name,
+        "companies_by_name": companies_by_name,
+    }
+
+
+def _resolve_candidates(step: dict, directory: dict) -> dict:
+    """Translate a step's friendly reviewer references into the Reviews API
+    ``candidates`` shape: ``{users:[{autodeskId}], roles:[...], companies:[...]}``.
+
+    Accepts per step: ``reviewer_users`` (names or emails), ``reviewer_roles`` (role
+    names), ``reviewer_companies`` (company names). A value that is already an
+    autodeskId (matches a directory value or looks like one) is passed through. Any
+    unmatched reference raises ValueError naming every unresolved entry, so a bad
+    Excel row fails loudly instead of silently dropping a reviewer."""
+    unresolved: list[str] = []
+
+    def _lookup(value, by_name: dict, by_email: "dict | None" = None):
+        key = str(value).strip()
+        low = key.lower()
+        if by_email and low in by_email:
+            return by_email[low]
+        if low in by_name:
+            return by_name[low]
+        known_ids = set(by_name.values())
+        if by_email:
+            known_ids |= set(by_email.values())
+        if key in known_ids or _looks_like_autodesk_id(key):
+            return key
+        unresolved.append(key)
+        return None
+
+    candidates: dict = {}
+    users = [
+        {"autodeskId": aid}
+        for v in (step.get("reviewer_users") or [])
+        if (aid := _lookup(v, directory["users_by_name"], directory["users_by_email"]))
+    ]
+    roles = [
+        {"autodeskId": aid}
+        for v in (step.get("reviewer_roles") or [])
+        if (aid := _lookup(v, directory["roles_by_name"]))
+    ]
+    companies = [
+        {"autodeskId": aid}
+        for v in (step.get("reviewer_companies") or [])
+        if (aid := _lookup(v, directory["companies_by_name"]))
+    ]
+    if unresolved:
+        raise ValueError(
+            "Could not resolve these reviewer references to Autodesk IDs: "
+            + ", ".join(unresolved)
+            + ". Users come from list_project_members (the 'autodesk_id' field). Role and "
+            "company IDs use a separate numeric ID space that Autodesk exposes no lookup "
+            "for — they can only be resolved from a workflow that already uses them (see "
+            "get_workflow), so pass the raw autodeskId for any role/company not yet used "
+            "in an existing workflow."
+        )
+    if users:
+        candidates["users"] = users
+    if roles:
+        candidates["roles"] = roles
+    if companies:
+        candidates["companies"] = companies
+    return candidates
+
+
+def _workflow_create_payload(spec: dict, directory: dict) -> dict:
+    """Build the POST body for an approval workflow from a friendly ``spec``
+    (snake_case → API camelCase), resolving each step's reviewer references via
+    ``directory``. Only supplied keys are included. Shared by create_workflow and
+    bulk_create_workflows. Raises ValueError on a missing name or unresolved
+    reviewer."""
+    if not spec.get("name"):
+        raise ValueError("Workflow 'name' is required.")
+    body: dict = {"name": spec["name"]}
+    for src in ("description", "notes"):
+        if spec.get(src) is not None:
+            body[src] = spec[src]
+    if spec.get("initiator_edit_permissions") is not None:
+        body["additionalOptions"] = {
+            "initiatorEditPermissions": spec["initiator_edit_permissions"]
+        }
+    if spec.get("additional_approval_status_options") is not None:
+        body["additionalApprovalStatusOptions"] = spec["additional_approval_status_options"]
+
+    steps_out = []
+    for step in (spec.get("steps") or []):
+        s: dict = {"name": step.get("name"), "type": step.get("type")}
+        if step.get("duration") is not None:
+            s["duration"] = step["duration"]
+        if step.get("due_date_type") is not None:
+            s["dueDateType"] = step["due_date_type"]
+        if step.get("group_review") is not None:
+            s["groupReview"] = step["group_review"]
+        candidates = _resolve_candidates(step, directory)
+        if not candidates and step.get("candidates"):
+            candidates = step["candidates"]  # allow a pre-built passthrough candidates dict
+        if candidates:
+            s["candidates"] = candidates
+        steps_out.append(s)
+    body["steps"] = steps_out
+
+    # copyFilesOptions is required by the API; default to "don't copy" when omitted.
+    cfo = spec.get("copy_files_options")
+    body["copyFilesOptions"] = cfo if cfo is not None else {"enabled": False}
+    if spec.get("attached_attributes") is not None:
+        body["attachedAttributes"] = spec["attached_attributes"]
+    if spec.get("update_attributes_options") is not None:
+        body["updateAttributesOptions"] = spec["update_attributes_options"]
+    return body
 
 
 async def _resolve_folder_with_hub(
@@ -2769,6 +2999,203 @@ async def list_tools() -> list[Tool]:
                 "required": [],
             },
         ),
+        Tool(
+            name="list_workflows",
+            description=(
+                "List approval workflows (ACC Reviews module) in a project. Each "
+                "workflow defines the steps, reviewers/approvers, durations, approval "
+                "statuses, and post-review copy/attribute actions used when creating "
+                "file reviews. Auto-paginates all matches. By default the API returns "
+                "only ACTIVE workflows — pass status=INACTIVE for disabled ones. Not "
+                "compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "status": {"type": "string", "description": "Filter by status: ACTIVE (default) or INACTIVE. Cannot be combined with initiator."},
+                    "initiator": {"type": "boolean", "description": "If true, return only workflows initiated by the current user (ignored for project admins). Cannot be combined with status."},
+                    "sort": {"type": "string", "description": "Sort field: name, status, or updatedAt; append ' desc' for descending (e.g. 'name desc')."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_workflow",
+            description=(
+                "Get a single approval workflow by its UUID (`workflow_id`) or by its "
+                "`name` (one lookup among the project's ACTIVE workflows). Returns the "
+                "full workflow object including every step's resolved candidates "
+                "(users/roles/companies with their Autodesk IDs). Not compatible with "
+                "BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "workflow_id": {"type": "string", "description": "The workflow UUID (preferred). Provide this or name."},
+                    "name": {"type": "string", "description": "The workflow name (exact, case-insensitive). Resolved to the UUID via one list call. Provide this or workflow_id."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="create_workflow",
+            description=(
+                "Create an approval workflow in an ACC project. Posts immediately (no "
+                "dry_run — use bulk_create_workflows for a previewable batch). Reviewers "
+                "are given as friendly names/emails/role names/company names per step "
+                "(reviewer_users / reviewer_roles / reviewer_companies) and resolved to "
+                "Autodesk IDs automatically; raw autodeskId values also pass through. A "
+                "name collision returns a 409. Not compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "name": {"type": "string", "description": "Workflow name — must be unique within the project (max 255)."},
+                    "description": {"type": "string", "description": "Workflow description (max 4096)."},
+                    "notes": {"type": "string", "description": "Custom note shown to all reviewers during the review (max 4096)."},
+                    "initiator_edit_permissions": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["REVIEWER_ASSIGNMENTS_AND_DURATION", "APPROVERS"]},
+                        "description": "Extra edit permissions granted to the review initiator in the UI. Omit/empty = none.",
+                    },
+                    "additional_approval_status_options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "Display name, unique across all statuses (max 255)."},
+                                "value": {"type": "string", "enum": ["APPROVED", "REJECTED"], "description": "Underlying outcome the custom status maps to."},
+                            },
+                            "required": ["label", "value"],
+                        },
+                        "description": "Custom approval statuses added on top of the built-in APPROVED/REJECTED (up to 50).",
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Step name (max 255)."},
+                                "type": {"type": "string", "enum": ["INITIATOR", "REVIEWER", "APPROVER"], "description": "INITIATOR (first, launches review), REVIEWER (intermediate), or APPROVER (final decision)."},
+                                "duration": {"type": "integer", "description": "Days allowed for the step (1–99). REVIEWER/APPROVER only."},
+                                "due_date_type": {"type": "string", "enum": ["CALENDAR_DAY", "WORKDAY"], "description": "How the due date is counted. Default CALENDAR_DAY. REVIEWER/APPROVER only."},
+                                "group_review": {
+                                    "type": "object",
+                                    "properties": {
+                                        "enabled": {"type": "boolean", "description": "Allow multiple reviewers on this step."},
+                                        "type": {"type": "string", "enum": ["ALL", "MINIMUM"], "description": "ALL reviewers must respond, or a MINIMUM number."},
+                                        "min": {"type": "integer", "description": "Minimum responders when type=MINIMUM (1–30)."},
+                                    },
+                                    "description": "Group-review rule. REVIEWER steps only.",
+                                },
+                                "reviewer_users": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by user name or email (resolved to Autodesk IDs via project members). Raw autodeskId also accepted."},
+                                "reviewer_roles": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by role name. Role IDs use a numeric space with no lookup API, so a name is resolved only if some existing workflow already uses that role; otherwise pass the raw numeric autodeskId (see get_workflow)."},
+                                "reviewer_companies": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by company name. Resolved only from a role/company already used in an existing workflow; otherwise pass the raw autodeskId."},
+                                "candidates": {"type": "object", "description": "Advanced: a pre-built candidates object ({users/roles/companies:[{autodeskId}]}). Used only if no reviewer_* keys are given."},
+                            },
+                            "required": ["name", "type"],
+                        },
+                        "description": "Ordered workflow steps. Steps run in the order given.",
+                    },
+                    "copy_files_options": {
+                        "type": "object",
+                        "properties": {
+                            "enabled": {"type": "boolean", "description": "Copy approved files to a target folder when the review completes."},
+                            "allowOverride": {"type": "boolean", "description": "Let the initiator change the target folder."},
+                            "condition": {"type": "string", "enum": ["ANY", "ALL"], "description": "Copy when ANY or ALL files are approved."},
+                            "folderUrn": {"type": "string", "description": "Target folder URN for approved copies."},
+                            "includeMarkups": {"type": "boolean", "description": "Include published markups on copied files."},
+                            "disableOverrideMarkupSetting": {"type": "boolean", "description": "Lock the markup setting during review setup."},
+                        },
+                        "description": "Post-review copy-approved-files action. Defaults to {enabled:false} when omitted.",
+                    },
+                    "attached_attributes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "description": "Custom attribute id to apply after completion."},
+                                "required": {"type": "boolean", "description": "Whether the approver must supply a value."},
+                            },
+                            "required": ["id"],
+                        },
+                        "description": "Custom attributes applied to approved files (Update Attributes action).",
+                    },
+                    "update_attributes_options": {
+                        "type": "object",
+                        "properties": {
+                            "enableAttachedAttributes": {"type": "boolean"},
+                            "updateSourceAndCopiedFiles": {"type": "boolean"},
+                            "allowApproverToUpdateRejectedFiles": {"type": "boolean"},
+                        },
+                        "description": "Controls how the attached_attributes are applied. Requires a copy action.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": ["name", "steps"],
+            },
+        ),
+        Tool(
+            name="bulk_create_workflows",
+            description=(
+                "Create many approval workflows in one project from a list of specs — "
+                "purpose-built for pushing an Excel template of workflows into ACC. Each "
+                "item has the same shape as create_workflow (minus the project). "
+                "Reviewer names/emails/roles/companies are resolved to Autodesk IDs once "
+                "up front and reused across all rows. Defaults to dry_run=true "
+                "('would_create'); a live run writes a timestamped audit CSV. A name "
+                "collision is reported per-row as 'already_exists' (409). Not compatible "
+                "with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "workflows": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Workflow name (unique within the project)."},
+                                "description": {"type": "string"},
+                                "notes": {"type": "string"},
+                                "initiator_edit_permissions": {"type": "array", "items": {"type": "string"}},
+                                "additional_approval_status_options": {"type": "array", "items": {"type": "object"}},
+                                "steps": {"type": "array", "items": {"type": "object"}, "description": "Same step shape as create_workflow (name, type, duration, due_date_type, group_review, reviewer_users/roles/companies)."},
+                                "copy_files_options": {"type": "object"},
+                                "attached_attributes": {"type": "array", "items": {"type": "object"}},
+                                "update_attributes_options": {"type": "object"},
+                            },
+                            "required": ["name", "steps"],
+                        },
+                        "description": "The workflows to create.",
+                    },
+                    "dry_run": {"type": "boolean", "description": "If true (default), preview ('would_create') without posting."},
+                    "continue_on_error": {"type": "boolean", "description": "If true (default), one failing row never aborts the batch."},
+                    "max_concurrency": {"type": "integer", "description": "Max workflow POSTs in parallel (default 8)."},
+                    "response_detail": {
+                        "type": "string",
+                        "enum": ["summary", "changes", "full"],
+                        "description": "Output verbosity. 'changes' (default) returns summary plus only the rows needing attention (errors + already_exists). 'full' echoes every row. 'summary' omits results but still surfaces a 'failures' array. Counts are accurate regardless.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": ["workflows"],
+            },
+        ),
     ]
 
 
@@ -3243,6 +3670,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 {
                     "name": u.get("name") or f"{u.get('firstName','')} {u.get('lastName','')}".strip(),
                     "email": u.get("email"),
+                    "autodesk_id": u.get("autodeskId"),
                     "role": u.get("role") or u.get("roleId"),
                     "status": u.get("status"),
                     "company": u.get("companyName"),
@@ -3459,6 +3887,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     members.append({
                         "email": u.get("email", ""),
                         "name": u.get("name", ""),
+                        "autodesk_id": u.get("autodeskId"),
                         "company": u.get("companyName", u.get("company_name", "")),
                         "roles": [r.get("name", "") for r in u.get("roles", []) if r.get("name")],
                     })
@@ -5381,6 +5810,122 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "status": "updated",
                 "issue": r.json(),
             }, indent=2))]
+
+        if name == "list_workflows":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
+            params: dict = {}
+            if arguments.get("status"):
+                params["filter[status]"] = arguments["status"]
+            if arguments.get("initiator") is not None:
+                params["filter[initiator]"] = str(arguments["initiator"]).lower()
+            if arguments.get("sort"):
+                params["sort"] = arguments["sort"]
+            workflows = await _get_all_issues(
+                client, WORKFLOWS_URL.format(pid=bare_id), wf_hdrs, params, page_limit=50,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(workflows),
+                "workflows": workflows,
+            }, indent=2))]
+
+        if name == "get_workflow":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
+            workflow_id = await _resolve_workflow_ref(client, wf_hdrs, bare_id, arguments)
+            r = await client.get(
+                f"{WORKFLOWS_URL.format(pid=bare_id)}/{workflow_id}", headers=wf_hdrs,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "workflow": r.json(),
+            }, indent=2))]
+
+        if name == "create_workflow":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION, "Content-Type": "application/json"}
+            directory = await _build_project_directory(client, token, bare_id)
+            body = _workflow_create_payload(arguments, directory)
+            r = await client.post(
+                WORKFLOWS_URL.format(pid=bare_id), headers=wf_hdrs, json=body,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "status": "created",
+                "workflow": r.json(),
+            }, indent=2))]
+
+        if name == "bulk_create_workflows":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION, "Content-Type": "application/json"}
+            specs = arguments.get("workflows") or []
+            dry_run = arguments.get("dry_run", True)
+            continue_on_error = arguments.get("continue_on_error", True)
+            max_concurrency = arguments.get("max_concurrency", 8)
+            url = WORKFLOWS_URL.format(pid=bare_id)
+            directory = await _build_project_directory(client, token, bare_id)
+
+            # Build payloads up front so a bad spec is reported without a POST.
+            prepared: list[dict] = []
+            for spec in specs:
+                wf_name = spec.get("name")
+                try:
+                    prepared.append({"name": wf_name, "payload": _workflow_create_payload(spec, directory)})
+                except ValueError as e:
+                    prepared.append({"name": wf_name, "error": str(e)})
+
+            if dry_run:
+                results = [
+                    {"name": p["name"], "action": "error", "message": p["error"]}
+                    if "error" in p else
+                    {"name": p["name"], "action": "would_create"}
+                    for p in prepared
+                ]
+            else:
+                async def _post_one(p: dict) -> dict:
+                    if "error" in p:
+                        return {"name": p["name"], "action": "error", "message": p["error"]}
+                    try:
+                        resp = await client.post(url, headers=wf_hdrs, json=p["payload"])
+                    except Exception as e:  # noqa: BLE001
+                        if not continue_on_error:
+                            raise
+                        return {"name": p["name"], "action": "error", "message": str(e)}
+                    if resp.status_code == 409:
+                        return {"name": p["name"], "action": "already_exists"}
+                    if not resp.is_success:
+                        return {"name": p["name"], "action": "error",
+                                "message": json.dumps(_error_body(resp))}
+                    created = resp.json()
+                    return {"name": p["name"], "action": "created", "workflow_id": created.get("id")}
+
+                results = await _gather_bounded(
+                    max_concurrency, [lambda p=p: _post_one(p) for p in prepared]
+                )
+
+            counts: dict = {}
+            for r in results:
+                counts[r["action"]] = counts.get(r["action"], 0) + 1
+            payload: dict = {
+                "project": resolved_name,
+                "dry_run": dry_run,
+                "total": len(results),
+                "summary": counts,
+            }
+            if not dry_run:
+                payload["audit_file"] = _write_audit_csv(results, "bulk_create_workflows")
+            _shape_bulk_response(
+                payload, results, arguments.get("response_detail"),
+                noteworthy=lambda r: r["action"] in ("error", "already_exists"),
+            )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
 

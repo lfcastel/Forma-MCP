@@ -34,6 +34,7 @@ ROLE_NAME_EDITOR = "Editor"
 
 USER_A_EMAIL = "alice@example.com"
 USER_A_ID = "user-id-alice"
+USER_A_AUTODESK_ID = "ADSKALICE001"   # opaque Autodesk ID for the Reviews candidate maps
 USER_B_EMAIL = "bob@example.com"
 USER_B_ID = "user-id-bob"
 
@@ -95,6 +96,7 @@ PROJECT_MEMBERS_RESPONSE = {
     "results": [
         {
             "id": USER_A_ID,
+            "autodeskId": USER_A_AUTODESK_ID,
             "email": USER_A_EMAIL,
             "name": "Alice Test",
             "roleId": ROLE_ID_VIEWER,
@@ -107,6 +109,12 @@ PROJECT_MEMBERS_RESPONSE = {
         }
     ]
 }
+
+# GET hq/v1/accounts/{account}/projects/{project}/companies (2-legged); used by
+# list_project_companies and the workflow candidate directory.
+PROJECT_COMPANIES_RESPONSE = [
+    {"id": COMPANY_ID, "name": COMPANY_NAME},
+]
 
 IMPORT_SUCCESS_RESPONSE = [
     {"email": USER_A_EMAIL, "success": True, "message": ""},
@@ -199,5 +207,46 @@ ISSUE_ATTR_MAPPINGS_RESPONSE = {
             "id": "mapping-id", "attributeDefinitionId": "attr-def-id",
             "mappedItemType": "issueSubtype", "mappedItemId": ISSUE_SUBTYPE_ID,
         },
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Reviews API (approval workflows) mock responses (top-level `pagination`)
+# ---------------------------------------------------------------------------
+
+WORKFLOW_ID = "workflow-id-1"
+
+# Reviews role/company IDs live in a numeric space distinct from project-role UUIDs;
+# the only source is the candidates on existing workflows, so the directory harvests
+# them from the list_workflows payload below.
+ROLE_EDITOR_AUTODESK_ID = "111222333"
+COMPANY_AUTODESK_ID = "444555666"
+
+WORKFLOWS_RESPONSE = {
+    "pagination": {"limit": 50, "offset": 0, "totalResults": 1},
+    "results": [
+        {
+            "id": WORKFLOW_ID, "name": "Design Review", "status": "ACTIVE",
+            "steps": [
+                {"id": "s0", "type": "INITIATOR", "candidates": {
+                    "roles": [{"name": ROLE_NAME_EDITOR, "autodeskId": ROLE_EDITOR_AUTODESK_ID}],
+                    "companies": [{"name": COMPANY_NAME, "autodeskId": COMPANY_AUTODESK_ID}],
+                }},
+            ],
+        },
+    ],
+}
+
+CREATED_WORKFLOW_RESPONSE = {
+    "id": "workflow-id-new", "name": "New Workflow", "status": "ACTIVE",
+    "steps": [{"id": "step-1", "type": "APPROVER"}],
+}
+
+SINGLE_WORKFLOW_RESPONSE = {
+    "id": WORKFLOW_ID, "name": "Design Review", "status": "ACTIVE",
+    "steps": [
+        {"id": "step-0", "type": "INITIATOR"},
+        {"id": "step-1", "type": "APPROVER",
+         "candidates": {"users": [{"autodeskId": USER_A_AUTODESK_ID, "name": "Alice Test"}]}},
     ],
 }
