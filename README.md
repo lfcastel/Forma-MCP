@@ -211,6 +211,24 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 
 > **Naming conventions in one pass — `include_naming_standard`.** The `folders/{f}/contents` payload already carries each subfolder's assigned naming standard, so `bulk_list_folder_contents` can surface it for free: pass `include_naming_standard: true` and every subfolder row gains a `naming_standard_ids` list (empty = none). Use this when you need both the listing **and** the conventions in a single sweep, instead of also calling `audit_folder_naming_standards` (which would re-fetch the same endpoint). Reach for `audit_folder_naming_standards` when you want a *recursive*, project-wide roll-up grouped by standard; reach for this flag when you're already listing folders and just want the convention tagged on.
 
+### Issues
+
+Read and create ACC **Issues** (the Issues module). All five are user-scoped (3-legged) and hit the `construction/issues/v1` API with a fixed `x-ads-region: EMEA` header. `create_issue` **posts immediately** (no `dry_run`). The API uses different names than the UI: a *category* is a **type** and a UI *type* is a **subtype** — `list_issue_types` returns both. Not compatible with BIM 360 projects; sheet-related (Build Sheets) issues are not returned.
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_issues` | List issues (pushpin + general) with common filters (status, search, assignee, dates, type/subtype, linked file URN, deleted); auto-paginates; `fields` slims each row | 3-legged |
+| `get_issue` | Get one issue by `issue_id` (UUID) or `display_id` (the friendly number) | 3-legged |
+| `create_issue` | Create an issue — requires `title`, `issue_subtype_id`, `status`; posts immediately | 3-legged (`data:write`) |
+| `update_issue` | Update an issue (edit fields, change status, reassign) by `issue_id`/`display_id`; posts only the fields you supply | 3-legged (`data:write`) |
+| `list_issue_types` | List issue categories + their types (subtypes) with 3-char codes — source of a valid `issue_subtype_id` and the key to decode type UUIDs | 3-legged |
+| `list_issue_attribute_definitions` | List project custom fields (id, title, dataType, dropdown options) | 3-legged |
+| `list_issue_attribute_mappings` | List which custom fields are assigned to which categories/types | 3-legged |
+
+> **Getting a valid `issue_subtype_id`.** Call `list_issue_types` first; each category carries a `subtypes` array whose `id` is what `create_issue` needs. Assignee, watcher, root-cause and location IDs are **not** discoverable through the Issues API — per Autodesk, extract them with the Data Connector.
+
+> **Addressing an issue.** `get_issue` and `update_issue` accept either the issue UUID (`issue_id`) or the user-facing number (`display_id`, e.g. 191), so you can say "mark issue 191 closed". Note the ACC Issues API (v1) has **no delete endpoint** — issues can only be deleted in the ACC UI (`deleted` is read-only via the API), so there is no `delete_issue` tool. `list_issues` can still surface UI-deleted issues via `deleted: true`.
+
 ---
 
 ## Tools & API endpoints
@@ -286,6 +304,16 @@ flowchart LR
         T32(audit_folder_naming_standards)
     end
 
+    subgraph ISSUES["Issues · 3-legged OAuth · x-ads-region: EMEA"]
+        T41(list_issues)
+        T42(create_issue)
+        T43(list_issue_types)
+        T44(list_issue_attribute_definitions)
+        T45(list_issue_attribute_mappings)
+        T46(get_issue)
+        T47(update_issue)
+    end
+
     E1["GET /project/v1/hubs"]
     E2["GET /project/v1/hubs/{hub}/projects"]
     E3["GET /project/v1/.../projects/{p}/topFolders"]
@@ -313,6 +341,13 @@ flowchart LR
     E25["PATCH /hq/v1/accounts/{a}/users/{u}"]
     E26["PATCH /hq/v1/accounts/{a}/companies/{c}"]
     E27["GET /construction/admin/v1/projects/{p}?fields=accountId,name,platform"]
+    E28["GET /construction/issues/v1/projects/{p}/issues"]
+    E29["POST /construction/issues/v1/projects/{p}/issues"]
+    E30["GET /construction/issues/v1/projects/{p}/issue-types"]
+    E31["GET /construction/issues/v1/projects/{p}/issue-attribute-definitions"]
+    E32["GET /construction/issues/v1/projects/{p}/issue-attribute-mappings"]
+    E33["GET /construction/issues/v1/projects/{p}/issues/{i}"]
+    E34["PATCH /construction/issues/v1/projects/{p}/issues/{i}"]
 
     T1 --> E1
     T2 --> E2
@@ -380,10 +415,18 @@ flowchart LR
     T32 --> E4
     T32 --> E21
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27 get
-    class E10,E11,E12,E14,E18,E19,E23,E24 post
-    class E15,E17,E20,E25,E26 patch
+    T41 --> E28
+    T42 --> E29
+    T43 --> E30
+    T44 --> E31
+    T45 --> E32
+    T46 --> E33
+    T47 --> E34
+
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33 get
+    class E10,E11,E12,E14,E18,E19,E23,E24,E29 post
+    class E15,E17,E20,E25,E26,E34 patch
     class E16 del
 ```
 
@@ -457,6 +500,18 @@ Audit the naming conventions under Project Files/Drawings in "Northgate Tower"
 Show me only the folders with no naming standard in "Northgate Tower"
 ```
 
+### Issues
+
+```
+List all open issues in "Northgate Tower"
+Show the issue categories and types in "Northgate Tower"
+Find issues assigned to <autodesk-id> that are due this month in "Central Station"
+What custom fields are defined for issues in "Riverside Bridge"?
+Create an issue in "Northgate Tower" titled "Cracked slab on L2" with status open using the "Defect" type
+Show me issue 191 in "Northgate Tower"
+Mark issue 191 in "Northgate Tower" as closed
+```
+
 ---
 
 ## Security & credentials
@@ -515,7 +570,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 39 tools
+├── aps_mcp.py                  # MCP server — 47 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt

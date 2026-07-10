@@ -133,3 +133,71 @@ COMPANY_IMPORT_SUCCESS_RESPONSE = {
     "success_items": [{"name": NEW_COMPANY_NAME}],
     "failure_items": [],
 }
+
+# ---------------------------------------------------------------------------
+# Issues API mock responses (top-level `pagination` envelope, not under `meta`)
+# ---------------------------------------------------------------------------
+
+ISSUE_TYPE_ID = "issue-type-id"
+ISSUE_SUBTYPE_ID = "issue-subtype-id"
+
+ISSUES_RESPONSE = {
+    "pagination": {"limit": 100, "offset": 0, "totalResults": 1},
+    "results": [
+        {
+            "id": "issue-id-1", "displayId": 1, "title": "Cracked slab",
+            "status": "open", "issueTypeId": ISSUE_TYPE_ID,
+            "issueSubtypeId": ISSUE_SUBTYPE_ID,
+        },
+    ],
+}
+
+# Single created issue (POST .../issues response body)
+CREATED_ISSUE_RESPONSE = {
+    "id": "issue-id-new", "displayId": 42, "title": "New issue",
+    "status": "open", "issueTypeId": ISSUE_TYPE_ID,
+    "issueSubtypeId": ISSUE_SUBTYPE_ID, "published": False,
+}
+
+# Single issue (GET/PATCH .../issues/{issueId} response body)
+SINGLE_ISSUE_RESPONSE = {
+    "id": "issue-id-1", "displayId": 1, "title": "Cracked slab",
+    "status": "open", "issueTypeId": ISSUE_TYPE_ID,
+    "issueSubtypeId": ISSUE_SUBTYPE_ID, "deleted": False,
+}
+
+ISSUE_TYPES_RESPONSE = {
+    "pagination": {"limit": 200, "offset": 0, "totalResults": 1},
+    "results": [
+        {
+            "id": ISSUE_TYPE_ID, "title": "Quality", "isActive": True,
+            "subtypes": [
+                {"id": ISSUE_SUBTYPE_ID, "issueTypeId": ISSUE_TYPE_ID,
+                 "title": "Defect", "code": "DEF", "isActive": True},
+            ],
+        },
+    ],
+}
+
+ISSUE_ATTR_DEFS_RESPONSE = {
+    "pagination": {"limit": 200, "offset": 0, "totalResults": 1},
+    "results": [
+        {
+            "id": "attr-def-id", "title": "Priority", "dataType": "list",
+            "metadata": {"list": {"options": [
+                {"id": "opt-high", "value": "High"},
+                {"id": "opt-low", "value": "Low"},
+            ]}},
+        },
+    ],
+}
+
+ISSUE_ATTR_MAPPINGS_RESPONSE = {
+    "pagination": {"limit": 200, "offset": 0, "totalResults": 1},
+    "results": [
+        {
+            "id": "mapping-id", "attributeDefinitionId": "attr-def-id",
+            "mappedItemType": "issueSubtype", "mappedItemId": ISSUE_SUBTYPE_ID,
+        },
+    ],
+}

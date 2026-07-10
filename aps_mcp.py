@@ -24,6 +24,11 @@ APS_BASE = "https://developer.api.autodesk.com"
 REDIRECT_URI = "http://localhost:8080/oauth/callback"
 SCOPES = "data:read data:write data:create account:read account:write"
 
+# The ACC Issues API routes per-region; all our Issues traffic is EMEA. Sent as
+# the `x-ads-region` header on every Issues call (avoids the auto-route latency).
+# One-line change here if a US hub is ever added.
+ISSUES_REGION = "EMEA"
+
 # tokens.json sits next to this script
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 
@@ -389,6 +394,40 @@ async def get_all_pages(
         pagination = meta.get("pagination", {})
         total = pagination.get("totalResults", len(items))
         if len(items) >= total or not data:
+            break
+        offset = len(items)
+    return items
+
+
+async def _get_all_issues(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    params: dict | None = None,
+    *,
+    page_limit: int = 100,
+) -> list:
+    """Fetch ALL rows from an ACC Issues API list endpoint (issues, issue-types,
+    attribute-definitions/mappings).
+
+    Same limit/offset scheme as `get_all_pages`, but the Issues API places the
+    `pagination` object at the **top level** of the body (not under `meta`), so
+    `get_all_pages` can't read `totalResults` and would stop after the first
+    page. This loop reads it from the right place. Issues cap each page at 100;
+    the type/attribute endpoints allow up to 200 (pass `page_limit`)."""
+    items: list = []
+    params = dict(params or {})
+    params.setdefault("limit", page_limit)
+    offset = 0
+    while True:
+        params["offset"] = offset
+        res = await _request_with_retry(client, "get", url, headers=headers, params=params)
+        res.raise_for_status()
+        body = res.json()
+        page = body.get("results") or []
+        items.extend(page)
+        total = (body.get("pagination") or {}).get("totalResults", len(items))
+        if len(items) >= total or not page:
             break
         offset = len(items)
     return items
@@ -824,6 +863,39 @@ async def _resolve_project_arg(
         allow_multiple=False,
     )
     return ref["hub_id"], ref["project_id"], ref["project_name"]
+
+
+async def _resolve_issue_project(
+    client: httpx.AsyncClient, token: str, arguments: dict
+) -> tuple[str, str]:
+    """Resolve a project for the Issues API: same resolution as every other tool,
+    but returns the **bare** project id (no 'b.' prefix) that the Issues endpoints
+    require, plus the resolved display name."""
+    _, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+    return _to_bare_id(project_id), resolved_name
+
+
+async def _resolve_issue_ref(
+    client: httpx.AsyncClient, issue_hdrs: dict, project_id: str, arguments: dict
+) -> str:
+    """Return an issue's UUID from either ``issue_id`` (a UUID, preferred) or
+    ``display_id`` (the friendly issue number, e.g. 191). A display id is resolved
+    with one cheap list call filtered on ``filter[displayId]``. Raises ValueError
+    if neither is given or the display id matches nothing."""
+    issue_id = arguments.get("issue_id")
+    if issue_id:
+        return issue_id
+    display_id = arguments.get("display_id")
+    if display_id is None:
+        raise ValueError("Provide 'issue_id' (UUID) or 'display_id' (the issue number).")
+    url = f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issues"
+    rows = await _get_all_issues(
+        client, url, issue_hdrs,
+        {"filter[displayId]": display_id, "fields": "id,displayId"}, page_limit=2,
+    )
+    if not rows:
+        raise ValueError(f"No issue with displayId {display_id} in this project.")
+    return rows[0]["id"]
 
 
 async def _resolve_folder_with_hub(
@@ -2465,6 +2537,236 @@ async def list_tools() -> list[Tool]:
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
                 "required": ["items"],
+            },
+        ),
+        Tool(
+            name="list_issues",
+            description=(
+                "List issues in an ACC project (Issues module). Returns file-related "
+                "(pushpin) and general issues with their comments/attachments metadata; "
+                "sheet-related issues from the Forma Build Sheets tool are not returned. "
+                "Auto-paginates all matches. Issue objects are large — narrow with the "
+                "filters below and/or pass `fields` to slim each row. Type/subtype come "
+                "back as UUIDs; use list_issue_types to decode them. Not compatible with "
+                "BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "status": {"type": "string", "description": "Filter by status (comma-separate multiple). Values: draft, open, pending, in_progress, completed, in_review, not_approved, in_dispute, closed."},
+                    "search": {"type": "string", "description": "Free-text search over issue title and display id."},
+                    "display_id": {"type": "string", "description": "Filter by the user-friendly numeric display id (comma-separate multiple)."},
+                    "assigned_to": {"type": "string", "description": "Filter by current assignee Autodesk ID (comma-separate multiple)."},
+                    "created_by": {"type": "string", "description": "Filter by the Autodesk ID of the issue creator (comma-separate multiple)."},
+                    "due_date": {"type": "string", "description": "Filter by due date. YYYY-MM-DD, a range 'YYYY-MM-DD..YYYY-MM-DD', or an open-ended range."},
+                    "issue_type_id": {"type": "string", "description": "Filter by issue type (category) UUID (comma-separate multiple)."},
+                    "issue_subtype_id": {"type": "string", "description": "Filter by issue subtype (type) UUID (comma-separate multiple)."},
+                    "linked_document_urn": {"type": "string", "description": "Retrieve pushpin issues linked to the given file item IDs (3D model or PDF lineage URNs; comma-separate multiple)."},
+                    "deleted": {"type": "boolean", "description": "If true, return only deleted issues; if false (default on the API), only undeleted. Requires elevated permissions to see others' deleted issues."},
+                    "sort_by": {"type": "string", "description": "Sort fields, comma-separated; prefix a field with '-' for descending (e.g. 'status,-displayId')."},
+                    "fields": {"type": "string", "description": "Comma-separated fields to return per issue (slims the payload). id, title, status, issueTypeId are always included."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="create_issue",
+            description=(
+                "Create an issue in an ACC project. Posts immediately (no dry_run). "
+                "`issue_subtype_id` and `status` are required — get a valid "
+                "`issue_subtype_id` from list_issue_types (the API's 'subtype' = the "
+                "product's 'Type'). Assignee/watcher/root-cause/location IDs are NOT "
+                "discoverable via this API; per Autodesk, extract them with the Data "
+                "Connector. Custom fields come from list_issue_attribute_definitions. "
+                "Not compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "title": {"type": "string", "description": "Issue title (max 100 chars)."},
+                    "issue_subtype_id": {"type": "string", "description": "UUID of the issue subtype (the product's 'Type') — from list_issue_types."},
+                    "status": {"type": "string", "description": "Initial status. Values: draft, open, pending, in_progress, completed, in_review, not_approved, in_dispute, closed."},
+                    "description": {"type": "string", "description": "Issue description (max 1000 chars)."},
+                    "assigned_to": {"type": "string", "description": "Autodesk ID of the assignee (member/company/role). Requires assigned_to_type."},
+                    "assigned_to_type": {"type": "string", "description": "Assignee type: user, company, or role. Requires assigned_to."},
+                    "due_date": {"type": "string", "description": "Due date, ISO8601 (YYYY-MM-DD)."},
+                    "start_date": {"type": "string", "description": "Start date, ISO8601 (YYYY-MM-DD)."},
+                    "location_id": {"type": "string", "description": "LBS location UUID."},
+                    "location_details": {"type": "string", "description": "Free-text location (max 250 chars)."},
+                    "root_cause_id": {"type": "string", "description": "Root-cause type UUID."},
+                    "published": {"type": "boolean", "description": "Publish the issue (default false = unpublished draft)."},
+                    "watchers": {"type": "array", "items": {"type": "string"}, "description": "Autodesk IDs of members to add as watchers."},
+                    "custom_attributes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "attributeDefinitionId": {"type": "string", "description": "Custom-attribute UUID (from list_issue_attribute_definitions)."},
+                                "value": {"description": "Value: string, number, or null."},
+                            },
+                            "required": ["attributeDefinitionId", "value"],
+                        },
+                        "description": "Custom field values to set on the issue.",
+                    },
+                    "gps_coordinates": {
+                        "type": "object",
+                        "properties": {
+                            "latitude": {"type": "number"},
+                            "longitude": {"type": "number"},
+                        },
+                        "description": "Optional GPS location of the issue.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": ["title", "issue_subtype_id", "status"],
+            },
+        ),
+        Tool(
+            name="list_issue_types",
+            description=(
+                "List an ACC project's issue categories (API 'type') and, by default, "
+                "their types (API 'subtype') with the 3-char pushpin code. Use this to "
+                "find a valid issue_subtype_id for create_issue and to decode the "
+                "type/subtype UUIDs returned by list_issues. Does not return deleted "
+                "items. Not compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "include_subtypes": {"type": "boolean", "description": "Include each category's types (subtypes). Default true."},
+                    "is_active": {"type": "boolean", "description": "If set, filter to active (true) or inactive (false) categories only. Default: both."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_issue_attribute_definitions",
+            description=(
+                "List an ACC project's issue custom fields (custom attributes): id, "
+                "title, description, dataType (list/text/paragraph/numeric), and — for "
+                "list-type fields — the dropdown options with their ids. Use to "
+                "interpret and populate the customAttributes on issues. Not compatible "
+                "with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "data_type": {"type": "string", "description": "Filter by data type (comma-separate multiple). Values: list, text, paragraph, numeric."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="list_issue_attribute_mappings",
+            description=(
+                "List which issue custom fields are assigned to which issue categories "
+                "(mappedItemType 'issueType') and types ('issueSubtype'). By default "
+                "returns only directly-assigned mappings, not inherited ones. Pair with "
+                "list_issue_attribute_definitions to know each field's shape. Not "
+                "compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "attribute_definition_id": {"type": "string", "description": "Filter by custom-attribute definition UUID (comma-separate multiple)."},
+                    "mapped_item_id": {"type": "string", "description": "Filter by mapped item UUID — a project, type, or subtype (comma-separate multiple)."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_issue",
+            description=(
+                "Get a single issue by its UUID (`issue_id`) or its friendly number "
+                "(`display_id`, e.g. 191). Returns the full issue object. Not "
+                "compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "issue_id": {"type": "string", "description": "The issue UUID (preferred). Provide this or display_id."},
+                    "display_id": {"type": "integer", "description": "The friendly issue number (e.g. 191). Resolved to the UUID via one lookup. Provide this or issue_id."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="update_issue",
+            description=(
+                "Update an existing issue (edit fields, change status, reassign). "
+                "Identify it by `issue_id` (UUID) or `display_id`. Posts immediately. "
+                "Only the fields you supply are changed. Check an issue's "
+                "permittedStatuses/permittedAttributes (via get_issue) if a change is "
+                "rejected. Updating a deleted issue is not allowed. Not compatible with "
+                "BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "issue_id": {"type": "string", "description": "The issue UUID (preferred). Provide this or display_id."},
+                    "display_id": {"type": "integer", "description": "The friendly issue number (e.g. 191). Provide this or issue_id."},
+                    "title": {"type": "string", "description": "New title (max 100 chars)."},
+                    "description": {"type": "string", "description": "New description (max 1000 chars)."},
+                    "issue_subtype_id": {"type": "string", "description": "New issue subtype (the product's 'Type') UUID — from list_issue_types."},
+                    "status": {"type": "string", "description": "New status. Values: draft, open, pending, in_progress, completed, in_review, not_approved, in_dispute, closed."},
+                    "assigned_to": {"type": "string", "description": "Autodesk ID of the assignee (member/company/role). Requires assigned_to_type."},
+                    "assigned_to_type": {"type": "string", "description": "Assignee type: user, company, or role. Requires assigned_to."},
+                    "due_date": {"type": "string", "description": "Due date, ISO8601 (YYYY-MM-DD)."},
+                    "start_date": {"type": "string", "description": "Start date, ISO8601 (YYYY-MM-DD)."},
+                    "location_id": {"type": "string", "description": "LBS location UUID."},
+                    "location_details": {"type": "string", "description": "Free-text location (max 250 chars)."},
+                    "root_cause_id": {"type": "string", "description": "Root-cause type UUID."},
+                    "published": {"type": "boolean", "description": "Publish (true) or unpublish (false) the issue."},
+                    "watchers": {"type": "array", "items": {"type": "string"}, "description": "Autodesk IDs of members to set as watchers."},
+                    "custom_attributes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "attributeDefinitionId": {"type": "string", "description": "Custom-attribute UUID (from list_issue_attribute_definitions)."},
+                                "value": {"description": "Value: string, number, or null."},
+                            },
+                            "required": ["attributeDefinitionId", "value"],
+                        },
+                        "description": "Custom field values to set on the issue.",
+                    },
+                    "gps_coordinates": {
+                        "type": "object",
+                        "properties": {
+                            "latitude": {"type": "number"},
+                            "longitude": {"type": "number"},
+                        },
+                        "description": "GPS location of the issue.",
+                    },
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
             },
         ),
     ]
@@ -4894,6 +5196,191 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 noteworthy=lambda r: r["action"] in ("error", "not_found"),
             )
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "list_issues":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION}
+            params = {}
+            filter_map = {
+                "status": "filter[status]",
+                "search": "filter[search]",
+                "display_id": "filter[displayId]",
+                "assigned_to": "filter[assignedTo]",
+                "created_by": "filter[createdBy]",
+                "due_date": "filter[dueDate]",
+                "issue_type_id": "filter[issueTypeId]",
+                "issue_subtype_id": "filter[issueSubtypeId]",
+                "linked_document_urn": "filter[linkedDocumentUrn]",
+                "sort_by": "sortBy",
+                "fields": "fields",
+            }
+            for arg_key, q_key in filter_map.items():
+                val = arguments.get(arg_key)
+                if val is not None and val != "":
+                    params[q_key] = val
+            if arguments.get("deleted") is not None:
+                params["filter[deleted]"] = str(arguments["deleted"]).lower()
+            issues = await _get_all_issues(
+                client,
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issues",
+                issue_hdrs, params, page_limit=100,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(issues),
+                "issues": issues,
+            }, indent=2))]
+
+        if name == "create_issue":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION, "Content-Type": "application/json"}
+            body = {
+                "title": arguments["title"],
+                "issueSubtypeId": arguments["issue_subtype_id"],
+                "status": arguments["status"],
+            }
+            body_map = {
+                "description": "description",
+                "assigned_to": "assignedTo",
+                "assigned_to_type": "assignedToType",
+                "due_date": "dueDate",
+                "start_date": "startDate",
+                "location_id": "locationId",
+                "location_details": "locationDetails",
+                "root_cause_id": "rootCauseId",
+                "published": "published",
+                "watchers": "watchers",
+                "custom_attributes": "customAttributes",
+                "gps_coordinates": "gpsCoordinates",
+            }
+            for arg_key, body_key in body_map.items():
+                val = arguments.get(arg_key)
+                if val is not None:
+                    body[body_key] = val
+            r = await client.post(
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issues",
+                headers=issue_hdrs, json=body,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "status": "created",
+                "issue": r.json(),
+            }, indent=2))]
+
+        if name == "list_issue_types":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION}
+            params = {}
+            if arguments.get("include_subtypes", True):
+                params["include"] = "subtypes"
+            if arguments.get("is_active") is not None:
+                params["filter[isActive]"] = str(arguments["is_active"]).lower()
+            types = await _get_all_issues(
+                client,
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issue-types",
+                issue_hdrs, params, page_limit=200,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(types),
+                "types": types,
+            }, indent=2))]
+
+        if name == "list_issue_attribute_definitions":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION}
+            params = {}
+            if arguments.get("data_type"):
+                params["filter[dataType]"] = arguments["data_type"]
+            definitions = await _get_all_issues(
+                client,
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issue-attribute-definitions",
+                issue_hdrs, params, page_limit=200,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(definitions),
+                "definitions": definitions,
+            }, indent=2))]
+
+        if name == "list_issue_attribute_mappings":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION}
+            params = {}
+            if arguments.get("attribute_definition_id"):
+                params["filter[attributeDefinitionId]"] = arguments["attribute_definition_id"]
+            if arguments.get("mapped_item_id"):
+                params["filter[mappedItemId]"] = arguments["mapped_item_id"]
+            mappings = await _get_all_issues(
+                client,
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issue-attribute-mappings",
+                issue_hdrs, params, page_limit=200,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(mappings),
+                "mappings": mappings,
+            }, indent=2))]
+
+        if name == "get_issue":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION}
+            issue_id = await _resolve_issue_ref(client, issue_hdrs, project_id, arguments)
+            r = await client.get(
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issues/{issue_id}",
+                headers=issue_hdrs,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "issue": r.json(),
+            }, indent=2))]
+
+        if name == "update_issue":
+            project_id, resolved_name = await _resolve_issue_project(client, token, arguments)
+            issue_hdrs = {**hdrs, "x-ads-region": ISSUES_REGION, "Content-Type": "application/json"}
+            issue_id = await _resolve_issue_ref(client, issue_hdrs, project_id, arguments)
+            body = {}
+            body_map = {
+                "title": "title",
+                "description": "description",
+                "issue_subtype_id": "issueSubtypeId",
+                "status": "status",
+                "assigned_to": "assignedTo",
+                "assigned_to_type": "assignedToType",
+                "due_date": "dueDate",
+                "start_date": "startDate",
+                "location_id": "locationId",
+                "location_details": "locationDetails",
+                "root_cause_id": "rootCauseId",
+                "published": "published",
+                "watchers": "watchers",
+                "custom_attributes": "customAttributes",
+                "gps_coordinates": "gpsCoordinates",
+            }
+            for arg_key, body_key in body_map.items():
+                val = arguments.get(arg_key)
+                if val is not None:
+                    body[body_key] = val
+            if not body:
+                raise ValueError("Nothing to update — supply at least one field to change.")
+            r = await client.patch(
+                f"{APS_BASE}/construction/issues/v1/projects/{project_id}/issues/{issue_id}",
+                headers=issue_hdrs, json=body,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "status": "updated",
+                "issue": r.json(),
+            }, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
 
