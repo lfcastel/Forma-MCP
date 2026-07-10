@@ -109,6 +109,8 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 > **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "My Company - EU Hub"`. Without it, the first hub returned for the region is used.
 >
 > **Paste a project ID or ACC URL instead.** Every single-project tool also accepts an optional `project` parameter — a project **name**, a **project ID** (`b.xxxx` or bare UUID), or a **full ACC URL**. When it contains an ID/URL the tool pins the exact owning hub in one Admin-API call (no region guessing, no wrong-hub risk), so you never need `hub_name`. The old `project_name` parameter keeps working as a name-only alias. Use the standalone `resolve_project` tool to turn any of these into `{project_id, hub_id, hub_name, region, platform}` up front.
+>
+> **Bulk-user tools (`project_names` arrays).** `bulk_assign_users`, `update_user_roles`, `bulk_assign_company_users`, and `remove_users_from_projects` resolve every entry the same way — each name, project ID, or ACC URL is matched across **all** hubs, so a project in a non-default EMEA hub resolves without `hub_name`. A genuine same-name collision across hubs raises a clear ambiguity error (pass an ID/URL or `hub_name` to disambiguate).
 
 ### Navigation & file exploration
 
@@ -152,8 +154,8 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 | Tool | What it does | Auth |
 |------|-------------|------|
-| `create_role_data_export` | Trigger a Data Connector export for role/user data | 3-legged |
-| `get_data_connector_requests` | List and download completed Data Connector exports | 3-legged |
+| `create_role_data_export` | Trigger a Data Connector `admin` export to resolve the full project-roles catalog (id ↔ name, **empty roles included**) — for assigning users to an unused role or labelling `export_permission_matrix` | 3-legged |
+| `get_data_connector_requests` | Poll & download a completed Data Connector export; returns the `role_id → name` map | 3-legged |
 
 ### Bulk user management
 
@@ -161,11 +163,13 @@ All five bulk tools default to **`dry_run: true`** — Claude always shows a pre
 
 | Tool | What it does | Auth |
 |------|-------------|------|
-| `bulk_assign_users` | Add a list of users to one or more projects with specified roles | 3-legged + `account:write` |
-| `update_user_roles` | Update the role of existing project members | 3-legged + `account:write` |
+| `bulk_assign_users` | Add a list of users to one or more projects with specified role(s) | 3-legged + `account:write` |
+| `update_user_roles` | Update the role(s) of existing project members | 3-legged + `account:write` |
 | `remove_users_from_projects` | Remove users from one or more projects | 3-legged + `account:write` |
-| `clone_user_access` | Copy one user's full project access to another user | 3-legged + `account:write` |
+| `clone_user_access` | Copy one user's full project access (all roles) to another user | 3-legged + `account:write` |
 | `bulk_assign_company_users` | Add all members of an ACC company to a project | 3-legged + `account:write` |
+
+> **Multiple roles per user.** `bulk_assign_users`, `update_user_roles`, and `bulk_assign_company_users` accept `default_role` (and each `role_overrides` value) as either a single role or a **list** — e.g. `default_role: ["BIM Coordinator", "EXT Architect"]` — assigning several roles to a user at once (the API's `roleIds` is an array). Each entry is a role **name** or a raw role **ID**. `clone_user_access` copies **all** of the reference user's roles per project.
 
 ### Hub-level directory & onboarding
 
@@ -590,6 +594,7 @@ Read workflows.xlsx and push every row into "Northgate Tower" (preview first, th
 - **No hard delete for hub users or companies** — the HQ API only supports soft-offboarding, so `deactivate_hub_users` / `deactivate_hub_companies` set `status: inactive` rather than removing the record. Deactivated entries remain visible (as inactive) in the account directory.
 - **Hub onboarding can't grant account-admin** — `bulk_add_hub_users` sets each user's company and (optional) default role, but the underlying `users/import` endpoint cannot elevate someone to **account administrator**; do that in the ACC Account Admin UI.
 - **Issues can't be deleted via the API** — the ACC Issues API (v1) exposes no delete route: `deleted` is read-only on the update endpoint (a `PATCH {"deleted": true}` returns 400) and a raw HTTP DELETE is rejected (403). There is therefore no `delete_issue` tool — issues can only be deleted in the ACC UI. `list_issues` can still surface UI-deleted issues via `deleted: true`.
+- **Empty project roles are invisible; role assignment isn't pre-checked** — ACC exposes no project-roles catalog endpoint, so `list_project_roles` (and role-name resolution in the bulk-user tools) is derived from the roles *current members* hold — a role assigned to nobody yet doesn't appear. Because of this the bulk-user tools do **not** pre-reject a role: a value that resolves to a member-held role is used as-is, and any other value is passed through to the ACC API as a raw **role ID** for it to validate on import (a bogus value fails per-user at the API). To assign the first person to an **empty/newly-created** role, pass that role's **ID** rather than its name. The reliable way to discover the ID of a role nobody holds yet is a **Data Connector `admin` export**, which contains the *full* project-roles catalog (not just member-held roles): call `create_role_data_export` for the project, then `get_data_connector_requests` with the returned `request_id` — it polls the job and returns a `{role_id: role_name}` map including empty roles. (Data Connector is rate-limited to 24 jobs/24h per hub, so grab every `role_id` you need from one export and reuse them.) Alternatively, an ID can come from `list_project_roles` on a project where the role *does* have a member, or from `get_workflow` candidates.
 
 ---
 
