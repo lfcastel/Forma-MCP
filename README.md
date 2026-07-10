@@ -231,6 +231,23 @@ Read and create ACC **Issues** (the Issues module). All five are user-scoped (3-
 
 ---
 
+### Approval workflows
+
+Read and create ACC **approval workflows** (the Reviews module — the reusable step/reviewer/duration definitions that drive file reviews). All are user-scoped (3-legged) and hit the `construction/reviews/v1` API with a fixed `x-ads-region: EMEA` header. Built for provisioning workflows in bulk — e.g. reading an Excel template of workflows and pushing them into ACC. Not compatible with BIM 360 projects.
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_workflows` | List approval workflows; filter by `status` (ACTIVE default / INACTIVE) or `initiator`; `sort`; auto-paginates | 3-legged |
+| `get_workflow` | Get one workflow by `workflow_id` (UUID) or `name` | 3-legged |
+| `create_workflow` | Create a workflow — `name` + `steps` required; posts immediately (no `dry_run`) | 3-legged (`data:write`) |
+| `bulk_create_workflows` | Create many workflows from a list of specs (the Excel batch); `dry_run` default, audit CSV, bounded concurrency, per-row results | 3-legged (`data:write`) |
+
+> **Reviewers are given by name, resolved to Autodesk IDs.** The Reviews API identifies every reviewer/approver by `autodeskId`. `create_workflow` / `bulk_create_workflows` accept friendly `reviewer_users` (names or emails), `reviewer_roles` (role names) and `reviewer_companies` (company names) per step; raw `autodeskId` values also pass through, and an unresolved reference fails the row loudly. **Users** resolve from project members — `list_project_members` / `list_project_roles` now include an `autodesk_id` field so you can see them. **Roles and companies** are trickier: they use a separate numeric ID space that Autodesk exposes *no* lookup API for, so the tools harvest role/company name→ID from the candidates on the project's **existing** workflows. A role or company never used in any workflow yet can't be resolved by name — read one that does with `get_workflow` and pass the raw numeric `autodeskId`.
+
+> **Single vs bulk.** `create_workflow` posts one workflow immediately (like `create_issue`). `bulk_create_workflows` is the previewable batch: it resolves the reviewer directory once, defaults to `dry_run=true` (`would_create`), maps a name collision to `already_exists` (409) per row, and writes a timestamped audit CSV on a live run. Scope is list + get + create — the Reviews API exposes no workflow update/delete route.
+
+---
+
 ## Tools & API endpoints
 
 All tools grouped by function, with the APS API endpoints each one calls.
@@ -314,6 +331,13 @@ flowchart LR
         T47(update_issue)
     end
 
+    subgraph WORKFLOWS["Approval workflows · Reviews · 3-legged OAuth · x-ads-region: EMEA"]
+        T48(list_workflows)
+        T49(get_workflow)
+        T50(create_workflow)
+        T51(bulk_create_workflows)
+    end
+
     E1["GET /project/v1/hubs"]
     E2["GET /project/v1/hubs/{hub}/projects"]
     E3["GET /project/v1/.../projects/{p}/topFolders"]
@@ -348,6 +372,9 @@ flowchart LR
     E32["GET /construction/issues/v1/projects/{p}/issue-attribute-mappings"]
     E33["GET /construction/issues/v1/projects/{p}/issues/{i}"]
     E34["PATCH /construction/issues/v1/projects/{p}/issues/{i}"]
+    E35["GET /construction/reviews/v1/projects/{p}/workflows"]
+    E36["GET /construction/reviews/v1/projects/{p}/workflows/{w}"]
+    E37["POST /construction/reviews/v1/projects/{p}/workflows"]
 
     T1 --> E1
     T2 --> E2
@@ -423,9 +450,19 @@ flowchart LR
     T46 --> E33
     T47 --> E34
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33 get
-    class E10,E11,E12,E14,E18,E19,E23,E24,E29 post
+    T48 --> E35
+    T49 --> E35
+    T49 --> E36
+    T50 --> E37
+    T50 --> E5
+    T50 --> E8
+    T51 --> E37
+    T51 --> E5
+    T51 --> E8
+
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36 get
+    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37 post
     class E15,E17,E20,E25,E26,E34 patch
     class E16 del
 ```
@@ -512,6 +549,15 @@ Show me issue 191 in "Northgate Tower"
 Mark issue 191 in "Northgate Tower" as closed
 ```
 
+### Approval workflows
+
+```
+List the approval workflows in "Northgate Tower"
+Show the "Design Review" workflow in "Northgate Tower"
+Create an approval workflow "IFC Sign-off" in "Northgate Tower" with an approver step where Alice and the "BIM Manager" role review, 5 workday duration
+Read workflows.xlsx and push every row into "Northgate Tower" (preview first, then create)
+```
+
 ---
 
 ## Security & credentials
@@ -543,6 +589,7 @@ Mark issue 191 in "Northgate Tower" as closed
 - **Cloud-workshared Revit models can't be moved by API** — C4R models (`C4RModel`) return 403 on a move and cannot be relocated programmatically. During a `bulk_delete_folders` reorg they are what keeps a folder from being deleted: it is reported as `skipped_has_files` so a human can move them in the Revit/ACC UI first.
 - **No hard delete for hub users or companies** — the HQ API only supports soft-offboarding, so `deactivate_hub_users` / `deactivate_hub_companies` set `status: inactive` rather than removing the record. Deactivated entries remain visible (as inactive) in the account directory.
 - **Hub onboarding can't grant account-admin** — `bulk_add_hub_users` sets each user's company and (optional) default role, but the underlying `users/import` endpoint cannot elevate someone to **account administrator**; do that in the ACC Account Admin UI.
+- **Issues can't be deleted via the API** — the ACC Issues API (v1) exposes no delete route: `deleted` is read-only on the update endpoint (a `PATCH {"deleted": true}` returns 400) and a raw HTTP DELETE is rejected (403). There is therefore no `delete_issue` tool — issues can only be deleted in the ACC UI. `list_issues` can still surface UI-deleted issues via `deleted: true`.
 
 ---
 
@@ -570,7 +617,7 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 47 tools
+├── aps_mcp.py                  # MCP server — 51 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI
 ├── requirements.txt
