@@ -1108,6 +1108,10 @@ def _workflow_create_payload(spec: dict, directory: dict) -> dict:
             s["duration"] = step["duration"]
         if step.get("due_date_type") is not None:
             s["dueDateType"] = step["due_date_type"]
+        elif step.get("type") in ("REVIEWER", "APPROVER"):
+            # The API rejects a REVIEWER/APPROVER step with no dueDateType (400),
+            # even though CALENDAR_DAY is its documented default — supply it.
+            s["dueDateType"] = "CALENDAR_DAY"
         if step.get("group_review") is not None:
             s["groupReview"] = step["group_review"]
         candidates = _resolve_candidates(step, directory)
@@ -1115,6 +1119,18 @@ def _workflow_create_payload(spec: dict, directory: dict) -> dict:
             candidates = step["candidates"]  # allow a pre-built passthrough candidates dict
         if candidates:
             s["candidates"] = candidates
+        # A MINIMUM group review whose `min` exceeds the step's candidate count is a
+        # guaranteed 400 ("groupReview.min is greater than the total number of
+        # candidates") — catch it here with a clear message instead of a raw API error.
+        gr = s.get("groupReview") or {}
+        if gr.get("enabled") and gr.get("type") == "MINIMUM" and gr.get("min"):
+            cand_count = sum(len(v) for v in (candidates or {}).values() if isinstance(v, list))
+            if gr["min"] > cand_count:
+                raise ValueError(
+                    f"Step '{s.get('name')}': groupReview min ({gr['min']}) exceeds the "
+                    f"number of reviewers on the step ({cand_count}). Add more reviewers "
+                    f"or lower min."
+                )
         steps_out.append(s)
     body["steps"] = steps_out
 
@@ -3088,7 +3104,7 @@ async def list_tools() -> list[Tool]:
                                 "name": {"type": "string", "description": "Step name (max 255)."},
                                 "type": {"type": "string", "enum": ["INITIATOR", "REVIEWER", "APPROVER"], "description": "INITIATOR (first, launches review), REVIEWER (intermediate), or APPROVER (final decision)."},
                                 "duration": {"type": "integer", "description": "Days allowed for the step (1–99). REVIEWER/APPROVER only."},
-                                "due_date_type": {"type": "string", "enum": ["CALENDAR_DAY", "WORKDAY"], "description": "How the due date is counted. Default CALENDAR_DAY. REVIEWER/APPROVER only."},
+                                "due_date_type": {"type": "string", "enum": ["CALENDAR_DAY", "WORKDAY"], "description": "How the due date is counted (REVIEWER/APPROVER only). Defaults to CALENDAR_DAY — the API requires this field on those steps, so the tool fills it in when omitted."},
                                 "group_review": {
                                     "type": "object",
                                     "properties": {

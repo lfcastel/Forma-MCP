@@ -212,6 +212,32 @@ async def test_create_workflow_resolves_reviewers_and_posts_camelcase():
 
 
 @respx.mock
+async def test_create_workflow_defaults_due_date_type_on_reviewer_steps():
+    """The API requires dueDateType on REVIEWER/APPROVER steps; the tool fills the
+    documented CALENDAR_DAY default when the caller omits it (but never on INITIATOR)."""
+    _mock_resolve(respx)
+    _mock_directory(respx)
+    post = respx.post(WF_BASE).mock(
+        return_value=httpx.Response(201, json=CREATED_WORKFLOW_RESPONSE)
+    )
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+        await aps_mcp.call_tool("create_workflow", {
+            "project_name": PROJECT_NAME, "name": "Defaults",
+            "steps": [
+                {"name": "Kickoff", "type": "INITIATOR"},
+                {"name": "Approve", "type": "APPROVER", "duration": 5,
+                 "reviewer_users": [USER_A_EMAIL]},
+            ],
+        })
+
+    body = json.loads(post.calls[0].request.content)
+    assert "dueDateType" not in body["steps"][0]          # INITIATOR untouched
+    assert body["steps"][1]["dueDateType"] == "CALENDAR_DAY"  # APPROVER defaulted
+
+
+@respx.mock
 async def test_create_workflow_unresolved_reviewer_errors():
     _mock_resolve(respx)
     _mock_directory(respx)
@@ -225,6 +251,27 @@ async def test_create_workflow_unresolved_reviewer_errors():
                 "name": "Bad Reviewers",
                 "steps": [{"name": "Approve", "type": "APPROVER",
                            "reviewer_users": ["Ghost Person"]}],
+            })
+
+    assert not post.called
+
+
+@respx.mock
+async def test_create_workflow_group_review_min_exceeds_candidates_errors():
+    """A MINIMUM group review with min > resolvable reviewers is caught before the
+    POST (would otherwise be a raw 400 from the API)."""
+    _mock_resolve(respx)
+    _mock_directory(respx)
+    post = respx.post(WF_BASE).mock(return_value=httpx.Response(201, json=CREATED_WORKFLOW_RESPONSE))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+        with pytest.raises(ValueError, match="groupReview min"):
+            await aps_mcp.call_tool("create_workflow", {
+                "project_name": PROJECT_NAME, "name": "Too High Min",
+                "steps": [{"name": "Review", "type": "REVIEWER", "duration": 5,
+                           "group_review": {"enabled": True, "type": "MINIMUM", "min": 2},
+                           "reviewer_users": [USER_A_EMAIL]}],  # only 1 candidate
             })
 
     assert not post.called
