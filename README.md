@@ -89,11 +89,14 @@ Add the server to your Claude Code user config at `~/.claude.json`. Adjust the p
     "args": ["/path/to/forma-mcp/aps_mcp.py"],
     "env": {
       "APS_CLIENT_ID": "your_client_id",
-      "APS_CLIENT_SECRET": "your_client_secret"
+      "APS_CLIENT_SECRET": "your_client_secret",
+      "APS_ROLE_CACHE": "/path/to/role_id_cache.json"
     }
   }
 }
 ```
+
+`APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). Without the env var the server also looks for `role_id_cache.json` next to `aps_mcp.py`, then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
 
 **Windows paths** — use forward slashes or escaped backslashes:
 ```
@@ -110,7 +113,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 >
 > **Paste a project ID or ACC URL instead.** Every single-project tool also accepts an optional `project` parameter — a project **name**, a **project ID** (`b.xxxx` or bare UUID), or a **full ACC URL**. When it contains an ID/URL the tool pins the exact owning hub in one Admin-API call (no region guessing, no wrong-hub risk), so you never need `hub_name`. The old `project_name` parameter keeps working as a name-only alias. Use the standalone `resolve_project` tool to turn any of these into `{project_id, hub_id, hub_name, region, platform}` up front.
 >
-> **Bulk-user tools (`project_names` arrays).** `bulk_assign_users`, `update_user_roles`, `bulk_assign_company_users`, and `remove_users_from_projects` resolve every entry the same way — each name, project ID, or ACC URL is matched across **all** hubs, so a project in a non-default EMEA hub resolves without `hub_name`. A genuine same-name collision across hubs raises a clear ambiguity error (pass an ID/URL or `hub_name` to disambiguate).
+> **Bulk-user tools (`project_names` arrays).** `bulk_assign_users`, `update_user_roles`, `bulk_assign_company_users`, and `remove_users_from_projects` resolve every entry the same way — each name, project ID, or ACC URL is matched across **all** hubs, so a project in a non-default EMEA hub resolves without `hub_name`. A genuine same-name collision across hubs raises a clear ambiguity error (pass an ID/URL or `hub_name` to disambiguate). The **account-side lookups fan across hubs too**: the "is this user in the account?" roster check (`bulk_assign_users`/`update_user_roles`), `bulk_assign_company_users`' company→users lookup, and `clone_user_access`' scan for the reference user's projects all search **every** hub's account, so a user or company living only in a non-default hub is still found without `hub_name` (pass `hub_name` to scope the search to one hub).
 
 ### Navigation & file exploration
 
@@ -170,6 +173,8 @@ All five bulk tools default to **`dry_run: true`** — Claude always shows a pre
 | `bulk_assign_company_users` | Add all members of an ACC company to a project | 3-legged + `account:write` |
 
 > **Multiple roles per user.** `bulk_assign_users`, `update_user_roles`, and `bulk_assign_company_users` accept `default_role` (and each `role_overrides` value) as either a single role or a **list** — e.g. `default_role: ["BIM Coordinator", "EXT Architect"]` — assigning several roles to a user at once (the API's `roleIds` is an array). Each entry is a role **name** or a raw role **ID**. `clone_user_access` copies **all** of the reference user's roles per project.
+
+> **Role assignment (single async import).** On a live run, `bulk_assign_users` (and the shared core behind `clone_user_access` / `bulk_assign_company_users`) sends **one** `POST users:import` per project carrying the resolved `roleIds` — membership and roles are applied together in a single call (the import honours a valid role UUID, including a role no member holds yet). An **empty role is assigned by its name**: names resolve first from the roles members already hold, then from the `role_id_cache.json` name→UUID map (which lists unused roles too — see `APS_ROLE_CACHE` above), so you never handle a UUID. A name that resolves nowhere is still sent to ACC (the authority) and a **warning** flags it. The import is **asynchronous** (`202 + jobId`); the tool then polls the members list to confirm each user landed with their roles — confirmed → `success`, still queued → **`submitted`** (re-check shortly, not a failure). (`update_user_roles` uses the synchronous `PATCH .../users/{userId}` — the right call for changing an existing member's roles.)
 
 ### Hub-level directory & onboarding
 
@@ -414,11 +419,13 @@ flowchart LR
     T13 --> E12
     T14 --> E13
 
+    T15 --> E5
     T15 --> E14
     T16 --> E15
     T17 --> E16
     T18 --> E5
     T18 --> E14
+    T19 --> E5
     T19 --> E6
     T19 --> E14
 

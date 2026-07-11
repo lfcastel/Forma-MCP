@@ -2,6 +2,9 @@
 tokens.json
 mcp_config.json
 
+# Role-ID cache (contains real hub role UUIDs — resolve names locally, don't commit)
+role_id_cache.json
+
 # Virtual environment
 .venv/
 
