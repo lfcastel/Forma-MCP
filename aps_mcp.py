@@ -976,6 +976,8 @@ async def _build_project_directory(
     hdrs = auth_headers(token)
     users_by_name: dict[str, str] = {}
     users_by_email: dict[str, str] = {}
+    roles_by_name: dict[str, str] = {}
+    companies_by_name: dict[str, str] = {}
     params: dict = {"limit": 200, "offset": 0}
     while True:
         r = await client.get(
@@ -994,15 +996,26 @@ async def _build_project_directory(
                 email = u.get("email")
                 if email:
                     users_by_email[email.lower()] = aid
+            # Roles & companies (Tier 1): the Reviews API's numeric candidate autodeskId
+            # for a role is that role's `roleGroupId`, and for a company the user's
+            # `companyGroupId` — both already present in this same admin users payload
+            # (verified live: identical to the value embedded in existing workflow
+            # candidates). Free, and covers every role/company that has ≥1 member.
+            for role in (u.get("roles") or []):
+                rname, rgid = role.get("name"), role.get("roleGroupId")
+                if rname and rgid:
+                    roles_by_name.setdefault(rname.lower(), str(rgid))
+            cname, cgid = u.get("companyName"), u.get("companyGroupId")
+            if cname and cgid:
+                companies_by_name.setdefault(cname.lower(), str(cgid))
         if len(users) < params["limit"]:
             break
         params["offset"] += params["limit"]
 
-    # Harvest role/company autodeskIds from existing workflows' candidates (the only
-    # source in the Reviews ID space). Best-effort — a project with no workflows yet
-    # simply yields empty role/company maps, and those references must be raw ids.
-    roles_by_name: dict[str, str] = {}
-    companies_by_name: dict[str, str] = {}
+    # Tier 2: harvest role/company autodeskIds from existing workflows' candidates. This
+    # adds a role/company that is *used by a workflow but currently has no member* (so
+    # Tier 1 missed it). Best-effort — a project with no workflows yet simply yields
+    # nothing extra here.
     try:
         wf_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
         workflows = await _get_all_issues(
@@ -1013,12 +1026,21 @@ async def _build_project_directory(
                 cands = step.get("candidates") or {}
                 for role in cands.get("roles", []):
                     if role.get("name") and role.get("autodeskId"):
-                        roles_by_name[role["name"].lower()] = role["autodeskId"]
+                        roles_by_name.setdefault(role["name"].lower(), role["autodeskId"])
                 for comp in cands.get("companies", []):
                     if comp.get("name") and comp.get("autodeskId"):
-                        companies_by_name[comp["name"].lower()] = comp["autodeskId"]
+                        companies_by_name.setdefault(comp["name"].lower(), comp["autodeskId"])
     except Exception:
-        pass  # harvesting is best-effort; unresolved names fall back to raw-id passthrough
+        pass  # harvesting is best-effort; unresolved names fall back to the cache / raw id
+
+    # Tier 3: fill any remaining gaps (a role with zero members that no workflow uses
+    # either — a genuinely empty role) from the oxygen-id cache. That value is the Data
+    # Connector 'admin' export's `role_oxygen_id`, the only source that lists empty roles'
+    # Reviews IDs. Same cache mechanic as the role-UUID cache; refreshed on a miss.
+    for nm, oid in _load_role_oxygen_id().items():
+        roles_by_name.setdefault(nm, oid)
+    for nm, oid in _load_company_oxygen_id().items():
+        companies_by_name.setdefault(nm, oid)
 
     return {
         "users_by_name": users_by_name,
@@ -1075,10 +1097,12 @@ def _resolve_candidates(step: dict, directory: dict) -> dict:
             "Could not resolve these reviewer references to Autodesk IDs: "
             + ", ".join(unresolved)
             + ". Users come from list_project_members (the 'autodesk_id' field). Role and "
-            "company IDs use a separate numeric ID space that Autodesk exposes no lookup "
-            "for — they can only be resolved from a workflow that already uses them (see "
-            "get_workflow), so pass the raw autodeskId for any role/company not yet used "
-            "in an existing workflow."
+            "company IDs use a separate numeric space, resolved from (1) any member holding "
+            "the role / in the company, (2) a workflow already using it, or (3) the "
+            "role_id_cache.json 'roles_name_to_oxygen_id' map. An unresolved name is a "
+            "genuinely empty role (no member, no workflow) missing from the cache — refresh "
+            "it via a Data Connector export (its role_oxygen_id column) and merge, or pass "
+            "the raw numeric autodeskId from get_workflow."
         )
     if users:
         candidates["users"] = users
@@ -1728,6 +1752,42 @@ def _load_role_name_to_id() -> dict[str, str]:
     return out
 
 
+def _load_oxygen_map(key: str) -> dict[str, str]:
+    """Load a lowercase name → oxygen-id map from the role cache under ``key``.
+
+    The 'oxygen id' is the short *numeric* Autodesk ID the **Reviews Workflows** API
+    wants for a role/company step candidate (a different ID space than the role UUID in
+    ``roles_name_to_id``). It comes from the Data Connector 'admin' export's
+    ``role_oxygen_id`` column — the one source that also lists **empty** roles' Reviews
+    IDs. Read fresh each call; returns {} on a missing/unreadable/malformed file so
+    resolution degrades gracefully to the members-payload / workflow-harvest sources."""
+    path = _role_cache_path()
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for name, oid in (data.get(key) or {}).items():
+        if name and oid:
+            out[str(name).strip().lower()] = str(oid)
+    return out
+
+
+def _load_role_oxygen_id() -> dict[str, str]:
+    """Role name → Reviews-API numeric autodeskId, from the cache's
+    ``roles_name_to_oxygen_id`` map (see `_load_oxygen_map`)."""
+    return _load_oxygen_map("roles_name_to_oxygen_id")
+
+
+def _load_company_oxygen_id() -> dict[str, str]:
+    """Company name → Reviews-API numeric autodeskId, from the cache's
+    ``companies_name_to_oxygen_id`` map (see `_load_oxygen_map`)."""
+    return _load_oxygen_map("companies_name_to_oxygen_id")
+
+
 def _resolve_role_id(role_name: str, role_map: dict[str, str]) -> str | None:
     """Case-insensitive role name → role ID lookup."""
     name_lower = role_name.lower()
@@ -2304,7 +2364,10 @@ async def list_tools() -> list[Tool]:
                 "job — the tool polls internally every 15 s (up to 10 min) so you never need to "
                 "call it repeatedly. Returns a role_id→name map (EMPTY roles included) ready to "
                 "feed into bulk_assign_users / update_user_roles (assign to a role by its id) or "
-                "export_permission_matrix (label role ids with names)."
+                "export_permission_matrix (label role ids with names). Also returns "
+                "'roles_name_to_oxygen_id' (name→Reviews numeric autodeskId, from the export's "
+                "role_oxygen_id column) — merge it into role_id_cache.json to let the approval-"
+                "workflow tools resolve reviewer roles by name, including empty ones."
             ),
             inputSchema={
                 "type": "object",
@@ -3280,8 +3343,8 @@ async def list_tools() -> list[Tool]:
                                     "description": "Group-review rule. REVIEWER steps only.",
                                 },
                                 "reviewer_users": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by user name or email (resolved to Autodesk IDs via project members). Raw autodeskId also accepted."},
-                                "reviewer_roles": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by role name. Role IDs use a numeric space with no lookup API, so a name is resolved only if some existing workflow already uses that role; otherwise pass the raw numeric autodeskId (see get_workflow)."},
-                                "reviewer_companies": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by company name. Resolved only from a role/company already used in an existing workflow; otherwise pass the raw autodeskId."},
+                                "reviewer_roles": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by role name. Resolved to the Reviews numeric autodeskId from: any member holding the role, a workflow already using it, or the role_id_cache.json 'roles_name_to_oxygen_id' map. Only a genuinely empty role (no member, no workflow, not cached) needs the raw numeric autodeskId (see get_workflow)."},
+                                "reviewer_companies": {"type": "array", "items": {"type": "string"}, "description": "Reviewers/approvers by company name. Resolved from any member's company, a workflow already using it, or the cache — otherwise pass the raw autodeskId."},
                                 "candidates": {"type": "object", "description": "Advanced: a pre-built candidates object ({users/roles/companies:[{autodeskId}]}). Used only if no reviewer_* keys are given."},
                             },
                             "required": ["name", "type"],
@@ -4274,10 +4337,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 r.raise_for_status()
                 return r.json()["signedUrl"]
 
-            async def _download_roles(signed_url: str) -> dict[str, str]:
+            async def _download_roles(signed_url: str) -> tuple[dict[str, str], dict[str, str]]:
+                """Return ``(roles, roles_oxygen)`` from the admin_project_roles CSV:
+                ``roles`` = {role_id(UUID): role_name} (feeds the role-UUID cache and
+                export_permission_matrix); ``roles_oxygen`` = {role_name: role_oxygen_id},
+                the Reviews-API numeric autodeskId for the reviewer-workflow tools."""
                 dl = await client.get(signed_url, timeout=120)
                 dl.raise_for_status()
                 roles: dict[str, str] = {}
+                roles_oxygen: dict[str, str] = {}
                 zf = zipfile.ZipFile(io.BytesIO(dl.content))
                 for zfname in zf.namelist():
                     if "role" in zfname.lower() and zfname.endswith(".csv"):
@@ -4285,9 +4353,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                         for row in csv.DictReader(io.StringIO(csv_text)):
                             rid = row.get("role_id") or row.get("roleId") or row.get("id", "")
                             rname = row.get("name") or row.get("role_name") or row.get("roleName", "")
+                            oxy = row.get("role_oxygen_id") or row.get("roleOxygenId") or ""
                             if rid and rname:
                                 roles[rid] = rname
-                return roles
+                            if rname and oxy:
+                                roles_oxygen[rname] = str(oxy)
+                return roles, roles_oxygen
 
             if request_id:
                 job = await _poll_for_job(request_id)
@@ -4301,9 +4372,12 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 }
                 if (job.get("completionStatus") or "").lower() == "success" and job_id:
                     signed_url = await _get_signed_url(job_id)
-                    roles = await _download_roles(signed_url)
+                    roles, roles_oxygen = await _download_roles(signed_url)
                     result["roles"] = roles
                     result["role_count"] = len(roles)
+                    # Reviews-API numeric IDs (role_oxygen_id) for the approval-workflow
+                    # tools — merge into role_id_cache.json's 'roles_name_to_oxygen_id'.
+                    result["roles_name_to_oxygen_id"] = roles_oxygen
                 return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
             # No request_id: list requests only (no polling)
