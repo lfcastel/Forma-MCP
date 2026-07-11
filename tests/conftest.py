@@ -14,6 +14,23 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _disable_role_cache(monkeypatch):
+    """Point APS_ROLE_CACHE at a nonexistent file so tests never load a dev machine's real
+    ~/.claude/skills/aps/role_id_cache.json (which would make role-name resolution depend on
+    local state). Cache-resolution tests override this via monkeypatch.setenv."""
+    monkeypatch.setenv("APS_ROLE_CACHE", os.path.join(os.path.dirname(__file__), "_no_role_cache.json"))
+
+
+@pytest.fixture(autouse=True)
+def _fast_assign_poll(monkeypatch):
+    """The live bulk-assign polls the members list to confirm the async import. Zero the
+    delay so tests never actually sleep during that poll."""
+    import aps_mcp
+    monkeypatch.setattr(aps_mcp, "_ASSIGN_POLL_DELAY", 0, raising=False)
+    monkeypatch.setattr(aps_mcp, "_ASSIGN_POLL_ATTEMPTS", 3, raising=False)
+
 # ---------------------------------------------------------------------------
 # Shared fake IDs used across all test modules
 # ---------------------------------------------------------------------------

@@ -45,6 +45,13 @@ DEFAULT_PRODUCTS = [
     {"key": "insight", "access": "member"},
 ]
 
+# The project `users:import` call is asynchronous (returns 202 + a jobId), so after a
+# live bulk assign we poll the members list to confirm each user landed with their roles.
+# Best-effort: a user unconfirmed within the budget is reported as `submitted`, not failed.
+# (Tests set the delay to 0 so they never actually sleep.)
+_ASSIGN_POLL_ATTEMPTS = 10
+_ASSIGN_POLL_DELAY = 3.0
+
 # ---------------------------------------------------------------------------
 # Token persistence
 # ---------------------------------------------------------------------------
@@ -1570,6 +1577,47 @@ async def _get_account_users_map(
     return users
 
 
+async def _get_all_hubs_filtered(
+    client: httpx.AsyncClient, token: str, hub_name: str | None = None
+) -> list[dict]:
+    """Return every hub (raw data entries), or the ``hub_name``-filtered subset (exact
+    then partial match). Fanning across all hubs — not just the region's first — is the
+    wrong-hub fix that lets the bulk-user tools reach a project or account roster living
+    in a non-default hub (the two-EMEA-hubs trap)."""
+    hubs = await _get_all_hubs(client, token)
+    if not hubs:
+        raise ValueError("No hubs found for this account.")
+    if hub_name:
+        hn = hub_name.lower()
+        exact = [h for h in hubs if h["attributes"]["name"].lower() == hn]
+        partial = [h for h in hubs if hn in h["attributes"]["name"].lower()]
+        selected = exact or partial
+        if not selected:
+            available = [h["attributes"]["name"] for h in hubs]
+            raise ValueError(f"Hub '{hub_name}' not found. Available hubs: {available}")
+        return selected
+    return hubs
+
+
+async def _get_all_accounts_users_map(
+    client: httpx.AsyncClient, token: str, app_token: str, hub_name: str | None = None
+) -> dict[str, dict]:
+    """Merge the per-hub account user rosters across every hub (or the ``hub_name``-
+    filtered subset) into one email→user map. The HQ roster is per-hub-account, so a user
+    who lives only in a non-default hub's account would otherwise be wrongly flagged
+    'not in roster' — fanning across hubs is the wrong-hub fix. A 2-legged app token can
+    read every account the app is authorised on, so one token serves all hubs."""
+    hubs = await _get_all_hubs_filtered(client, token, hub_name)
+    maps = await _gather_bounded(
+        8,
+        [(lambda h=h: _get_account_users_map(client, _to_bare_id(h["id"]), app_token)) for h in hubs],
+    )
+    merged: dict[str, dict] = {}
+    for m in maps:
+        merged.update(m)
+    return merged
+
+
 async def _get_account_companies(
     client: httpx.AsyncClient, account_id: str, app_token: str
 ) -> list[dict]:
@@ -1633,6 +1681,53 @@ def _import_item_error(item: "Any") -> str:
     return json.dumps(item)
 
 
+_BARE_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _looks_like_uuid(value: str) -> bool:
+    """True if the value is a bare role UUID — i.e. already a raw ID, not a name."""
+    return bool(_BARE_UUID_RE.match(str(value).strip()))
+
+
+def _role_cache_path() -> "str | None":
+    """Locate the role-name → UUID cache JSON. Precedence: the `APS_ROLE_CACHE` env var,
+    then a repo-local `role_id_cache.json`, then the conventional aps-skill copy under
+    `~/.claude/skills/aps/`. Returns None if none exist (resolution then degrades to the
+    member-walk only)."""
+    env = os.environ.get("APS_ROLE_CACHE")
+    if env:
+        return env if os.path.exists(env) else None
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "role_id_cache.json")
+    if os.path.exists(here):
+        return here
+    skill = os.path.expanduser(os.path.join("~", ".claude", "skills", "aps", "role_id_cache.json"))
+    return skill if os.path.exists(skill) else None
+
+
+def _load_role_name_to_id() -> dict[str, str]:
+    """Load a lowercase role-name → UUID map from the role cache (see `_role_cache_path`).
+    This is the ONE source that lists empty/newly-created roles the member-walk can't see
+    (it's built from a Data Connector 'admin' export). Read fresh each call — the file is
+    tiny — and returns {} on a missing/unreadable/malformed file so resolution degrades
+    gracefully to the member-walk. Lets a human pass a role *name* even for a role no
+    member holds yet, instead of having to look up its UUID."""
+    path = _role_cache_path()
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for name, rid in (data.get("roles_name_to_id") or {}).items():
+        if name and rid:
+            out[str(name).strip().lower()] = str(rid)
+    return out
+
+
 def _resolve_role_id(role_name: str, role_map: dict[str, str]) -> str | None:
     """Case-insensitive role name → role ID lookup."""
     name_lower = role_name.lower()
@@ -1657,11 +1752,39 @@ def _as_role_list(role_spec: "Any") -> list[str]:
     return out
 
 
-def _resolve_role_ids(role_spec: "Any", role_map: dict[str, str]) -> list[str]:
-    """Resolve every role in the spec to its ID via the member-derived map, passing an
-    unresolved value straight through as a raw role ID (see _execute_bulk_assign — empty
-    roles aren't visible to the member walk, so the ACC API is the authority)."""
-    return [_resolve_role_id(name, role_map) or name for name in _as_role_list(role_spec)]
+def _resolve_role_ids(
+    role_spec: "Any", role_map: dict[str, str], name_cache: "dict[str, str] | None" = None
+) -> list[str]:
+    """Resolve every role in the spec to its ID. Order per entry: the project member-walk
+    map, then the hub-wide role-name cache (the only source for an empty/unused role's ID —
+    see `_load_role_name_to_id`), then pass the value through unchanged as a raw ID so the
+    ACC API stays the authority. This lets a human pass a role *name* even for a role no
+    member holds yet, without ever handling a UUID."""
+    if name_cache is None:
+        name_cache = _load_role_name_to_id()
+    out: list[str] = []
+    for name in _as_role_list(role_spec):
+        rid = _resolve_role_id(name, role_map) or name_cache.get(str(name).strip().lower()) or name
+        out.append(rid)
+    return out
+
+
+def _unresolved_role_names(
+    role_spec: "Any", role_map: dict[str, str], name_cache: "dict[str, str] | None" = None
+) -> list[str]:
+    """Role tokens that resolve to neither a member-held role nor a cached role and don't
+    look like a raw UUID — i.e. a likely typo or a role missing from the cache. Surfaced as
+    a warning so a bare 'Invalid UUID format' 400 from ACC isn't the only feedback."""
+    if name_cache is None:
+        name_cache = _load_role_name_to_id()
+    out: list[str] = []
+    for name in _as_role_list(role_spec):
+        if _resolve_role_id(name, role_map) or name_cache.get(str(name).strip().lower()):
+            continue
+        if _looks_like_uuid(name):
+            continue
+        out.append(name)
+    return out
 
 
 def _role_display(role_spec: "Any") -> str:
@@ -4261,8 +4384,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             Core assign logic reused by bulk_assign_users, clone_user_access,
             and bulk_assign_company_users.
             Returns (results, warnings, api_calls_made).
-            NOTE: request body format for users:import may need adjustment
-            against the ACC Admin API v1 spec during implementation.
+
+            A live run is a SINGLE `users:import` per project carrying the resolved
+            `roleIds` — membership and roles are applied together in one atomic call
+            (verified live: the import honours a valid role UUID, incl. a role no
+            member holds yet). Role names resolve via the member walk → the hub-wide
+            role cache (lists empty roles) → raw pass-through. The import is
+            asynchronous (202 + jobId), so we poll the members list to confirm each
+            user landed with their roles; a user unconfirmed within the poll budget is
+            reported `submitted` (queued), not failed.
             """
             warnings: list[str] = []
             BATCH = 200
@@ -4280,13 +4410,21 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     role_ids: list[str] = []
                     if _as_role_list(role_spec):
                         role_map = await _fetch_project_roles(client, pid, hdrs)
-                        # Resolve each friendly role name to its ID when a project member
-                        # already holds it. Empty/newly-created roles aren't visible to
-                        # that member walk (ACC exposes no project-roles catalog), so
-                        # DON'T pre-reject an unresolved value — pass it through as a raw
-                        # role ID and let the ACC API validate it on import. roleIds is an
-                        # array, so a user can be given multiple roles at once.
-                        role_ids = _resolve_role_ids(role_spec, role_map)
+                        # Resolve each friendly role name to its ID: first from the roles a
+                        # member already holds, then from the hub-wide role cache (which
+                        # DOES list empty/newly-created roles the member walk can't see), and
+                        # finally pass an unresolved value through as a raw ID for the ACC
+                        # API to validate. roleIds is an array — several roles per user.
+                        name_cache = _load_role_name_to_id()
+                        role_ids = _resolve_role_ids(role_spec, role_map, name_cache)
+                        unknown = _unresolved_role_names(role_spec, role_map, name_cache)
+                        if unknown:
+                            warnings.append(
+                                f"Role name(s) {unknown} not found among {pname}'s members or "
+                                f"the role cache — sent to ACC as-is (will be rejected if not a "
+                                f"valid role ID). Refresh role_id_cache.json via a Data "
+                                f"Connector export if this is a new role."
+                            )
 
                     if dry_run:
                         members = await _get_project_members_map(client, pid, hdrs)
@@ -4301,23 +4439,29 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                                 proj_results.append({
                                     "user": email, "project": pname, "role": role_display,
                                     "status": "would_add",
-                                    "message": f"Would add with role(s) '{role_display}'" if role_ids else "Would add (no role)",
+                                    "message": (
+                                        f"Would add with role(s) '{role_display}'"
+                                        if role_ids else "Would add (no role)"
+                                    ),
                                 })
                         return proj_results
 
                     bare_pid = _to_bare_id(pid)
+
+                    # --- Single import per batch, carrying roleIds -------------------
+                    # One `users:import` applies membership AND roles together. The call
+                    # is async (202 + jobId); we confirm by polling the members list below.
+                    # submitted = emails the POST accepted; post_errors = per-email failures.
+                    submitted: list[str] = []
+                    post_errors: dict[str, str] = {}
                     for i in range(0, len(user_emails), BATCH):
                         batch = user_emails[i : i + BATCH]
                         users_payload = []
                         for email in batch:
-                            entry: dict = {
-                                "email": email,
-                                "products": DEFAULT_PRODUCTS,
-                            }
+                            entry: dict = {"email": email, "products": DEFAULT_PRODUCTS}
                             if role_ids:
                                 entry["roleIds"] = role_ids
                             users_payload.append(entry)
-
                         api_calls_made_flag[0] = True
                         r = await client.post(
                             f"{APS_BASE}/construction/admin/v2/projects/{bare_pid}/users:import",
@@ -4325,31 +4469,51 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                             json={"users": users_payload, "suppressAdministrativeEmails": False},
                         )
                         if r.is_success:
-                            resp = r.json()
-                            items = _extract_response_items(resp)
-                            if items:
-                                for item in items:
-                                    email_resp = (item.get("email") or "").lower()
-                                    ok = item.get("success", True)
-                                    proj_results.append({
-                                        "user": email_resp or "(unknown)",
-                                        "project": pname, "role": role_display,
-                                        "status": "success" if ok else "error",
-                                        "message": item.get("message") or item.get("error") or "",
-                                    })
-                            else:
-                                for email in batch:
-                                    proj_results.append({
-                                        "user": email, "project": pname, "role": role_display,
-                                        "status": "success", "message": "",
-                                    })
+                            submitted.extend(batch)
                         else:
                             body = _error_body(r)
                             for email in batch:
-                                proj_results.append({
-                                    "user": email, "project": pname, "role": role_display,
-                                    "status": "error", "message": f"HTTP {r.status_code}: {body}",
-                                })
+                                post_errors[email] = f"HTTP {r.status_code}: {body}"
+
+                    # --- Confirm the async job by polling the members list ----------
+                    # A user is confirmed when they're a member holding every requested
+                    # role. Best-effort within the poll budget; unconfirmed → `submitted`.
+                    confirmed: set[str] = set()
+                    members: dict[str, dict] = {}
+                    role_id_set = set(role_ids)
+                    if submitted:
+                        for attempt in range(_ASSIGN_POLL_ATTEMPTS):
+                            members = await _get_project_members_map(client, pid, hdrs)
+                            confirmed = {
+                                e for e in submitted
+                                if e in members and role_id_set.issubset(
+                                    {rr.get("id") for rr in members[e].get("roles", [])}
+                                )
+                            }
+                            if len(confirmed) == len(submitted):
+                                break
+                            if attempt < _ASSIGN_POLL_ATTEMPTS - 1:
+                                await asyncio.sleep(_ASSIGN_POLL_DELAY)
+
+                    # --- One row per requested user ---------------------------------
+                    for email in user_emails:
+                        if email in post_errors:
+                            proj_results.append({
+                                "user": email, "project": pname, "role": role_display,
+                                "status": "error", "message": post_errors[email],
+                            })
+                        elif email in confirmed:
+                            proj_results.append({
+                                "user": email, "project": pname, "role": role_display,
+                                "status": "success", "message": "",
+                            })
+                        else:
+                            proj_results.append({
+                                "user": email, "project": pname, "role": role_display,
+                                "status": "submitted",
+                                "message": "Queued (async import) — not confirmed within the "
+                                           "poll window; re-check membership shortly",
+                            })
                     return proj_results
 
             gathered = await asyncio.gather(*[_process_project(p) for p in resolved_projects])
@@ -4368,9 +4532,6 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             default_role = arguments.get("default_role") or ""
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
 
-            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
-            account_id = _to_bare_id(hub_id)
-
             resolved_projects: list[dict] = []
             project_errors: list[dict] = []
             for pname in project_names:
@@ -4386,7 +4547,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             invalid_email_set: set[str] = set()
             if resolved_projects:
                 app_token = await get_app_token()
-                account_users = await _get_account_users_map(client, account_id, app_token)
+                # Roster check across EVERY hub account (the roster is per-hub-account, so
+                # a project in a non-default hub must not wrongly skip valid users).
+                account_users = await _get_all_accounts_users_map(
+                    client, token, app_token, hub_name=arguments.get("hub_name")
+                )
                 for email in user_emails:
                     if email not in account_users:
                         invalid_email_set.add(email)
@@ -4420,7 +4585,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "already_member", "error")
+                for k in ("success", "submitted", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({
@@ -4437,9 +4602,6 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             default_role = arguments["default_role"]
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
 
-            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
-            account_id = _to_bare_id(hub_id)
-
             resolved_projects: list[dict] = []
             project_errors: list[dict] = []
             for pname in project_names:
@@ -4454,7 +4616,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             invalid_email_set: set[str] = set()
             if resolved_projects:
                 app_token = await get_app_token()
-                account_users = await _get_account_users_map(client, account_id, app_token)
+                # Roster check across EVERY hub account (see bulk_assign_users).
+                account_users = await _get_all_accounts_users_map(
+                    client, token, app_token, hub_name=arguments.get("hub_name")
+                )
                 for email in user_emails:
                     if email not in account_users:
                         invalid_email_set.add(email)
@@ -4462,6 +4627,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             valid_emails = [e for e in user_emails if e not in invalid_email_set]
 
             results: list[dict] = []
+            warnings: list[str] = []
             for email in invalid_email_set:
                 for proj in resolved_projects:
                     role_display = _role_display(role_overrides.get(proj["name"].lower(), default_role))
@@ -4486,11 +4652,19 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 role_display = _role_display(role_spec)
 
                 role_map = await _fetch_project_roles(client, pid, hdrs)
-                # See _execute_bulk_assign: unresolved role names aren't pre-rejected
-                # (empty roles aren't visible via the member walk) — they pass through
-                # as raw role IDs and the ACC API is the authority. roleIds is an array,
-                # so a member can be given multiple roles at once.
-                role_ids = _resolve_role_ids(role_spec, role_map)
+                # Resolve names via the member walk, then the hub-wide role cache (which
+                # lists empty/unused roles the walk can't see), else pass through as a raw
+                # ID for the ACC API to validate. roleIds is an array (multiple roles).
+                name_cache = _load_role_name_to_id()
+                role_ids = _resolve_role_ids(role_spec, role_map, name_cache)
+                unknown = _unresolved_role_names(role_spec, role_map, name_cache)
+                if unknown:
+                    warnings.append(
+                        f"Role name(s) {unknown} not found among {pname}'s members or the "
+                        f"role cache — sent to ACC as-is (will be rejected if not a valid "
+                        f"role ID). Refresh role_id_cache.json via a Data Connector export "
+                        f"if this is a new role."
+                    )
 
                 members = await _get_project_members_map(client, pid, hdrs)
                 bare_pid = _to_bare_id(pid)
@@ -4552,7 +4726,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({
                 "dry_run": dry_run, "operation": "update_user_roles",
                 "summary": summary, "results": results,
-                "audit_file": audit_file,
+                "warnings": warnings, "audit_file": audit_file,
             }, indent=2))]
 
         if name == "remove_users_from_projects":
@@ -4653,15 +4827,21 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             }, indent=2))]
 
         if name == "clone_user_access":
-            region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
             ref_email = arguments["reference_user_email"].lower().strip()
             target_emails = _norm_emails(arguments["target_user_emails"])
 
-            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
-            all_projs = await get_all_pages(
-                client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
+            # Scan projects across EVERY hub (or the hub_name-filtered subset) — the
+            # reference user may hold access in a non-default hub, so a single-hub scan
+            # would miss it (the wrong-hub fix).
+            hubs = await _get_all_hubs_filtered(client, token, arguments.get("hub_name"))
+            project_lists = await _gather_bounded(
+                8,
+                [(lambda h=h: get_all_pages(
+                    client, f"{APS_BASE}/project/v1/hubs/{h['id']}/projects", hdrs
+                )) for h in hubs],
             )
+            all_projs = [p for plist in project_lists for p in plist]
 
             # Find all projects where the reference user is a member
             # Use a semaphore to limit concurrency across potentially 200+ projects
@@ -4704,7 +4884,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "already_member", "error")
+                for k in ("success", "submitted", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({
@@ -4724,12 +4904,14 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
             user_filter = _norm_emails(arguments.get("user_filter") or [])
 
-            hub_id, _ = await resolve_hub(client, token, region, hub_name=arguments.get("hub_name"))
-            account_id = _to_bare_id(hub_id)
             app_token = await get_app_token()
 
-            # Find company by name across all account companies (HQ API)
-            account_users = await _get_account_users_map(client, account_id, app_token)
+            # Resolve the company's users across EVERY hub account (the roster is per-hub-
+            # account, so a company whose members live in a non-default hub is still found
+            # without a hub_name hint — the wrong-hub fix).
+            account_users = await _get_all_accounts_users_map(
+                client, token, app_token, hub_name=arguments.get("hub_name")
+            )
             company_emails = [
                 email for email, u in account_users.items()
                 if company_name in (u.get("company_name") or u.get("companyName") or "").lower()
@@ -4773,7 +4955,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             summary = {
                 k: sum(1 for r in results if r["status"] == k)
-                for k in ("success", "would_add", "already_member", "error")
+                for k in ("success", "submitted", "would_add", "already_member", "error")
             }
             summary["total"] = len(results)
             return [TextContent(type="text", text=json.dumps({
