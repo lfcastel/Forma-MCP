@@ -401,3 +401,140 @@ async def test_looks_like_autodesk_id():
     assert aps_mcp._looks_like_autodesk_id("ADSKALICE001")
     assert not aps_mcp._looks_like_autodesk_id("Alice Test")  # has space
     assert not aps_mcp._looks_like_autodesk_id("Alice")       # no digit
+
+
+# ===========================================================================
+# _build_project_directory — role/company Reviews-ID resolution (3 tiers)
+# ===========================================================================
+
+# A member holding a role exposes that role's Reviews-API numeric autodeskId as
+# `roleGroupId`, and the member's company id as `companyGroupId`, in the SAME admin
+# users payload used for user ids. (Ints here to prove the str() coercion.)
+MEMBERS_WITH_GROUP_IDS = {
+    "results": [
+        {
+            "autodeskId": "USR1", "email": "u@x.com", "name": "U One",
+            "companyName": "Contoso", "companyGroupId": 990000020,
+            "roles": [{"id": "uuid-admin", "name": "BAC Admin", "roleGroupId": 990000010}],
+        }
+    ]
+}
+EMPTY_WORKFLOWS = {"pagination": {"limit": 50, "offset": 0, "totalResults": 0}, "results": []}
+
+
+@respx.mock
+async def test_build_directory_resolves_role_and_company_from_members_payload():
+    """Tier 1: a role/company with ≥1 member resolves by name from roleGroupId /
+    companyGroupId — no dependency on an existing workflow using it."""
+    respx.get(ADMIN_USERS).mock(return_value=httpx.Response(200, json=MEMBERS_WITH_GROUP_IDS))
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=EMPTY_WORKFLOWS))
+
+    async with httpx.AsyncClient() as client:
+        directory = await aps_mcp._build_project_directory(client, FAKE_TOKEN, BARE_PROJECT_ID)
+
+    assert directory["roles_by_name"]["bac admin"] == "990000010"
+    assert directory["companies_by_name"]["contoso"] == "990000020"
+
+
+@respx.mock
+async def test_build_directory_tier3_oxygen_cache_fallback(tmp_path, monkeypatch):
+    """Tier 3: a genuinely empty role (no member, no workflow) resolves by name from the
+    role_id_cache.json 'roles_name_to_oxygen_id' map — same cache mechanic as role UUIDs."""
+    cache = tmp_path / "role_id_cache.json"
+    cache.write_text(json.dumps({
+        "roles_name_to_oxygen_id": {"Empty Role": "990000030"},
+        "companies_name_to_oxygen_id": {"Ghost Co": "990000040"},
+    }))
+    monkeypatch.setenv("APS_ROLE_CACHE", str(cache))
+    # No members, no workflows — only the cache can resolve these names.
+    respx.get(ADMIN_USERS).mock(return_value=httpx.Response(200, json={"results": []}))
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=EMPTY_WORKFLOWS))
+
+    async with httpx.AsyncClient() as client:
+        directory = await aps_mcp._build_project_directory(client, FAKE_TOKEN, BARE_PROJECT_ID)
+
+    assert directory["roles_by_name"]["empty role"] == "990000030"
+    assert directory["companies_by_name"]["ghost co"] == "990000040"
+
+
+@respx.mock
+async def test_create_workflow_resolves_role_via_member_role_group_id():
+    """End-to-end: a role no workflow uses, but that a member holds, now resolves by name
+    (the fix for the 'missing role-id' failure) — its roleGroupId becomes the candidate."""
+    _mock_resolve(respx)
+    respx.get(ADMIN_USERS).mock(return_value=httpx.Response(200, json=MEMBERS_WITH_GROUP_IDS))
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=EMPTY_WORKFLOWS))
+    post = respx.post(WF_BASE).mock(
+        return_value=httpx.Response(201, json=CREATED_WORKFLOW_RESPONSE)
+    )
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+        result = await aps_mcp.call_tool("create_workflow", {
+            "project_name": PROJECT_NAME, "name": "Role By Name",
+            "steps": [{"name": "Approve", "type": "APPROVER", "duration": 5,
+                       "reviewer_roles": ["BAC Admin"]}],
+        })
+
+    data = _parse(result)
+    assert data["status"] == "created"
+    body = json.loads(post.calls[0].request.content)
+    assert body["steps"][0]["candidates"]["roles"] == [{"autodeskId": "990000010"}]
+
+
+async def test_load_oxygen_id_maps(tmp_path, monkeypatch):
+    """The oxygen-id cache loaders read their own keys, lowercased, and degrade to {}."""
+    cache = tmp_path / "role_id_cache.json"
+    cache.write_text(json.dumps({
+        "roles_name_to_oxygen_id": {"BAC Admin": "990000010"},
+        "companies_name_to_oxygen_id": {"Contoso": 990000020},   # int coerced
+    }))
+    monkeypatch.setenv("APS_ROLE_CACHE", str(cache))
+    assert aps_mcp._load_role_oxygen_id() == {"bac admin": "990000010"}
+    assert aps_mcp._load_company_oxygen_id() == {"contoso": "990000020"}
+
+
+# ===========================================================================
+# get_data_connector_requests — captures role_oxygen_id for the Reviews tools
+# ===========================================================================
+
+@respx.mock
+async def test_data_connector_export_captures_oxygen_id():
+    """The admin export's admin_project_roles CSV carries role_oxygen_id (the Reviews
+    numeric autodeskId); get_data_connector_requests surfaces it as a name→oxygen map to
+    merge into the cache, alongside the existing role_id→name map."""
+    import io as _io, zipfile as _zip
+    account_id = aps_mcp._to_bare_id(HUB_ID)
+    req_id, job_id = "req-1", "job-1"
+    signed = "https://signed.example/autodesk_data_extract.zip"
+
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "admin_project_roles.csv",
+            "role_id,name,role_oxygen_id\n"
+            "uuid-admin,BAC Admin,990000010\n"
+            "uuid-empty,Empty Role,990000030\n",
+        )
+    zip_bytes = buf.getvalue()
+
+    respx.get(f"{BASE}/project/v1/hubs").mock(return_value=httpx.Response(200, json=HUB_RESPONSE))
+    respx.get(
+        f"{BASE}/data-connector/v1/accounts/{account_id}/requests/{req_id}/jobs"
+    ).mock(return_value=httpx.Response(200, json={
+        "results": [{"id": job_id, "status": "complete", "completionStatus": "success",
+                     "completedAt": "2026-07-11T00:00:00Z"}]
+    }))
+    respx.get(
+        f"{BASE}/data-connector/v1/accounts/{account_id}/jobs/{job_id}/data/autodesk_data_extract.zip"
+    ).mock(return_value=httpx.Response(200, json={"signedUrl": signed}))
+    respx.get(signed).mock(return_value=httpx.Response(200, content=zip_bytes))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("get_data_connector_requests", {"request_id": req_id})
+
+    data = _parse(result)
+    assert data["roles"]["uuid-admin"] == "BAC Admin"
+    assert data["roles_name_to_oxygen_id"] == {
+        "BAC Admin": "990000010", "Empty Role": "990000030",
+    }

@@ -109,12 +109,6 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 ## Tools reference
 
-> **Multiple hubs on the same region?** Every tool accepts an optional `hub_name` parameter (partial match, case-insensitive). Pass it whenever your account has more than one EMEA hub and you need to target a specific one — e.g. `hub_name: "My Company - EU Hub"`. Without it, the first hub returned for the region is used.
->
-> **Paste a project ID or ACC URL instead.** Every single-project tool also accepts an optional `project` parameter — a project **name**, a **project ID** (`b.xxxx` or bare UUID), or a **full ACC URL**. When it contains an ID/URL the tool pins the exact owning hub in one Admin-API call (no region guessing, no wrong-hub risk), so you never need `hub_name`. The old `project_name` parameter keeps working as a name-only alias. Use the standalone `resolve_project` tool to turn any of these into `{project_id, hub_id, hub_name, region, platform}` up front.
->
-> **Bulk-user tools (`project_names` arrays).** `bulk_assign_users`, `update_user_roles`, `bulk_assign_company_users`, and `remove_users_from_projects` resolve every entry the same way — each name, project ID, or ACC URL is matched across **all** hubs, so a project in a non-default EMEA hub resolves without `hub_name`. A genuine same-name collision across hubs raises a clear ambiguity error (pass an ID/URL or `hub_name` to disambiguate). The **account-side lookups fan across hubs too**: the "is this user in the account?" roster check (`bulk_assign_users`/`update_user_roles`), `bulk_assign_company_users`' company→users lookup, and `clone_user_access`' scan for the reference user's projects all search **every** hub's account, so a user or company living only in a non-default hub is still found without `hub_name` (pass `hub_name` to scope the search to one hub).
-
 ### Navigation & file exploration
 
 | Tool | What it does | Auth |
@@ -162,8 +156,6 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 ### Bulk user management
 
-All five bulk tools default to **`dry_run: true`** — Claude always shows a preview before making any changes. A timestamped audit CSV (`audit_<operation>_<timestamp>.csv`) is written on every live execution.
-
 | Tool | What it does | Auth |
 |------|-------------|------|
 | `bulk_assign_users` | Add a list of users to one or more projects with specified role(s) | 3-legged + `account:write` |
@@ -172,13 +164,7 @@ All five bulk tools default to **`dry_run: true`** — Claude always shows a pre
 | `clone_user_access` | Copy one user's full project access (all roles) to another user | 3-legged + `account:write` |
 | `bulk_assign_company_users` | Add all members of an ACC company to a project | 3-legged + `account:write` |
 
-> **Multiple roles per user.** `bulk_assign_users`, `update_user_roles`, and `bulk_assign_company_users` accept `default_role` (and each `role_overrides` value) as either a single role or a **list** — e.g. `default_role: ["BIM Coordinator", "EXT Architect"]` — assigning several roles to a user at once (the API's `roleIds` is an array). Each entry is a role **name** or a raw role **ID**. `clone_user_access` copies **all** of the reference user's roles per project.
-
-> **Role assignment (single async import).** On a live run, `bulk_assign_users` (and the shared core behind `clone_user_access` / `bulk_assign_company_users`) sends **one** `POST users:import` per project carrying the resolved `roleIds` — membership and roles are applied together in a single call (the import honours a valid role UUID, including a role no member holds yet). An **empty role is assigned by its name**: names resolve first from the roles members already hold, then from the `role_id_cache.json` name→UUID map (which lists unused roles too — see `APS_ROLE_CACHE` above), so you never handle a UUID. A name that resolves nowhere is still sent to ACC (the authority) and a **warning** flags it. The import is **asynchronous** (`202 + jobId`); the tool then polls the members list to confirm each user landed with their roles — confirmed → `success`, still queued → **`submitted`** (re-check shortly, not a failure). (`update_user_roles` uses the synchronous `PATCH .../users/{userId}` — the right call for changing an existing member's roles.)
-
 ### Hub-level directory & onboarding
-
-These operate on the **hub member/company directory** (account level), not on a single project — the onboarding step that must happen *before* a user can be assigned to a project. All four default to **`dry_run: true`**, write a timestamped audit CSV on live runs, batch imports at ≤50 per API call, and support `response_detail`. Distinct from the bulk tools above, which assign *already-existing* hub members to projects.
 
 | Tool | What it does | Auth |
 |------|-------------|------|
@@ -187,11 +173,7 @@ These operate on the **hub member/company directory** (account level), not on a 
 | `deactivate_hub_users` | Soft-offboard hub users (`status: inactive`; the API has no hard delete) | 2-legged (`account:write`) |
 | `deactivate_hub_companies` | Deactivate companies in the hub directory (`status: inactive`) | 2-legged (`account:write`) |
 
-> **Onboarding, not project assignment.** `bulk_add_hub_users` creates the hub account; `bulk_assign_users` grants project access. A typical joiner flow is: `bulk_add_hub_companies` (if the company is new) → `bulk_add_hub_users` → `bulk_assign_users`. `bulk_add_hub_users` resolves `company_name` against the hub directory and errors if the company doesn't exist yet, so create it first.
-
 ### Bulk folder operations
-
-Three composable primitives for reorganising folder structures at scale (e.g. standardising the subfolders across hundreds of building folders in one project). They are deliberately **dumb and general** — a Claude instance does the orchestration and judgment (audit → decide what to create/delete → surface anomalies and stuck files); no reorg policy is baked into the tools. The two mutating tools default to **`dry_run: true`**.
 
 | Tool | What it does | Auth |
 |------|-------------|------|
@@ -202,11 +184,7 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 | `bulk_move_files` | Batch-move files into new folders (no re-upload); idempotent (`already_there`); C4R models that 403 are reported `skipped_unmovable` | 3-legged |
 | `bulk_move_folders` | Batch-move folders (with contents) under new parents; idempotent (`already_there`) | 3-legged |
 
-> **File safety is absolute.** `bulk_delete_folders` applies the same subtree-file check as the single `delete_folder` and only ever soft-deletes (admin-reversible). The `skipped_has_files` rows are the "stuck files" (typically cloud-workshared Revit/C4R models the API can't move) for a human to relocate in the ACC UI. Both mutating tools support `continue_on_error` (default true), a `max_concurrency` cap (default 8), and survive a mid-batch token expiry (a 401 triggers a one-time token refresh).
-
 #### Output verbosity — `response_detail`
-
-`bulk_move_files`, `bulk_move_folders`, `bulk_delete_folders`, `bulk_list_folder_contents`, and `audit_folder_naming_standards` take a `response_detail` parameter that shapes the returned `results` array **without changing what the tool does** (the `summary` counts are always computed before filtering and stay accurate at every level):
 
 | Value | Returns |
 |-------|---------|
@@ -214,15 +192,7 @@ Three composable primitives for reorganising folder structures at scale (e.g. st
 | `changes` *(default)* | Summary + only the rows that need attention — moves keep `error` / `skipped_unmovable` / `not_found`; deletes keep `skipped_has_files` / `error`; the contents audit keeps only folders with files or subfolders; the naming-standards audit keeps only folders with no standard. The success/no-op noise (`moved`, `already_there`, `deleted`, empty folders, folders that already have a standard) is dropped. |
 | `summary` | Only the summary counts — the per-item `results` array is omitted. **Failures are never lost:** any locked/unmovable/stuck row (or no-standard folder) is still surfaced under a small `failures` array (and the contents audit's separate `errors` array is always present). |
 
-`changes` is the default because in a typical batch almost everything succeeds silently and only the locked/conflict cases need action — returning just those is the bulk of the token saving. Pass `response_detail: "full"` to get the old echo-everything behaviour.
-
-> **Lean audits — `fields`.** `bulk_list_folder_contents` also takes `fields: ["files", "subfolders"]` to restrict each folder row to just those sections. When `fields` is given, file entries are returned **lean** (`id` + `name` only, dropping `last_modified` / `created_by`) — ideal when you only need URNs to feed straight into a `bulk_move_files` call.
-
-> **Naming conventions in one pass — `include_naming_standard`.** The `folders/{f}/contents` payload already carries each subfolder's assigned naming standard, so `bulk_list_folder_contents` can surface it for free: pass `include_naming_standard: true` and every subfolder row gains a `naming_standard_ids` list (empty = none). Use this when you need both the listing **and** the conventions in a single sweep, instead of also calling `audit_folder_naming_standards` (which would re-fetch the same endpoint). Reach for `audit_folder_naming_standards` when you want a *recursive*, project-wide roll-up grouped by standard; reach for this flag when you're already listing folders and just want the convention tagged on.
-
 ### Issues
-
-Read and create ACC **Issues** (the Issues module). All five are user-scoped (3-legged) and hit the `construction/issues/v1` API with a fixed `x-ads-region: EMEA` header. `create_issue` **posts immediately** (no `dry_run`). The API uses different names than the UI: a *category* is a **type** and a UI *type* is a **subtype** — `list_issue_types` returns both. Not compatible with BIM 360 projects; sheet-related (Build Sheets) issues are not returned.
 
 | Tool | What it does | Auth |
 |------|-------------|------|
@@ -234,15 +204,9 @@ Read and create ACC **Issues** (the Issues module). All five are user-scoped (3-
 | `list_issue_attribute_definitions` | List project custom fields (id, title, dataType, dropdown options) | 3-legged |
 | `list_issue_attribute_mappings` | List which custom fields are assigned to which categories/types | 3-legged |
 
-> **Getting a valid `issue_subtype_id`.** Call `list_issue_types` first; each category carries a `subtypes` array whose `id` is what `create_issue` needs. Assignee, watcher, root-cause and location IDs are **not** discoverable through the Issues API — per Autodesk, extract them with the Data Connector.
-
-> **Addressing an issue.** `get_issue` and `update_issue` accept either the issue UUID (`issue_id`) or the user-facing number (`display_id`, e.g. 191), so you can say "mark issue 191 closed". Note the ACC Issues API (v1) has **no delete endpoint** — issues can only be deleted in the ACC UI (`deleted` is read-only via the API), so there is no `delete_issue` tool. `list_issues` can still surface UI-deleted issues via `deleted: true`.
-
 ---
 
 ### Approval workflows
-
-Read and create ACC **approval workflows** (the Reviews module — the reusable step/reviewer/duration definitions that drive file reviews). All are user-scoped (3-legged) and hit the `construction/reviews/v1` API with a fixed `x-ads-region: EMEA` header. Built for provisioning workflows in bulk — e.g. reading an Excel template of workflows and pushing them into ACC. Not compatible with BIM 360 projects.
 
 | Tool | What it does | Auth |
 |------|-------------|------|
@@ -250,10 +214,6 @@ Read and create ACC **approval workflows** (the Reviews module — the reusable 
 | `get_workflow` | Get one workflow by `workflow_id` (UUID) or `name` | 3-legged |
 | `create_workflow` | Create a workflow — `name` + `steps` required; posts immediately (no `dry_run`) | 3-legged (`data:write`) |
 | `bulk_create_workflows` | Create many workflows from a list of specs (the Excel batch); `dry_run` default, audit CSV, bounded concurrency, per-row results | 3-legged (`data:write`) |
-
-> **Reviewers are given by name, resolved to Autodesk IDs.** The Reviews API identifies every reviewer/approver by `autodeskId`. `create_workflow` / `bulk_create_workflows` accept friendly `reviewer_users` (names or emails), `reviewer_roles` (role names) and `reviewer_companies` (company names) per step; raw `autodeskId` values also pass through, and an unresolved reference fails the row loudly. **Users** resolve from project members — `list_project_members` / `list_project_roles` now include an `autodesk_id` field so you can see them. **Roles and companies** are trickier: they use a separate numeric ID space that Autodesk exposes *no* lookup API for, so the tools harvest role/company name→ID from the candidates on the project's **existing** workflows. A role or company never used in any workflow yet can't be resolved by name — read one that does with `get_workflow` and pass the raw numeric `autodeskId`.
-
-> **Single vs bulk.** `create_workflow` posts one workflow immediately (like `create_issue`). `bulk_create_workflows` is the previewable batch: it resolves the reviewer directory once, defaults to `dry_run=true` (`would_create`), maps a name collision to `already_exists` (409) per row, and writes a timestamped audit CSV on a live run. Scope is list + get + create — the Reviews API exposes no workflow update/delete route.
 
 ---
 
@@ -601,7 +561,7 @@ Read workflows.xlsx and push every row into "Northgate Tower" (preview first, th
 - **No hard delete for hub users or companies** — the HQ API only supports soft-offboarding, so `deactivate_hub_users` / `deactivate_hub_companies` set `status: inactive` rather than removing the record. Deactivated entries remain visible (as inactive) in the account directory.
 - **Hub onboarding can't grant account-admin** — `bulk_add_hub_users` sets each user's company and (optional) default role, but the underlying `users/import` endpoint cannot elevate someone to **account administrator**; do that in the ACC Account Admin UI.
 - **Issues can't be deleted via the API** — the ACC Issues API (v1) exposes no delete route: `deleted` is read-only on the update endpoint (a `PATCH {"deleted": true}` returns 400) and a raw HTTP DELETE is rejected (403). There is therefore no `delete_issue` tool — issues can only be deleted in the ACC UI. `list_issues` can still surface UI-deleted issues via `deleted: true`.
-- **Empty project roles are invisible; role assignment isn't pre-checked** — ACC exposes no project-roles catalog endpoint, so `list_project_roles` (and role-name resolution in the bulk-user tools) is derived from the roles *current members* hold — a role assigned to nobody yet doesn't appear. Because of this the bulk-user tools do **not** pre-reject a role: a value that resolves to a member-held role is used as-is, and any other value is passed through to the ACC API as a raw **role ID** for it to validate on import (a bogus value fails per-user at the API). To assign the first person to an **empty/newly-created** role, pass that role's **ID** rather than its name. The reliable way to discover the ID of a role nobody holds yet is a **Data Connector `admin` export**, which contains the *full* project-roles catalog (not just member-held roles): call `create_role_data_export` for the project, then `get_data_connector_requests` with the returned `request_id` — it polls the job and returns a `{role_id: role_name}` map including empty roles. (Data Connector is rate-limited to 24 jobs/24h per hub, so grab every `role_id` you need from one export and reuse them.) Alternatively, an ID can come from `list_project_roles` on a project where the role *does* have a member, or from `get_workflow` candidates.
+- **Empty project roles are invisible; role assignment isn't pre-checked** — ACC exposes no project-roles catalog endpoint, so `list_project_roles` (and role-name resolution in the bulk-user tools) is derived from the roles *current members* hold — a role assigned to nobody yet doesn't appear. Because of this the bulk-user tools do **not** pre-reject a role: a value that resolves to a member-held role is used as-is, and any other value is passed through to the ACC API as a raw **role ID** for it to validate on import (a bogus value fails per-user at the API). To assign the first person to an **empty/newly-created** role, pass that role's **ID** rather than its name. The reliable way to discover the ID of a role nobody holds yet is a **Data Connector `admin` export**, which contains the *full* project-roles catalog (not just member-held roles): call `create_role_data_export` for the project, then `get_data_connector_requests` with the returned `request_id` — it polls the job and returns a `{role_id: role_name}` map including empty roles. (Data Connector is rate-limited to 24 jobs/24h per hub, so grab every `role_id` you need from one export and reuse them.) Alternatively, an ID can come from `list_project_roles` on a project where the role *does* have a member, or from `get_workflow` candidates. The same export also carries each role's `role_oxygen_id` (a *separate numeric* ID) which `get_data_connector_requests` returns as `roles_name_to_oxygen_id` — the approval-workflow tools use this (cached in `role_id_cache.json`) to resolve reviewer roles by name, including empty ones (see the Approval workflows section).
 
 ---
 

@@ -18,6 +18,9 @@ audit_*.csv
 todo.md
 test_plan_*.md
 
+# Local-only env values (real project IDs / user emails — never commit)
+*.local.md
+
 # Archived / scratch files
 archive/
 
