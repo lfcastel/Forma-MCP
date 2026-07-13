@@ -96,7 +96,7 @@ Add the server to your Claude Code user config at `~/.claude.json`. Adjust the p
 }
 ```
 
-`APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). Without the env var the server also looks for `role_id_cache.json` next to `aps_mcp.py`, then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
+`APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). The same file is read in reverse (UUID → name) to **label role columns in `export_permission_matrix`** when the permissions endpoint returns a role with no inline name. Without the env var the server also looks for `role_id_cache.json` next to `aps_mcp.py`, then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
 
 **Windows paths** — use forward slashes or escaped backslashes:
 ```
@@ -144,7 +144,7 @@ Restart Claude Code after saving, then run `claude mcp list` — `aps` should ap
 
 | Tool | What it does | Auth |
 |------|-------------|------|
-| `export_permission_matrix` | Export a full permission matrix for a folder tree | 3-legged |
+| `export_permission_matrix` | Export a full permission matrix for a folder tree (role columns labelled from the permissions endpoint, falling back to `role_id_cache.json` for nameless/empty roles) | 3-legged |
 | `apply_permission_changes` | Apply batched permission changes to folders | 3-legged |
 
 ### Role & data export

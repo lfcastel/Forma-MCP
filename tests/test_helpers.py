@@ -278,3 +278,35 @@ async def test_request_with_retry_raises_after_max_retries():
              patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(aps_mcp.APSQuotaError):
                 await aps_mcp._request_with_retry(client, "get", "https://example.com", max_retries=2)
+
+
+# ---------------------------------------------------------------------------
+# _load_role_id_to_name  (inverse cache map used to LABEL roles in
+# export_permission_matrix — same role_id_cache.json as the name->id resolvers)
+# ---------------------------------------------------------------------------
+
+def test_load_role_id_to_name_inverts_cache(tmp_path, monkeypatch):
+    cache = tmp_path / "role_id_cache.json"
+    cache.write_text(json.dumps({
+        "roles_name_to_id": {"BAC BIM Coordinator": "uuid-bim", "BAC Reviewer": "uuid-rev"}
+    }))
+    monkeypatch.setenv("APS_ROLE_CACHE", str(cache))
+    # id -> name, original display casing preserved (not lowercased like name->id)
+    assert aps_mcp._load_role_id_to_name() == {
+        "uuid-bim": "BAC BIM Coordinator",
+        "uuid-rev": "BAC Reviewer",
+    }
+
+
+def test_load_role_id_to_name_missing_file_is_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("APS_ROLE_CACHE", str(tmp_path / "does_not_exist.json"))
+    assert aps_mcp._load_role_id_to_name() == {}
+
+
+def test_load_role_id_to_name_drops_falsy_entries(tmp_path, monkeypatch):
+    cache = tmp_path / "role_id_cache.json"
+    cache.write_text(json.dumps({
+        "roles_name_to_id": {"Good Role": "uuid-good", "": "uuid-noname", "No Id": ""}
+    }))
+    monkeypatch.setenv("APS_ROLE_CACHE", str(cache))
+    assert aps_mcp._load_role_id_to_name() == {"uuid-good": "Good Role"}
