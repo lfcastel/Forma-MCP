@@ -1752,6 +1752,28 @@ def _load_role_name_to_id() -> dict[str, str]:
     return out
 
 
+def _load_role_id_to_name() -> dict[str, str]:
+    """Inverse of `_load_role_name_to_id`: role UUID → display name (original casing kept),
+    from the cache's ``roles_name_to_id`` map. Used to LABEL role IDs in
+    export_permission_matrix when the permissions endpoint returns a role subject with no
+    inline name — the same Data Connector cache the assign/workflow resolvers use, so
+    labeling stays consistent with resolution. Read fresh each call; returns {} on a
+    missing/unreadable/malformed file so it degrades to the inline name / id placeholder."""
+    path = _role_cache_path()
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for name, rid in (data.get("roles_name_to_id") or {}).items():
+        if name and rid:
+            out[str(rid)] = str(name)
+    return out
+
+
 def _load_oxygen_map(key: str) -> dict[str, str]:
     """Load a lowercase name → oxygen-id map from the role cache under ``key``.
 
@@ -4202,7 +4224,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 return ",".join(sorted(s))
 
             # Collect ROLE subjects only (not users or companies) in encounter order.
-            # Names come directly from the permissions response.
+            # Names come from the permissions response; a nameless role (e.g. empty/unused)
+            # falls back to the shared role_id_cache.json (id -> name) — the same Data
+            # Connector cache the assign/workflow resolvers use — before the id placeholder.
+            role_id_to_name = _load_role_id_to_name()
             subject_order: list[str] = []
             subject_meta: dict[str, dict] = {}
             for fd in folder_data:
@@ -4211,7 +4236,10 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     stype = p.get("subjectType", "")
                     if not sid or stype != "ROLE" or sid in subject_meta:
                         continue
-                    name_val = p.get("name") or p.get("subjectName") or p.get("displayName") or f"[{stype} {sid[:8]}]"
+                    name_val = (
+                        p.get("name") or p.get("subjectName") or p.get("displayName")
+                        or role_id_to_name.get(sid) or f"[{stype} {sid[:8]}]"
+                    )
                     subject_meta[sid] = {"id": sid, "type": stype, "name": name_val}
                     subject_order.append(sid)
 
