@@ -31,6 +31,16 @@ def _fast_assign_poll(monkeypatch):
     monkeypatch.setattr(aps_mcp, "_ASSIGN_POLL_DELAY", 0, raising=False)
     monkeypatch.setattr(aps_mcp, "_ASSIGN_POLL_ATTEMPTS", 3, raising=False)
 
+
+@pytest.fixture(autouse=True)
+def _no_rate_pacing(monkeypatch):
+    """Turn the client-side token buckets off so mocked requests never sleep and
+    tests that assert on `asyncio.sleep` see only the retry/back-off sleeps. The
+    rate-limiter tests re-enable pacing explicitly against a fresh bucket registry."""
+    import aps_mcp
+    monkeypatch.setattr(aps_mcp, "_RATE_LIMITING_ENABLED", False)
+    monkeypatch.setattr(aps_mcp, "_rate_buckets", {})
+
 # ---------------------------------------------------------------------------
 # Shared fake IDs used across all test modules
 # ---------------------------------------------------------------------------
