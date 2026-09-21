@@ -52,6 +52,12 @@ DEFAULT_PRODUCTS = [
 _ASSIGN_POLL_ATTEMPTS = 10
 _ASSIGN_POLL_DELAY = 3.0
 
+# Recursive tree walks (find_files, list_all_files, find_folder, find_recent_activity,
+# export_permission_matrix) fan out one listing per folder. This caps how many
+# listings are in flight at once — a burst/connection guard; the per-endpoint
+# token buckets (`_pace_request`) do the actual rate pacing.
+_WALK_CONCURRENCY = 8
+
 # ---------------------------------------------------------------------------
 # Token persistence
 # ---------------------------------------------------------------------------
@@ -322,18 +328,6 @@ def _safe_int(value: "Any") -> "int | None":
         return None
 
 
-def _is_quota_429(r: "httpx.Response") -> bool:
-    """Whether a 429 is a hard quota limit (vs a transient rate spike).
-
-    APS quota errors carry wording like `"developerMessage": "Quota limit
-    exceeded."` — retrying within seconds won't help, so we fail fast on these.
-    """
-    try:
-        return "quota" in json.dumps(r.json()).lower()
-    except Exception:
-        return False
-
-
 def _quota_message(r: "httpx.Response") -> str:
     """Build a clear, user-facing message for a 429 response."""
     detail = ""
@@ -349,8 +343,191 @@ def _quota_message(r: "httpx.Response") -> str:
         parts.append(str(detail))
     if retry_after:
         parts.append(f"Retry-After: {retry_after}s.")
-    parts.append("The MCP server stopped instead of hanging — please wait and try again later.")
+    parts.append(
+        "The MCP server waited out the Retry-After period and retried, but the "
+        "limit persisted — please wait a minute and try again."
+    )
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Client-side rate limiting (APS Data Management per-endpoint limits)
+# ---------------------------------------------------------------------------
+#
+# APS enforces Data Management rate limits *per endpoint, per client ID, per
+# minute* (https://aps.autodesk.com/en/docs/data/v2/overview/rate-limits/).
+# A concurrency cap alone doesn't respect that (8 in-flight requests at ~200 ms
+# each is ~2,400 rpm against a 300 rpm limit), so every request the dispatch
+# client sends is paced through a token bucket keyed by its normalised
+# endpoint. The buckets refill at the published limit scaled by
+# `_RATE_LIMIT_HEADROOM` (other apps/sessions on the same client ID share the
+# real bucket) and allow a burst of ~10 s worth of requests. A 429 response
+# empties that endpoint's bucket for the `Retry-After` period so concurrent
+# waiters hold off too, instead of each hitting the wall in turn.
+#
+# Limits from the published table (requests/minute). Paths are the URL path
+# with `/project/v1` / `/data/v1` stripped and every id segment replaced by
+# `{id}`. Data Management endpoints not listed here get `_DM_DEFAULT_LIMIT`
+# (the table's floor). Non-Data-Management APIs (ACC Admin, HQ, Issues,
+# Reviews, BIM 360 Docs) publish their limits separately and are not paced.
+
+_DM_ENDPOINT_LIMITS: dict[tuple[str, str], int] = {
+    ("GET", "/hubs"): 50,
+    ("GET", "/hubs/{id}"): 50,
+    ("GET", "/hubs/{id}/projects"): 50,
+    ("GET", "/hubs/{id}/projects/{id}"): 50,
+    ("GET", "/hubs/{id}/projects/{id}/hub"): 50,
+    ("GET", "/hubs/{id}/projects/{id}/topFolders"): 300,
+    ("GET", "/projects/{id}/downloads/{id}"): 300,
+    ("GET", "/projects/{id}/jobs/{id}"): 300,
+    ("POST", "/projects/{id}/downloads"): 50,
+    ("POST", "/projects/{id}/storage"): 300,
+    ("GET", "/projects/{id}/folders/{id}"): 300,
+    ("GET", "/projects/{id}/folders/{id}/contents"): 300,
+    ("GET", "/projects/{id}/folders/{id}/parent"): 50,
+    ("GET", "/projects/{id}/folders/{id}/refs"): 50,
+    ("GET", "/projects/{id}/folders/{id}/relationships/links"): 50,
+    ("GET", "/projects/{id}/folders/{id}/relationships/refs"): 50,
+    ("GET", "/projects/{id}/folders/{id}/search"): 300,
+    ("POST", "/projects/{id}/folders"): 50,
+    ("POST", "/projects/{id}/folders/{id}/relationships/refs"): 50,
+    ("PATCH", "/projects/{id}/folders/{id}"): 50,
+    ("GET", "/projects/{id}/items/{id}"): 300,
+    ("GET", "/projects/{id}/items/{id}/parent"): 50,
+    ("GET", "/projects/{id}/items/{id}/refs"): 300,
+    ("GET", "/projects/{id}/items/{id}/relationships/refs"): 50,
+    ("GET", "/projects/{id}/items/{id}/relationships/links"): 50,
+    ("GET", "/projects/{id}/items/{id}/tip"): 50,
+    ("GET", "/projects/{id}/items/{id}/versions"): 800,
+    ("POST", "/projects/{id}/items"): 50,
+    ("POST", "/projects/{id}/items/{id}/relationships/refs"): 50,
+    ("PATCH", "/projects/{id}/items/{id}"): 50,
+    ("GET", "/projects/{id}/versions/{id}"): 300,
+    ("GET", "/projects/{id}/versions/{id}/downloadFormats"): 50,
+    ("GET", "/projects/{id}/versions/{id}/downloads"): 50,
+    ("GET", "/projects/{id}/versions/{id}/item"): 50,
+    ("GET", "/projects/{id}/versions/{id}/refs"): 50,
+    ("GET", "/projects/{id}/versions/{id}/relationships/links"): 50,
+    ("GET", "/projects/{id}/versions/{id}/relationships/refs"): 50,
+    ("POST", "/projects/{id}/versions"): 300,
+    ("POST", "/projects/{id}/versions/{id}/relationships/refs"): 50,
+    ("POST", "/projects/{id}/versions/{id}/relationships/links"): 50,
+    ("PATCH", "/projects/{id}/versions/{id}"): 50,
+    ("PATCH", "/projects/{id}/versions/{id}/relationships/links/{id}"): 50,
+    ("POST", "/projects/{id}/commands"): 300,
+}
+_DM_DEFAULT_LIMIT = 50
+
+# Fraction of the published limit we allow ourselves (the bucket is shared by
+# every session using this client ID). Overridable via APS_RATE_HEADROOM.
+_RATE_LIMIT_HEADROOM = float(os.environ.get("APS_RATE_HEADROOM", "0.8"))
+# Master switch — tests turn pacing off (conftest) so mocked calls never sleep.
+_RATE_LIMITING_ENABLED = os.environ.get("APS_RATE_LIMITING", "1") != "0"
+# Longest single wait we'll honour from a Retry-After header, in seconds.
+_RETRY_AFTER_CAP = 60
+
+# Segments that are always followed by an id in Data Management URLs.
+_DM_ID_PARENTS = frozenset({
+    "hubs", "projects", "folders", "items", "versions", "downloads", "jobs", "links",
+})
+
+
+def _dm_endpoint_key(method: str, url: str) -> "tuple[str, str] | None":
+    """Normalise a request into the `(METHOD, /path/with/{id}s)` key used by the
+    rate-limit table, or None when the URL isn't a Data Management endpoint
+    (those aren't paced). Ids are recognised positionally: any segment that
+    follows `hubs`, `projects`, `folders`, … is an id, so URN-shaped ids with
+    colons/dots are handled without needing to parse them."""
+    path = urllib.parse.urlsplit(url).path
+    for prefix in ("/project/v1", "/data/v1"):
+        if path.startswith(prefix + "/"):
+            path = path[len(prefix):]
+            break
+    else:
+        return None
+    out: list[str] = []
+    prev = ""
+    for seg in path.strip("/").split("/"):
+        out.append("{id}" if prev in _DM_ID_PARENTS else seg)
+        prev = seg
+    return method.upper(), "/" + "/".join(out)
+
+
+class _TokenBucket:
+    """Token bucket that lets waiters *reserve* a token (balance may go negative)
+    and sleep for exactly as long as their reservation is in the future, so N
+    queued callers are spaced evenly at the refill rate instead of all waking at
+    once. `penalize(seconds)` drains the bucket so nobody sends for that long."""
+
+    def __init__(self, rate_per_min: float, burst_seconds: float = 10.0):
+        self.rate = rate_per_min / 60.0                       # tokens per second
+        self.capacity = max(1.0, self.rate * burst_seconds)
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self.blocked_until = 0.0
+
+    def _refill(self, now: float) -> None:
+        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+
+    def reserve(self) -> float:
+        """Take one token; return the seconds the caller must wait before sending."""
+        now = time.monotonic()
+        self._refill(now)
+        self.tokens -= 1.0
+        wait = max(0.0, -self.tokens / self.rate)
+        return max(wait, self.blocked_until - now)
+
+    def penalize(self, seconds: float) -> None:
+        """A 429 came back: stop sending on this endpoint for `seconds`."""
+        now = time.monotonic()
+        self._refill(now)
+        self.tokens = min(self.tokens, 0.0)
+        self.blocked_until = max(self.blocked_until, now + seconds)
+
+
+_rate_buckets: dict[tuple[str, str], _TokenBucket] = {}
+
+
+def _bucket_for(key: tuple[str, str]) -> _TokenBucket:
+    bucket = _rate_buckets.get(key)
+    if bucket is None:
+        limit = _DM_ENDPOINT_LIMITS.get(key, _DM_DEFAULT_LIMIT)
+        bucket = _rate_buckets[key] = _TokenBucket(limit * _RATE_LIMIT_HEADROOM)
+    return bucket
+
+
+async def _pace_request(request: httpx.Request) -> None:
+    """httpx `request` event hook: wait for the endpoint's token before sending."""
+    if not _RATE_LIMITING_ENABLED:
+        return
+    key = _dm_endpoint_key(request.method, str(request.url))
+    if key is None:
+        return
+    wait = _bucket_for(key).reserve()
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+async def _note_rate_limited(response: httpx.Response) -> None:
+    """httpx `response` event hook: on a 429, drain the endpoint's bucket for the
+    Retry-After period so concurrent callers back off together."""
+    if response.status_code != 429 or not _RATE_LIMITING_ENABLED:
+        return
+    key = _dm_endpoint_key(response.request.method, str(response.request.url))
+    if key is None:
+        return
+    wait = _safe_int(response.headers.get("Retry-After")) or 10
+    _bucket_for(key).penalize(min(wait, _RETRY_AFTER_CAP))
+
+
+def _make_client(**kwargs) -> httpx.AsyncClient:
+    """The AsyncClient every tool dispatch uses: all requests are paced through
+    the per-endpoint buckets, and every 429 is fed back into them."""
+    return httpx.AsyncClient(
+        event_hooks={"request": [_pace_request], "response": [_note_rate_limited]},
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -525,13 +702,15 @@ async def _walk_project_files(
     (best-effort walk). Shared by `find_files` (substring predicate) and
     `list_all_files` (no predicate)."""
     results: list[dict] = []
+    sem = asyncio.Semaphore(_WALK_CONCURRENCY)
 
     async def walk(folder_id: str, path: str, depth: int):
         if depth > max_depth:
             return
-        contents = await get_all_folder_contents(
-            client, project_id, folder_id, headers, raise_on_error=False
-        )
+        async with sem:
+            contents = await get_all_folder_contents(
+                client, project_id, folder_id, headers, raise_on_error=False
+            )
         tasks = []
         for item in contents:
             a = item.get("attributes", {})
@@ -565,11 +744,16 @@ async def _request_with_retry(
     on_unauthorized=None,
     **kwargs,
 ) -> httpx.Response:
-    """Issue an HTTP request, retrying transient 429s/503s with a short, capped backoff.
+    """Issue an HTTP request, retrying 429s (honouring `Retry-After`) and transient 503s.
 
-    Fails fast with a clear `APSQuotaError` when APS signals a hard quota limit
-    (retrying within seconds can't clear it) or when the retries are exhausted —
-    so the caller surfaces a "can't proceed" message instead of hanging.
+    A 429 is APS's *rate-limit* signal — its body reads "Quota limit exceeded."
+    even for an ordinary per-minute rate limit — so it is always worth waiting
+    out: we sleep for the `Retry-After` the server asks for (capped at
+    `_RETRY_AFTER_CAP`, falling back to a short exponential back-off when the
+    header is missing) and retry. Only once `max_retries` are exhausted do we
+    raise `APSQuotaError`, so the caller surfaces a clear "can't proceed" message
+    rather than an opaque exception. (The client-side buckets in `_pace_request`
+    exist to make this path rare.)
 
     When `on_unauthorized` is given (an async callback), a single 401 triggers it
     once — typically to refresh an expired token by mutating the shared headers
@@ -591,14 +775,13 @@ async def _request_with_retry(
             continue
         if r.status_code != 429:
             return r
-        # Hard quota, or out of retries → stop now with a clear message.
-        if _is_quota_429(r) or attempt == max_retries:
+        if attempt == max_retries:
             raise APSQuotaError(_quota_message(r), _safe_int(r.headers.get("Retry-After")))
-        # Transient rate spike → brief, capped back-off, then retry.
+        # Rate limited → wait the full period APS asks for, then retry.
         wait = _safe_int(r.headers.get("Retry-After"))
         if wait is None:
-            wait = min(2 ** attempt, 10)
-        await asyncio.sleep(min(wait, 10))
+            wait = min(5 * 2 ** attempt, 30)
+        await asyncio.sleep(min(max(wait, 0), _RETRY_AFTER_CAP))
     return r  # unreachable; keeps type-checkers happy
 
 
@@ -1439,22 +1622,30 @@ async def _walk_folder_tree(
     hdrs: dict,
     max_depth: int,
     depth: int = 0,
+    sem: "asyncio.Semaphore | None" = None,
 ) -> list[dict]:
-    perms = await _get_folder_perms(client, project_id, folder_id, hdrs)
+    """Collect every folder's permissions in a subtree. `sem` bounds how many
+    folders are being fetched at once across the whole recursion (created at
+    the root when not given)."""
+    if sem is None:
+        sem = asyncio.Semaphore(_WALK_CONCURRENCY)
+    async with sem:
+        perms = await _get_folder_perms(client, project_id, folder_id, hdrs)
     results = [{"folder_id": folder_id, "folder_path": folder_path, "permissions": perms}]
 
     if depth >= max_depth:
         return results
 
-    contents = await get_all_folder_contents(
-        client, project_id, folder_id, hdrs, raise_on_error=False
-    )
+    async with sem:
+        contents = await get_all_folder_contents(
+            client, project_id, folder_id, hdrs, raise_on_error=False
+        )
 
     tasks = [
         _walk_folder_tree(
             client, project_id, bare_id, item["id"],
             f"{folder_path}/{_folder_name(item['attributes'])}",
-            hdrs, max_depth, depth + 1,
+            hdrs, max_depth, depth + 1, sem,
         )
         for item in contents
         if item["type"] == "folders"
@@ -3535,7 +3726,7 @@ async def call_tool(name: str, arguments: dict) -> "list[TextContent] | CallTool
 async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
     token = await get_access_token()
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with _make_client(timeout=30) as client:
         hdrs = auth_headers(token)
 
         if name == "list_hubs":
@@ -3996,12 +4187,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 else datetime.now(timezone.utc) - timedelta(days=7)
             )
 
+            walk_sem = asyncio.Semaphore(_WALK_CONCURRENCY)
+
             async def collect_recent(folder_id: str, collected: list, depth: int = 0):
                 if len(collected) >= limit or depth > 6:
                     return
-                contents = await get_all_folder_contents(
-                    client, project_id, folder_id, hdrs, raise_on_error=False
-                )
+                async with walk_sem:
+                    contents = await get_all_folder_contents(
+                        client, project_id, folder_id, hdrs, raise_on_error=False
+                    )
                 tasks = []
                 for item in contents:
                     a = item.get("attributes", {})
@@ -4099,13 +4293,15 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             )
 
             results: list[dict] = []
+            walk_sem = asyncio.Semaphore(_WALK_CONCURRENCY)
 
             async def search_folders(folder_id: str, path: str, depth: int = 0):
                 if depth > 8:
                     return
-                contents = await get_all_folder_contents(
-                    client, project_id, folder_id, hdrs, raise_on_error=False
-                )
+                async with walk_sem:
+                    contents = await get_all_folder_contents(
+                        client, project_id, folder_id, hdrs, raise_on_error=False
+                    )
                 tasks = []
                 for item in contents:
                     if item["type"] != "folders":
