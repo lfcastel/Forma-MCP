@@ -75,6 +75,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
+
 ---
 
 ## Configuration in Claude Code

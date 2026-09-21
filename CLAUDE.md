@@ -29,6 +29,8 @@ python -m pytest tests/test_bulk_tools.py::test_bulk_assign_dry_run_returns_woul
 
 `pytest.ini` sets `asyncio_mode = auto` and `testpaths = tests`.
 
+`requirements.txt` pins **`mcp>=1.0.0,<2`**: the MCP Python SDK 2.0 dropped the low-level `Server.list_tools()`/`call_tool()` decorators the server uses (import fails with `'Server' object has no attribute 'list_tools'`). CI does a fresh install, so an unpinned `mcp` breaks every PR; don't lift the pin without porting to the 2.x API.
+
 ## Architecture
 
 ### Authentication
