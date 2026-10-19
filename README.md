@@ -6,7 +6,9 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) stdio server 
 
 ## Prerequisites
 
-- Python 3.11+
+- [uv](https://docs.astral.sh/uv/), which provides `uvx` to install and run the server (it fetches a suitable Python 3.11+ itself). No admin rights needed:
+  - Windows: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
+  - macOS / Linux: `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed
 - An **APS app** with a Client ID and Client Secret ([create one here](https://aps.autodesk.com/myapps))
 - An Autodesk account with **Account Admin** access to your ACC hub
@@ -29,7 +31,7 @@ Used for account-level operations that don't require a user context: listing all
 
 Used for all project, folder, and permission operations — the API acts on behalf of *you*, the logged-in Autodesk user.
 
-- **How it works:** On first use, a browser window opens automatically. You log in with your Autodesk account and grant consent. The token is cached in `tokens.json` and refreshed automatically. You only need to re-authorize after ~14 days of inactivity.
+- **How it works:** On first use, a browser window opens automatically. You log in with your Autodesk account and grant consent. The token is cached in `~/.forma-mcp/tokens.json` (see [Data directory](#data-directory)) and refreshed automatically. You only need to re-authorize after ~14 days of inactivity.
 - **Required scopes:** `data:read`, `account:read`, `account:write` (for bulk user management tools)
 - **When it's used:** All navigation, folder, and permission tools; all bulk user write operations
 
@@ -59,12 +61,66 @@ Without this step, API calls will return 403 errors even with valid credentials.
 
 ---
 
-## Installation
+## Installation & configuration in Claude Code
+
+No clone or virtualenv needed: `uvx` installs the server straight from this repo, pinned to a release tag, and runs it in an isolated environment. Register it with Claude Code in one command:
+
+```bash
+claude mcp add aps --scope user \
+  -e APS_CLIENT_ID=your_client_id \
+  -e APS_CLIENT_SECRET=your_client_secret \
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.1.0 forma-mcp
+```
+
+Or add it by hand to `~/.claude.json`:
+
+```json
+"mcpServers": {
+  "aps": {
+    "type": "stdio",
+    "command": "uvx",
+    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.1.0", "forma-mcp"],
+    "env": {
+      "APS_CLIENT_ID": "your_client_id",
+      "APS_CLIENT_SECRET": "your_client_secret"
+    }
+  }
+}
+```
+
+Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `aps` should show as connected. The first tool call opens a browser for the Autodesk login.
+
+**Upgrading:** change the tag (`@v0.1.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
+
+> **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
+
+### Optional environment variables
+
+Add these to the `-e` flags or the `env` block as needed.
+
+`FORMA_MCP_HOME` (optional, default `~/.forma-mcp`) is the per-user data directory; see [Data directory](#data-directory).
+
+`APS_RATE_HEADROOM` (optional, default `0.8`) is the fraction of each published Data Management rate limit the server allows itself — lower it if the same APS client ID is shared by several people/sessions; `APS_RATE_LIMITING=0` switches the client-side pacing off entirely (see Known Limitations).
+
+`APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). The same file is read in reverse (UUID → name) to **label role columns in `export_permission_matrix`** when the permissions endpoint returns a role with no inline name. Without the env var the server looks for `role_id_cache.json` in the data directory (`~/.forma-mcp/`), then next to `aps_mcp.py` (repo clone), then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
+
+### Data directory
+
+The server keeps its per-user state in `~/.forma-mcp/` (override with `FORMA_MCP_HOME`), **not** next to the code, because `uvx` can rebuild its cached environment at any time:
+
+| File | Contents |
+|------|----------|
+| `tokens.json` | Cached 3-legged OAuth token (delete it to force a fresh login) |
+| `audit_logs/` | Timestamped audit CSVs written by the bulk tools when run live |
+| `role_id_cache.json` | Optional role-name cache (see `APS_ROLE_CACHE` above) |
+
+Coming from a repo-clone install? An existing `tokens.json` next to `aps_mcp.py` is still read, and the next token refresh moves it into `~/.forma-mcp/`.
+
+### Running from a clone (development)
 
 ```bash
 git clone https://github.com/lfcastel/Forma-MCP.git
 cd Forma-MCP
-
 python -m venv .venv
 
 # Windows
@@ -72,42 +128,12 @@ python -m venv .venv
 # macOS / Linux
 source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
 
-> **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
+Then point the MCP config at the clone: either `"command": "uvx", "args": ["--from", "/path/to/Forma-MCP", "forma-mcp"]`, or the venv directly with `"command": "/path/to/Forma-MCP/.venv/Scripts/python.exe", "args": ["/path/to/Forma-MCP/aps_mcp.py"]`.
 
----
-
-## Configuration in Claude Code
-
-Add the server to your Claude Code user config at `~/.claude.json`. Adjust the paths to where you cloned this repo:
-
-```json
-"mcpServers": {
-  "aps": {
-    "type": "stdio",
-    "command": "/path/to/forma-mcp/.venv/bin/python",
-    "args": ["/path/to/forma-mcp/aps_mcp.py"],
-    "env": {
-      "APS_CLIENT_ID": "your_client_id",
-      "APS_CLIENT_SECRET": "your_client_secret",
-      "APS_ROLE_CACHE": "/path/to/role_id_cache.json"
-    }
-  }
-}
-```
-
-`APS_RATE_HEADROOM` (optional, default `0.8`) is the fraction of each published Data Management rate limit the server allows itself — lower it if the same APS client ID is shared by several people/sessions; `APS_RATE_LIMITING=0` switches the client-side pacing off entirely (see Known Limitations).
-
-`APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). The same file is read in reverse (UUID → name) to **label role columns in `export_permission_matrix`** when the permissions endpoint returns a role with no inline name. Without the env var the server also looks for `role_id_cache.json` next to `aps_mcp.py`, then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
-
-**Windows paths** — use forward slashes or escaped backslashes:
-```
-C:/Users/YourName/Documents/forma-mcp/.venv/Scripts/python.exe
-```
-
-Restart Claude Code after saving, then run `claude mcp list` — `aps` should appear as connected.
+**Windows paths** in the JSON config: use forward slashes or escaped backslashes (e.g. `C:/Users/YourName/Documents/Forma-MCP`).
 
 ---
 
@@ -537,7 +563,7 @@ Read workflows.xlsx and push every row into "Northgate Tower" (preview first, th
 
 ## Security & credentials
 
-- **3-legged OAuth** — the user token is cached in `tokens.json` after your first browser login. This file is listed in `.gitignore` — never commit it.
+- **3-legged OAuth** — the user token is cached in `~/.forma-mcp/tokens.json` after your first browser login. That's outside the repo, so it can't be committed by accident; treat it like a password.
 - **2-legged OAuth** — uses your APS Client ID and Secret (stored in `~/.claude.json`, Claude Code's config). The token is derived from these credentials at runtime and cached **in memory only** — it is never written to disk.
 - Each user authenticates with **their own Autodesk account** via 3-legged OAuth. The server acts with their permissions, not with elevated app-level rights.
 - Bulk write tools default to `dry_run: true` — no changes are made without explicit confirmation.
@@ -549,8 +575,9 @@ Read workflows.xlsx and push every row into "Northgate Tower" (preview first, th
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | 403 on any API call | App not registered as Custom Integration in the hub | Account Admin must add it via **ACC Account Admin → Custom Integrations** |
-| 403 on folder or permission calls | Token expired | Delete `tokens.json` to force re-login |
-| MCP server not listed | Config path wrong or venv not set up | Run `claude mcp list`; check paths in `~/.claude.json` |
+| 403 on folder or permission calls | Token expired | Delete `~/.forma-mcp/tokens.json` to force re-login |
+| MCP server not listed / failed to connect | `uv` not installed or not on `PATH`, or credentials missing | Run `uvx --version`. Run the server command in a terminal: a missing `APS_CLIENT_ID`/`APS_CLIENT_SECRET` prints a clear error. Check `claude mcp list` and `~/.claude.json` |
+| Still on an old version after upgrading | `uvx` reused its cached build of a branch | Pin a tag, or run `uvx --refresh --from git+https://github.com/lfcastel/Forma-MCP@<ref> forma-mcp` once |
 | Browser doesn't open for login | Port 8080 already in use | Free up port 8080 and retry |
 | Company not found | Not yet added to ACC account | Add it via `bulk_add_hub_companies`, or Account Admin adds it via **ACC Account Admin → Companies** |
 | Company not in project | Added to account but not linked to project | Project Admin adds it via **ACC Admin → Project Admin → Companies** |
@@ -581,11 +608,13 @@ Licensed under the [GNU Lesser General Public License v3.0](https://www.gnu.org/
 git clone https://github.com/lfcastel/Forma-MCP.git
 cd Forma-MCP
 python -m venv .venv && .venv\Scripts\activate   # Windows
-pip install -r requirements.txt
+pip install -e ".[dev]"
 python -m pytest tests/ -v                        # all tests must pass before pushing
 ```
 
-All changes go through a pull request. GitHub Actions runs the test suite automatically on every PR — the PR cannot be merged until CI is green.
+All changes go through a pull request. GitHub Actions runs the test suite and a package build automatically on every PR — the PR cannot be merged until CI is green.
+
+**Releasing:** bump `version` in `pyproject.toml` in the PR. After it merges, tag `main` (`git tag v0.2.0 && git push origin v0.2.0`) and update the `@v…` tag in the install command above.
 
 > **One-time repo setup (owner only):** after the first CI run completes, go to **Settings → Branches → Add rule** for `main`, tick *Require status checks to pass*, and select the `test` job.
 
@@ -595,7 +624,8 @@ All changes go through a pull request. GitHub Actions runs the test suite automa
 forma-mcp/
 ├── aps_mcp.py                  # MCP server — 51 tools
 ├── tests/                      # pytest test suite
-├── .github/workflows/ci.yml    # GitHub Actions CI
+├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build)
+├── pyproject.toml              # packaging: `forma-mcp` console script for uvx
 ├── requirements.txt
 ├── README.md
 └── .gitignore

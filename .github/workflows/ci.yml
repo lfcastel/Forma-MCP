@@ -18,3 +18,11 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -v
+      # Packaging check: the wheel must build and expose the `forma-mcp` entry point
+      # that `uvx --from git+…@<tag> forma-mcp` runs.
+      - run: pip install build && python -m build
+      - run: |
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/*.whl
+          test -x /tmp/wheel-venv/bin/forma-mcp
+          cd /tmp && /tmp/wheel-venv/bin/python -c "import aps_mcp; assert callable(aps_mcp.run)"

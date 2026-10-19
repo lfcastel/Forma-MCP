@@ -24,6 +24,13 @@ def _disable_role_cache(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_data_dir(tmp_path, monkeypatch):
+    """Point the per-user data dir (tokens, audit logs, role cache) at a per-test tmp dir so
+    tests never read or write the developer's real ~/.forma-mcp."""
+    monkeypatch.setenv("FORMA_MCP_HOME", str(tmp_path / "forma-mcp-home"))
+
+
+@pytest.fixture(autouse=True)
 def _fast_assign_poll(monkeypatch):
     """The live bulk-assign polls the members list to confirm the async import. Zero the
     delay so tests never actually sleep during that poll."""
