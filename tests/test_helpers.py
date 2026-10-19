@@ -105,13 +105,8 @@ def test_naming_standard_ids_drops_falsy_entries():
 # _write_audit_csv
 # ---------------------------------------------------------------------------
 
-def test_write_audit_csv_creates_file(tmp_path, monkeypatch):
-    # Redirect the output directory to tmp_path so we don't litter the project
-    monkeypatch.setattr(
-        aps_mcp, "__file__",
-        str(tmp_path / "aps_mcp.py"),
-    )
-
+def test_write_audit_csv_creates_file():
+    # conftest points FORMA_MCP_HOME at a tmp dir, so this never litters the real data dir
     rows = [
         {"user": "alice@example.com", "project": "Test Project", "role": "Viewer", "status": "success", "message": ""},
         {"user": "bob@example.com",   "project": "Test Project", "role": "Viewer", "status": "error",   "message": "HTTP 403"},
@@ -119,6 +114,7 @@ def test_write_audit_csv_creates_file(tmp_path, monkeypatch):
     filepath = aps_mcp._write_audit_csv(rows, "test_op")
 
     assert os.path.isfile(filepath)
+    assert filepath.startswith(os.path.join(aps_mcp._data_dir(), "audit_logs"))
     with open(filepath, encoding="utf-8") as f:
         content = f.read()
     assert "alice@example.com" in content
@@ -129,12 +125,58 @@ def test_write_audit_csv_creates_file(tmp_path, monkeypatch):
     assert "status" in content
 
 
-def test_write_audit_csv_empty_rows_still_returns_path(tmp_path, monkeypatch):
-    monkeypatch.setattr(aps_mcp, "__file__", str(tmp_path / "aps_mcp.py"))
+def test_write_audit_csv_empty_rows_still_returns_path():
     filepath = aps_mcp._write_audit_csv([], "empty_op")
     # Should return a path (file may not exist if rows is empty — that's fine)
     assert isinstance(filepath, str)
     assert "empty_op" in filepath
+
+
+# ---------------------------------------------------------------------------
+# Per-user data dir + token persistence
+# ---------------------------------------------------------------------------
+
+def test_data_dir_defaults_to_home(monkeypatch):
+    monkeypatch.delenv("FORMA_MCP_HOME")
+    assert aps_mcp._data_dir() == os.path.join(os.path.expanduser("~"), ".forma-mcp")
+
+
+def test_save_tokens_writes_to_data_dir():
+    aps_mcp._save_tokens({"access_token": "t1"})
+    with open(os.path.join(aps_mcp._data_dir(), "tokens.json")) as f:
+        assert json.load(f) == {"access_token": "t1"}
+    assert aps_mcp._load_tokens() == {"access_token": "t1"}
+
+
+def test_load_tokens_falls_back_to_legacy_file(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy_tokens.json"
+    legacy.write_text(json.dumps({"access_token": "old"}))
+    monkeypatch.setattr(aps_mcp, "LEGACY_TOKEN_FILE", str(legacy))
+    assert aps_mcp._load_tokens() == {"access_token": "old"}
+    # The next save migrates to the data dir, which then takes precedence
+    aps_mcp._save_tokens({"access_token": "new"})
+    assert aps_mcp._load_tokens() == {"access_token": "new"}
+
+
+def test_load_tokens_empty_when_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(aps_mcp, "LEGACY_TOKEN_FILE", str(tmp_path / "missing.json"))
+    assert aps_mcp._load_tokens() == {}
+
+
+def test_role_cache_found_in_data_dir(monkeypatch):
+    monkeypatch.delenv("APS_ROLE_CACHE")
+    os.makedirs(aps_mcp._data_dir(), exist_ok=True)
+    path = os.path.join(aps_mcp._data_dir(), "role_id_cache.json")
+    with open(path, "w") as f:
+        f.write("{}")
+    assert aps_mcp._role_cache_path() == path
+
+
+def test_run_exits_with_message_when_credentials_missing(monkeypatch):
+    monkeypatch.delenv("APS_CLIENT_ID")
+    with pytest.raises(SystemExit) as exc:
+        aps_mcp.run()
+    assert "APS_CLIENT_ID" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

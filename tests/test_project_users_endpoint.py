@@ -19,7 +19,12 @@ import httpx
 
 APS_BASE = "https://developer.api.autodesk.com"
 PROJECT_ID = ""  # fill in your own project ID (with "b." prefix) before running
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "..", "tokens.json")
+TOKEN_FILE = os.path.join(
+    os.environ.get("FORMA_MCP_HOME") or os.path.join(os.path.expanduser("~"), ".forma-mcp"),
+    "tokens.json",
+)
+if not os.path.exists(TOKEN_FILE):  # pre-packaging location, next to aps_mcp.py
+    TOKEN_FILE = os.path.join(os.path.dirname(__file__), "..", "tokens.json")
 
 
 def _load_token() -> str:

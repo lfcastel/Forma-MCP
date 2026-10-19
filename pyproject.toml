@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forma-mcp"
+version = "0.1.0"
+description = "MCP server for administering Autodesk Construction Cloud (ACC) via the Autodesk Platform Services API"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LGPL-3.0-or-later"
+license-files = ["COPYING", "COPYING.LESSER"]
+dependencies = [
+    # MCP SDK 2.0 dropped the low-level Server.list_tools()/call_tool() decorators — keep <2.
+    "mcp>=1.0.0,<2",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0", "pytest-asyncio>=1.3", "respx>=0.23"]
+
+[project.scripts]
+forma-mcp = "aps_mcp:run"
+
+[project.urls]
+Repository = "https://github.com/lfcastel/Forma-MCP"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["aps_mcp.py"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["aps_mcp.py", "README.md", "COPYING", "COPYING.LESSER", "pyproject.toml"]

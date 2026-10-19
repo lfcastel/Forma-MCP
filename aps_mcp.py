@@ -1,5 +1,6 @@
 import os
 import io
+import sys
 import re
 import csv
 import zipfile
@@ -18,8 +19,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, CallToolResult
 
-APS_CLIENT_ID = os.environ["APS_CLIENT_ID"]
-APS_CLIENT_SECRET = os.environ["APS_CLIENT_SECRET"]
+# Read leniently so a missing value surfaces as a readable error from run(), not a
+# bare KeyError at import (which an MCP client just reports as "failed to connect").
+APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID", "")
+APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET", "")
 APS_BASE = "https://developer.api.autodesk.com"
 REDIRECT_URI = "http://localhost:8080/oauth/callback"
 SCOPES = "data:read data:write data:create account:read account:write"
@@ -33,8 +36,23 @@ ISSUES_REGION = "EMEA"
 # Brussels Airport traffic is EMEA. Sent as `x-ads-region` on every Reviews call.
 REVIEWS_REGION = "EMEA"
 
-# tokens.json sits next to this script
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
+
+def _data_dir() -> str:
+    """Per-user state directory (tokens, audit logs, role cache): `FORMA_MCP_HOME`, else
+    `~/.forma-mcp`. Deliberately not next to this script — under `uvx` the script lives in
+    uv's cache env, which uv may wipe or rebuild at any time. Not created here; writers
+    `makedirs` it on demand."""
+    return os.environ.get("FORMA_MCP_HOME") or os.path.join(os.path.expanduser("~"), ".forma-mcp")
+
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Pre-packaging location (repo clone): still read so existing installs don't re-auth;
+# the next save migrates the tokens to the data dir.
+LEGACY_TOKEN_FILE = os.path.join(_SCRIPT_DIR, "tokens.json")
+
+
+def _token_file() -> str:
+    return os.path.join(_data_dir(), "tokens.json")
 
 app = Server("aps-mcp")
 
@@ -63,15 +81,18 @@ _WALK_CONCURRENCY = 8
 # ---------------------------------------------------------------------------
 
 def _load_tokens() -> dict:
-    try:
-        with open(TOKEN_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    for path in (_token_file(), LEGACY_TOKEN_FILE):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return {}
 
 
 def _save_tokens(data: dict) -> None:
-    with open(TOKEN_FILE, "w") as f:
+    os.makedirs(_data_dir(), exist_ok=True)
+    with open(_token_file(), "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -1908,15 +1929,16 @@ def _looks_like_uuid(value: str) -> bool:
 
 def _role_cache_path() -> "str | None":
     """Locate the role-name → UUID cache JSON. Precedence: the `APS_ROLE_CACHE` env var,
-    then a repo-local `role_id_cache.json`, then the conventional aps-skill copy under
+    then `role_id_cache.json` in the data dir (`_data_dir()`), then a repo-local copy, then the conventional aps-skill copy under
     `~/.claude/skills/aps/`. Returns None if none exist (resolution then degrades to the
     member-walk only)."""
     env = os.environ.get("APS_ROLE_CACHE")
     if env:
         return env if os.path.exists(env) else None
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "role_id_cache.json")
-    if os.path.exists(here):
-        return here
+    for path in (os.path.join(_data_dir(), "role_id_cache.json"),
+                 os.path.join(_SCRIPT_DIR, "role_id_cache.json")):
+        if os.path.exists(path):
+            return path
     skill = os.path.expanduser(os.path.join("~", ".claude", "skills", "aps", "role_id_cache.json"))
     return skill if os.path.exists(skill) else None
 
@@ -2066,9 +2088,9 @@ def _role_display(role_spec: "Any") -> str:
 
 
 def _write_audit_csv(rows: list[dict], operation: str) -> str:
-    """Write audit rows to a timestamped CSV in the audit_logs/ folder. Returns file path."""
+    """Write audit rows to a timestamped CSV in the data dir's audit_logs/ folder. Returns file path."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    audit_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_logs")
+    audit_dir = os.path.join(_data_dir(), "audit_logs")
     os.makedirs(audit_dir, exist_ok=True)
     filepath = os.path.join(audit_dir, f"audit_{operation}_{timestamp}.csv")
     if rows:
@@ -6474,5 +6496,17 @@ async def main():
         await app.run(r, w, app.create_initialization_options())
 
 
-if __name__ == "__main__":
+def run():
+    """Console-script entry point (`forma-mcp`, e.g. via `uvx`)."""
+    missing = [v for v in ("APS_CLIENT_ID", "APS_CLIENT_SECRET") if not os.environ.get(v)]
+    if missing:
+        sys.exit(
+            f"forma-mcp: missing environment variable(s): {', '.join(missing)}. "
+            "Set them in your MCP server config (e.g. `claude mcp add aps -e APS_CLIENT_ID=... "
+            "-e APS_CLIENT_SECRET=... -- uvx ...`)."
+        )
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()

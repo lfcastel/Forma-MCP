@@ -28,3 +28,8 @@ archive/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Build output
+dist/
+build/
+*.egg-info/
