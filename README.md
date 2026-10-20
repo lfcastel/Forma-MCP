@@ -92,6 +92,17 @@ Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `aps`
 
 **Upgrading:** change the tag (`@v0.2.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
+**Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
+
+```bash
+claude mcp add aps --scope user \
+  -e APS_CLIENT_ID=your_client_id \
+  -e APS_CLIENT_SECRET=your_client_secret \
+  -- uvx --refresh --from git+https://github.com/lfcastel/Forma-MCP forma-mcp
+```
+
+or in `~/.claude.json`: `"args": ["--refresh", "--from", "git+https://github.com/lfcastel/Forma-MCP", "forma-mcp"]`. Pin a tag instead when you want everyone on the same reproducible build.
+
 > **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
 
 ### Optional environment variables
