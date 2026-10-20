@@ -69,7 +69,7 @@ No clone or virtualenv needed: `uvx` installs the server straight from this repo
 claude mcp add aps --scope user \
   -e APS_CLIENT_ID=your_client_id \
   -e APS_CLIENT_SECRET=your_client_secret \
-  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.1.0 forma-mcp
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.2.0 forma-mcp
 ```
 
 Or add it by hand to `~/.claude.json`:
@@ -79,7 +79,7 @@ Or add it by hand to `~/.claude.json`:
   "aps": {
     "type": "stdio",
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.1.0", "forma-mcp"],
+    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.2.0", "forma-mcp"],
     "env": {
       "APS_CLIENT_ID": "your_client_id",
       "APS_CLIENT_SECRET": "your_client_secret"
@@ -90,7 +90,7 @@ Or add it by hand to `~/.claude.json`:
 
 Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `aps` should show as connected. The first tool call opens a browser for the Autodesk login.
 
-**Upgrading:** change the tag (`@v0.1.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
+**Upgrading:** change the tag (`@v0.2.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 > **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
 
