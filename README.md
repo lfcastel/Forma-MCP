@@ -245,6 +245,13 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | `create_workflow` | Create a workflow — `name` + `steps` required; posts immediately (no `dry_run`) | 3-legged (`data:write`) |
 | `bulk_create_workflows` | Create many workflows from a list of specs (the Excel batch); `dry_run` default, audit CSV, bounded concurrency, per-row results | 3-legged (`data:write`) |
 
+### File reviews
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_reviews` | List file reviews (instances started from a workflow); filter by `status` (OPEN/CLOSED/VOID/FAILED), `workflow_id`/`workflow_name`, `name`, `sequence_id`, date ranges (`created_at`, `updated_at`, `finished_at`, `current_step_due_date`, `approved_at`, `archived_at` as `start..end`), next-action user/role/company, `approved_by`, `archived`; `sort`; auto-paginates. Archived reviews are hidden unless `archived=true` | 3-legged |
+| `get_review` | Get one review by `review_id` (UUID) or `sequence_id` (the UI number); `include` any of `progress` (per-step state, who acted, notes), `versions` (files in the latest round with approval status, filterable by `approve_status` label) and `workflow` (the workflow snapshot the review used) | 3-legged |
+
 ---
 
 ## Tools & API endpoints
@@ -337,6 +344,11 @@ flowchart LR
         T51(bulk_create_workflows)
     end
 
+    subgraph REVIEWS["File reviews · Reviews · 3-legged OAuth · x-ads-region: EMEA"]
+        T52(list_reviews)
+        T53(get_review)
+    end
+
     E1["GET /project/v1/hubs"]
     E2["GET /project/v1/hubs/{hub}/projects"]
     E3["GET /project/v1/.../projects/{p}/topFolders"]
@@ -374,6 +386,9 @@ flowchart LR
     E35["GET /construction/reviews/v1/projects/{p}/workflows"]
     E36["GET /construction/reviews/v1/projects/{p}/workflows/{w}"]
     E37["POST /construction/reviews/v1/projects/{p}/workflows"]
+    E38["GET /construction/reviews/v1/projects/{p}/reviews"]
+    E39["GET /construction/reviews/v1/projects/{p}/reviews/{r}"]
+    E40["GET /construction/reviews/v1/projects/{p}/reviews/{r}/progress · /versions · /workflow"]
 
     T1 --> E1
     T2 --> E2
@@ -461,8 +476,14 @@ flowchart LR
     T51 --> E5
     T51 --> E8
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36 get
+    T52 --> E38
+    T52 --> E35
+    T53 --> E38
+    T53 --> E39
+    T53 --> E40
+
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40 get
     class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37 post
     class E15,E17,E20,E25,E26,E34 patch
     class E16 del
@@ -559,6 +580,15 @@ Create an approval workflow "IFC Sign-off" in "Northgate Tower" with an approver
 Read workflows.xlsx and push every row into "Northgate Tower" (preview first, then create)
 ```
 
+### File reviews
+
+```
+List the open reviews in "Northgate Tower" whose current step is due this week
+Show the progress of review 42 in "Northgate Tower"
+Which files in review 42 were rejected?
+List every closed review created from the "Design Review" workflow in "Northgate Tower"
+```
+
 ---
 
 ## Security & credentials
@@ -622,7 +652,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 51 tools
+├── aps_mcp.py                  # MCP server — 53 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build)
 ├── pyproject.toml              # packaging: `forma-mcp` console script for uvx
