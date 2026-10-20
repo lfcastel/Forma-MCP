@@ -1152,6 +1152,71 @@ async def _resolve_workflow_ref(
     return matches[0]["id"]
 
 
+REVIEWS_URL = APS_BASE + "/construction/reviews/v1/projects/{pid}/reviews"
+
+# list_reviews: friendly snake_case param → Reviews API query key.
+_REVIEW_FILTER_MAP = {
+    "workflow_id": "filter[workflowId]",
+    "status": "filter[status]",
+    "name": "filter[name]",
+    "sequence_id": "filter[sequenceId]",
+    "current_step_due_date": "filter[currentStepDueDate]",
+    "created_at": "filter[createdAt]",
+    "updated_at": "filter[updatedAt]",
+    "finished_at": "filter[finishedAt]",
+    "next_action_by_user": "filter[nextActionByUser]",
+    "next_action_by_role": "filter[nextActionByRole]",
+    "next_action_by_company": "filter[nextActionByCompany]",
+    "archived_by": "filter[archivedBy]",
+    "archived_at": "filter[archivedAt]",
+    "approved_by": "filter[approvedBy]",
+    "approved_at": "filter[approvedAt]",
+    "sort": "sort",
+}
+
+
+def _review_list_params(arguments: dict) -> dict:
+    """Map list_reviews' friendly args onto the Reviews API query keys (only the
+    ones provided). ``archived`` is a bool → 'true'/'false'; ``approved_by`` may be
+    a list (≤10 ids), sent comma-joined."""
+    params: dict = {}
+    for arg, key in _REVIEW_FILTER_MAP.items():
+        value = arguments.get(arg)
+        if value is None or value == "":
+            continue
+        if isinstance(value, list):
+            value = ",".join(str(v) for v in value)
+        params[key] = str(value)
+    if arguments.get("archived") is not None:
+        params["filter[archived]"] = str(arguments["archived"]).lower()
+    return params
+
+
+async def _resolve_review_ref(
+    client: httpx.AsyncClient, rv_hdrs: dict, bare_project_id: str, arguments: dict
+) -> str:
+    """Return a review's UUID from ``review_id`` (preferred) or ``sequence_id`` (the
+    number shown in the Reviews UI). The API's ``filter[sequenceId]`` is a *partial*
+    match (11 → 113, 211), so the exact hit is picked client-side; archived reviews
+    are hidden by default, so a miss among active reviews retries with archived=true."""
+    review_id = arguments.get("review_id")
+    if review_id:
+        return review_id
+    seq = arguments.get("sequence_id")
+    if seq is None or seq == "":
+        raise ValueError("Provide 'review_id' (UUID) or 'sequence_id'.")
+    url = REVIEWS_URL.format(pid=bare_project_id)
+    for archived in ("false", "true"):
+        rows = await _get_all_issues(
+            client, url, rv_hdrs,
+            {"filter[sequenceId]": str(seq), "filter[archived]": archived}, page_limit=50,
+        )
+        matches = [r for r in rows if str(r.get("sequenceId")) == str(seq)]
+        if matches:
+            return matches[0]["id"]
+    raise ValueError(f"No review with sequence ID {seq} in this project.")
+
+
 def _looks_like_autodesk_id(value: str) -> bool:
     """Heuristic: an opaque Autodesk ID (alphanumeric, ≥8 chars, contains a digit) —
     distinguishes a pasted raw id from a person/role/company name (which rarely
@@ -3673,6 +3738,79 @@ async def list_tools() -> list[Tool]:
                     "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
                 },
                 "required": ["workflows"],
+            },
+        ),
+        Tool(
+            name="list_reviews",
+            description=(
+                "List file reviews (ACC Reviews module — the review *instances* started "
+                "from an approval workflow) in a project. Each row has id, sequenceId (the "
+                "number shown in the UI), name, status (OPEN/CLOSED/VOID/FAILED), initiator, "
+                "current step + due date, workflowId, approver, archive info and "
+                "nextActionBy (claimers + candidate users/roles/companies). Auto-paginates "
+                "all matches. Archived reviews are excluded unless archived=true. Use "
+                "get_review for a review's progress, files/versions and workflow. Not "
+                "compatible with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "workflow_id": {"type": "string", "description": "Only reviews created from this approval workflow (UUID)."},
+                    "workflow_name": {"type": "string", "description": "Only reviews created from the workflow with this exact name (case-insensitive) — resolved to workflow_id via one list call."},
+                    "status": {"type": "string", "enum": ["OPEN", "CLOSED", "VOID", "FAILED"], "description": "Filter by review status. FAILED reviews are only visible to project admins."},
+                    "name": {"type": "string", "description": "Review name contains this text (case-insensitive)."},
+                    "sequence_id": {"type": "integer", "description": "Review sequence ID — partial match on the API side (11 matches 113 and 211)."},
+                    "current_step_due_date": {"type": "string", "description": "Current step due date range. Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "created_at": {"type": "string", "description": "Creation date range. Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "updated_at": {"type": "string", "description": "Last-updated date range. Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "finished_at": {"type": "string", "description": "Finished date range. Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "next_action_by_user": {"type": "string", "description": "Autodesk ID of a user responsible for the next action (incl. via their role/company). Get it from list_project_members' autodesk_id."},
+                    "next_action_by_role": {"type": "string", "description": "Reviews numeric autodeskId of a role responsible for the next action (= the role's roleGroupId; see get_workflow candidates)."},
+                    "next_action_by_company": {"type": "string", "description": "Reviews numeric autodeskId of a company responsible for the next action."},
+                    "archived": {"type": "boolean", "description": "true → only archived reviews; false → only active. Omit for active only (API default)."},
+                    "archived_by": {"type": "string", "description": "Autodesk ID of the user who archived the review (requires archived=true)."},
+                    "archived_at": {"type": "string", "description": "Archive date range (requires archived=true). Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "approved_by": {"type": "array", "items": {"type": "string"}, "description": "Autodesk IDs (≤10) of the user who submitted the final step."},
+                    "approved_at": {"type": "string", "description": "Final-approval date range. Date range 'start..end', both ISO 8601 (e.g. '2026-06-01..2026-06-30')."},
+                    "sort": {"type": "string", "description": "One of name, status, sequenceId, currentStepDueDate, createdAt, finishedAt; append ' desc' for descending (e.g. 'createdAt desc')."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="get_review",
+            description=(
+                "Get one file review by its UUID (`review_id`) or the number shown in the "
+                "Reviews UI (`sequence_id`). Returns the review summary (status, current "
+                "step, due date, initiator, approver, nextActionBy). Optional `include` "
+                "adds: 'progress' (per-step state of the current round — claimed/"
+                "submitted/void, who acted, when, notes; newest first), 'versions' (the "
+                "files in the latest round with their approval status, pending review "
+                "name, custom attributes and copied-version URN), and 'workflow' (the "
+                "exact workflow snapshot the review was created with). Not compatible "
+                "with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "review_id": {"type": "string", "description": "The review UUID (preferred). Provide this or sequence_id."},
+                    "sequence_id": {"type": "integer", "description": "The review number shown in the Reviews UI — resolved to the UUID via one list call (archived reviews included). Provide this or review_id."},
+                    "include": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["progress", "versions", "workflow"]},
+                        "description": "Extra sections to fetch alongside the review. Omit for the summary only.",
+                    },
+                    "approve_status": {"type": "array", "items": {"type": "string"}, "description": "With include 'versions': only files whose approval status *label* (as defined in the workflow, e.g. 'Approved with comments') is one of these."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": [],
             },
         ),
     ]
@@ -6482,6 +6620,53 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 payload, results, arguments.get("response_detail"),
                 noteworthy=lambda r: r["action"] in ("error", "already_exists"),
             )
+            return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "list_reviews":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            rv_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
+            params = _review_list_params(arguments)
+            if arguments.get("workflow_name") and not arguments.get("workflow_id"):
+                params["filter[workflowId]"] = await _resolve_workflow_ref(
+                    client, rv_hdrs, bare_id, {"name": arguments["workflow_name"]},
+                )
+            reviews = await _get_all_issues(
+                client, REVIEWS_URL.format(pid=bare_id), rv_hdrs, params, page_limit=50,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "result_count": len(reviews),
+                "reviews": reviews,
+            }, indent=2))]
+
+        if name == "get_review":
+            bare_id, resolved_name = await _resolve_review_project(client, token, arguments)
+            rv_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION}
+            review_id = await _resolve_review_ref(client, rv_hdrs, bare_id, arguments)
+            review_url = f"{REVIEWS_URL.format(pid=bare_id)}/{review_id}"
+            r = await client.get(review_url, headers=rv_hdrs)
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            payload = {"project": resolved_name, "review": r.json()}
+            include = set(arguments.get("include") or [])
+            if "progress" in include:
+                payload["progress"] = await _get_all_issues(
+                    client, f"{review_url}/progress", rv_hdrs, page_limit=50,
+                )
+            if "versions" in include:
+                v_params = {}
+                if arguments.get("approve_status"):
+                    v_params["filter[approveStatus]"] = list(arguments["approve_status"])
+                payload["versions"] = await _get_all_issues(
+                    client, f"{review_url}/versions", rv_hdrs, v_params, page_limit=50,
+                )
+            if "workflow" in include:
+                wr = await client.get(f"{review_url}/workflow", headers=rv_hdrs)
+                payload["workflow"] = (
+                    wr.json() if wr.is_success
+                    else {"error": wr.status_code, "body": _error_body(wr)}
+                )
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
