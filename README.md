@@ -31,7 +31,7 @@ Used for account-level operations that don't require a user context: listing all
 
 Used for all project, folder, and permission operations — the API acts on behalf of *you*, the logged-in Autodesk user.
 
-- **How it works:** On first use, a browser window opens automatically. You log in with your Autodesk account and grant consent. The token is cached in `~/.forma-mcp/tokens.json` (see [Data directory](#data-directory)) and refreshed automatically. You only need to re-authorize after ~14 days of inactivity.
+- **How it works:** On first use, a browser window opens automatically. You log in with your Autodesk account and grant consent (authorization code flow with PKCE and a `state` check). The refresh token is stored in your **OS keychain** (Windows Credential Manager / macOS Keychain / Secret Service) and the access token is kept in memory only (see [Security & credentials](#security--credentials)). It refreshes automatically; you only need to re-authorize after ~14 days of inactivity.
 - **Required scopes:** `data:read`, `account:read`, `account:write` (for bulk user management tools)
 - **When it's used:** All navigation, folder, and permission tools; all bulk user write operations
 
@@ -63,13 +63,20 @@ Without this step, API calls will return 403 errors even with valid credentials.
 
 ## Installation & configuration in Claude Code
 
-No clone or virtualenv needed: `uvx` installs the server straight from this repo, pinned to a release tag, and runs it in an isolated environment. Register it with Claude Code in one command:
+No clone or virtualenv needed: `uvx` installs the server straight from this repo, pinned to a release tag, and runs it in an isolated environment.
+
+**1. Store the client secret in your OS keychain** (once per machine — run it in a normal terminal; it prompts without echoing):
+
+```bash
+uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.3.0 forma-mcp auth set-secret --client-id your_client_id
+```
+
+**2. Register the server with Claude Code.** Only the (non-secret) Client ID goes in the config:
 
 ```bash
 claude mcp add aps --scope user \
   -e APS_CLIENT_ID=your_client_id \
-  -e APS_CLIENT_SECRET=your_client_secret \
-  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.2.0 forma-mcp
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.3.0 forma-mcp
 ```
 
 Or add it by hand to `~/.claude.json`:
@@ -79,25 +86,25 @@ Or add it by hand to `~/.claude.json`:
   "aps": {
     "type": "stdio",
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.2.0", "forma-mcp"],
+    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.3.0", "forma-mcp"],
     "env": {
-      "APS_CLIENT_ID": "your_client_id",
-      "APS_CLIENT_SECRET": "your_client_secret"
+      "APS_CLIENT_ID": "your_client_id"
     }
   }
 }
 ```
 
+No keychain on the machine (e.g. a headless Linux box)? Put `APS_CLIENT_SECRET` in the `env` block instead — an env value always wins over the keychain, so existing configs keep working.
+
 Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `aps` should show as connected. The first tool call opens a browser for the Autodesk login.
 
-**Upgrading:** change the tag (`@v0.2.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
+**Upgrading:** change the tag (`@v0.3.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
 
 ```bash
 claude mcp add aps --scope user \
   -e APS_CLIENT_ID=your_client_id \
-  -e APS_CLIENT_SECRET=your_client_secret \
   -- uvx --refresh --from git+https://github.com/lfcastel/Forma-MCP forma-mcp
 ```
 
@@ -111,6 +118,8 @@ Add these to the `-e` flags or the `env` block as needed.
 
 `FORMA_MCP_HOME` (optional, default `~/.forma-mcp`) is the per-user data directory; see [Data directory](#data-directory).
 
+`APS_CLIENT_SECRET` (optional) supplies the client secret directly instead of the OS keychain; it takes precedence when set. `FORMA_MCP_KEYRING=0` turns the keychain off entirely (the secret must then come from `APS_CLIENT_SECRET`, and the refresh token falls back to an owner-only `tokens.json` in the data directory).
+
 `APS_RATE_HEADROOM` (optional, default `0.8`) is the fraction of each published Data Management rate limit the server allows itself — lower it if the same APS client ID is shared by several people/sessions; `APS_RATE_LIMITING=0` switches the client-side pacing off entirely (see Known Limitations).
 
 `APS_ROLE_CACHE` (optional) points at a `role_id_cache.json` mapping every hub role **name → UUID**, so you can assign a role **by name even when no member holds it yet** (an unused role is otherwise invisible — ACC has no project-roles catalog API). The same file is read in reverse (UUID → name) to **label role columns in `export_permission_matrix`** when the permissions endpoint returns a role with no inline name. Without the env var the server looks for `role_id_cache.json` in the data directory (`~/.forma-mcp/`), then next to `aps_mcp.py` (repo clone), then under `~/.claude/skills/aps/`. Build/refresh the file from a Data Connector export (`create_role_data_export` → `get_data_connector_requests`). It contains real role UUIDs, so it's **gitignored** — keep it local.
@@ -121,11 +130,11 @@ The server keeps its per-user state in `~/.forma-mcp/` (override with `FORMA_MCP
 
 | File | Contents |
 |------|----------|
-| `tokens.json` | Cached 3-legged OAuth token (delete it to force a fresh login) |
+| `tokens.json` | Only when no OS keychain is available: the 3-legged refresh token, owner-only. Normally absent — the token lives in the keychain |
 | `audit_logs/` | Timestamped audit CSVs written by the bulk tools when run live |
 | `role_id_cache.json` | Optional role-name cache (see `APS_ROLE_CACHE` above) |
 
-Coming from a repo-clone install? An existing `tokens.json` next to `aps_mcp.py` is still read, and the next token refresh moves it into `~/.forma-mcp/`.
+Upgrading from v0.2.x or a repo-clone install? An existing plaintext `tokens.json` (in `~/.forma-mcp/` or next to `aps_mcp.py`) is moved into the OS keychain on first use and the file is deleted.
 
 ### Running from a clone (development)
 
@@ -604,8 +613,19 @@ List every closed review created from the "Design Review" workflow in "Northgate
 
 ## Security & credentials
 
-- **3-legged OAuth** — the user token is cached in `~/.forma-mcp/tokens.json` after your first browser login. That's outside the repo, so it can't be committed by accident; treat it like a password.
-- **2-legged OAuth** — uses your APS Client ID and Secret (stored in `~/.claude.json`, Claude Code's config). The token is derived from these credentials at runtime and cached **in memory only** — it is never written to disk.
+- **Client secret** — stored in the **OS keychain** (Windows Credential Manager, encrypted with DPAPI to your Windows login; macOS Keychain; Secret Service on Linux) by `forma-mcp auth set-secret`, keyed per Client ID. It is read at runtime and never written to a file. Setting `APS_CLIENT_SECRET` in the MCP config still works and overrides the keychain, but then the secret sits in plain text in `~/.claude.json` — prefer the keychain.
+- **3-legged OAuth** — only the **refresh token** is persisted, in the OS keychain; the 1-hour access token lives in memory. Without a keychain, the refresh token falls back to an owner-only `~/.forma-mcp/tokens.json`. The browser login uses PKCE and a random `state` that the local callback verifies, so a forged callback to `localhost:8080` is rejected; the callback listener gives up after 5 minutes.
+- **2-legged OAuth** — the app token is derived from the Client ID + Secret at runtime and cached **in memory only**.
+- **Managing stored credentials:**
+
+  | Command | Effect |
+  |---------|--------|
+  | `forma-mcp auth status` | Shows the keychain backend and *where* the secret and refresh token come from (never the values) |
+  | `forma-mcp auth set-secret [--client-id ID]` | Prompts for the client secret and stores it in the keychain |
+  | `forma-mcp auth delete-secret [--client-id ID]` | Removes the stored client secret |
+  | `forma-mcp auth logout [--client-id ID]` | Removes the stored login (keychain entry and any `tokens.json`); the next tool call opens a browser login |
+
+  Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`. `--client-id` defaults to `APS_CLIENT_ID`.
 - Each user authenticates with **their own Autodesk account** via 3-legged OAuth. The server acts with their permissions, not with elevated app-level rights.
 - Bulk write tools default to `dry_run: true` — no changes are made without explicit confirmation.
 
@@ -616,10 +636,11 @@ List every closed review created from the "Design Review" workflow in "Northgate
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | 403 on any API call | App not registered as Custom Integration in the hub | Account Admin must add it via **ACC Account Admin → Custom Integrations** |
-| 403 on folder or permission calls | Token expired | Delete `~/.forma-mcp/tokens.json` to force re-login |
-| MCP server not listed / failed to connect | `uv` not installed or not on `PATH`, or credentials missing | Run `uvx --version`. Run the server command in a terminal: a missing `APS_CLIENT_ID`/`APS_CLIENT_SECRET` prints a clear error. Check `claude mcp list` and `~/.claude.json` |
+| 403 on folder or permission calls | Token expired | Run `forma-mcp auth logout` to force a fresh login |
+| MCP server not listed / failed to connect | `uv` not installed or not on `PATH`, or credentials missing | Run `uvx --version`. Run the server command in a terminal: a missing `APS_CLIENT_ID` or client secret prints a clear error; `forma-mcp auth status` shows where the secret is (or isn't) found. Check `claude mcp list` and `~/.claude.json` |
 | Still on an old version after upgrading | `uvx` reused its cached build of a branch | Pin a tag, or run `uvx --refresh --from git+https://github.com/lfcastel/Forma-MCP@<ref> forma-mcp` once |
 | Browser doesn't open for login | Port 8080 already in use | Free up port 8080 and retry |
+| "Invalid or missing state parameter" in the browser | A stale or foreign callback hit `localhost:8080` | Retry the tool call to start a fresh login; only the newest login's callback is accepted |
 | Company not found | Not yet added to ACC account | Add it via `bulk_add_hub_companies`, or Account Admin adds it via **ACC Account Admin → Companies** |
 | Company not in project | Added to account but not linked to project | Project Admin adds it via **ACC Admin → Project Admin → Companies** |
 

@@ -141,26 +141,26 @@ def test_data_dir_defaults_to_home(monkeypatch):
     assert aps_mcp._data_dir() == os.path.join(os.path.expanduser("~"), ".forma-mcp")
 
 
-def test_save_tokens_writes_to_data_dir():
-    aps_mcp._save_tokens({"access_token": "t1"})
+def test_save_refresh_token_falls_back_to_data_dir_file_without_keychain():
+    aps_mcp._save_refresh_token("rt1")
     with open(os.path.join(aps_mcp._data_dir(), "tokens.json")) as f:
-        assert json.load(f) == {"access_token": "t1"}
-    assert aps_mcp._load_tokens() == {"access_token": "t1"}
+        assert json.load(f) == {"refresh_token": "rt1"}
+    assert aps_mcp._load_refresh_token() == "rt1"
 
 
-def test_load_tokens_falls_back_to_legacy_file(tmp_path, monkeypatch):
+def test_load_refresh_token_falls_back_to_legacy_file(tmp_path, monkeypatch):
     legacy = tmp_path / "legacy_tokens.json"
-    legacy.write_text(json.dumps({"access_token": "old"}))
+    legacy.write_text(json.dumps({"access_token": "a", "refresh_token": "old"}))
     monkeypatch.setattr(aps_mcp, "LEGACY_TOKEN_FILE", str(legacy))
-    assert aps_mcp._load_tokens() == {"access_token": "old"}
-    # The next save migrates to the data dir, which then takes precedence
-    aps_mcp._save_tokens({"access_token": "new"})
-    assert aps_mcp._load_tokens() == {"access_token": "new"}
+    assert aps_mcp._load_refresh_token() == "old"
+    # The next save writes the data dir, which then takes precedence
+    aps_mcp._save_refresh_token("new")
+    assert aps_mcp._load_refresh_token() == "new"
 
 
-def test_load_tokens_empty_when_none(tmp_path, monkeypatch):
+def test_load_refresh_token_none_when_nothing_stored(tmp_path, monkeypatch):
     monkeypatch.setattr(aps_mcp, "LEGACY_TOKEN_FILE", str(tmp_path / "missing.json"))
-    assert aps_mcp._load_tokens() == {}
+    assert aps_mcp._load_refresh_token() is None
 
 
 def test_role_cache_found_in_data_dir(monkeypatch):
@@ -175,7 +175,7 @@ def test_role_cache_found_in_data_dir(monkeypatch):
 def test_run_exits_with_message_when_credentials_missing(monkeypatch):
     monkeypatch.delenv("APS_CLIENT_ID")
     with pytest.raises(SystemExit) as exc:
-        aps_mcp.run()
+        aps_mcp.run([])
     assert "APS_CLIENT_ID" in str(exc.value)
 
 

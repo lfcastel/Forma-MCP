@@ -5,44 +5,26 @@ and print the roles found on each user.
 Run from the repo root with:
     python tests/test_project_users_endpoint.py
 
-Reads the cached 3-legged token from tokens.json (written by aps_mcp.py).
-Make sure the MCP server has been authorised at least once before running this.
+Gets a 3-legged token the same way aps_mcp.py does (refresh token from the OS keychain,
+or a browser login if none is stored). Needs APS_CLIENT_ID and the client secret
+(APS_CLIENT_SECRET or `forma-mcp auth set-secret`).
 """
 
 import sys
 import os
-import json
-import time
 import asyncio
 
 import httpx
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import aps_mcp  # noqa: E402
+
 APS_BASE = "https://developer.api.autodesk.com"
 PROJECT_ID = ""  # fill in your own project ID (with "b." prefix) before running
-TOKEN_FILE = os.path.join(
-    os.environ.get("FORMA_MCP_HOME") or os.path.join(os.path.expanduser("~"), ".forma-mcp"),
-    "tokens.json",
-)
-if not os.path.exists(TOKEN_FILE):  # pre-packaging location, next to aps_mcp.py
-    TOKEN_FILE = os.path.join(os.path.dirname(__file__), "..", "tokens.json")
-
-
-def _load_token() -> str:
-    try:
-        with open(TOKEN_FILE) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        sys.exit("tokens.json not found or invalid — run the MCP server once to authorise first.")
-
-    expires_at = data.get("expires_at", 0)
-    if time.time() > expires_at - 60:
-        sys.exit("Cached token has expired — trigger any MCP tool call first to refresh it.")
-
-    return data["access_token"]
 
 
 async def main():
-    token = _load_token()
+    token = await aps_mcp.get_access_token()
     bare_id = PROJECT_ID.removeprefix("b.")
     url = f"{APS_BASE}/construction/admin/v1/projects/{bare_id}/users"
     headers = {"Authorization": f"Bearer {token}"}

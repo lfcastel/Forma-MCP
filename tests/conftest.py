@@ -31,6 +31,16 @@ def _isolated_data_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_keychain(monkeypatch):
+    """Never touch the developer's real OS keychain; keychain tests swap in a fake via
+    `monkeypatch.setattr(aps_mcp, "_keyring", ...)`. Also start each test with no
+    in-memory 3-legged access token."""
+    import aps_mcp
+    monkeypatch.setenv("FORMA_MCP_KEYRING", "0")
+    monkeypatch.setattr(aps_mcp, "_user_token_cache", {"token": None, "expires_at": 0})
+
+
+@pytest.fixture(autouse=True)
 def _fast_assign_poll(monkeypatch):
     """The live bulk-assign polls the members list to confirm the async import. Zero the
     delay so tests never actually sleep during that poll."""

@@ -8,6 +8,10 @@ import base64
 import json
 import time
 import asyncio
+import getpass
+import hashlib
+import secrets
+import argparse
 import webbrowser
 import urllib.parse
 from datetime import datetime, timezone, timedelta
@@ -22,7 +26,7 @@ from mcp.types import Tool, TextContent, CallToolResult
 # Read leniently so a missing value surfaces as a readable error from run(), not a
 # bare KeyError at import (which an MCP client just reports as "failed to connect").
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID", "")
-APS_CLIENT_SECRET = os.environ.get("APS_CLIENT_SECRET", "")
+# The client secret is read per call by `_client_secret()`: env first, then the OS keychain.
 APS_BASE = "https://developer.api.autodesk.com"
 REDIRECT_URI = "http://localhost:8080/oauth/callback"
 SCOPES = "data:read data:write data:create account:read account:write"
@@ -77,41 +81,174 @@ _ASSIGN_POLL_DELAY = 3.0
 _WALK_CONCURRENCY = 8
 
 # ---------------------------------------------------------------------------
-# Token persistence
+# Credential storage (OS keychain, plaintext-file fallback)
 # ---------------------------------------------------------------------------
+# Secrets live in the OS keychain via `keyring` (Windows Credential Manager / DPAPI,
+# macOS Keychain, Secret Service on Linux), keyed per APS client id. Only the refresh
+# token is persisted — the 1-hour access token stays in memory. Without a usable
+# keychain (headless Linux, or `FORMA_MCP_KEYRING=0`) the refresh token falls back to
+# `<data dir>/tokens.json`, written owner-only; the client secret never touches disk
+# and must then come from `APS_CLIENT_SECRET`.
 
-def _load_tokens() -> dict:
+KEYRING_SERVICE = "forma-mcp"
+
+
+def _keyring():
+    """The `keyring` module when a real backend is available, else None."""
+    if os.environ.get("FORMA_MCP_KEYRING", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    try:
+        import keyring
+        from keyring.backends import fail, null
+    except ImportError:
+        return None
+    try:
+        backend = keyring.get_keyring()
+    except Exception:
+        return None
+    if isinstance(backend, (fail.Keyring, null.Keyring)):
+        return None
+    return keyring
+
+
+def _kr_user(key: str, client_id: str | None = None) -> str:
+    return f"{key}:{client_id or APS_CLIENT_ID}"
+
+
+def _kr_get(key: str, client_id: str | None = None) -> str | None:
+    kr = _keyring()
+    if not kr:
+        return None
+    try:
+        return kr.get_password(KEYRING_SERVICE, _kr_user(key, client_id))
+    except Exception:
+        return None
+
+
+def _kr_set(key: str, value: str, client_id: str | None = None) -> bool:
+    kr = _keyring()
+    if not kr:
+        return False
+    try:
+        kr.set_password(KEYRING_SERVICE, _kr_user(key, client_id), value)
+        return True
+    except Exception:
+        return False
+
+
+def _kr_delete(key: str, client_id: str | None = None) -> bool:
+    kr = _keyring()
+    if not kr:
+        return False
+    try:
+        kr.delete_password(KEYRING_SERVICE, _kr_user(key, client_id))
+        return True
+    except Exception:  # PasswordDeleteError when absent
+        return False
+
+
+def _client_secret() -> str:
+    """`APS_CLIENT_SECRET` from the environment, else the keychain (`forma-mcp auth set-secret`)."""
+    return os.environ.get("APS_CLIENT_SECRET") or _kr_get("client_secret") or ""
+
+
+def _write_private_file(path: str, text: str) -> None:
+    """Write `text` readable by the owner only (0600 on POSIX; on Windows the user-profile
+    ACLs already restrict it)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    try:
+        os.chmod(path, 0o600)  # an older file keeps its old mode through O_CREAT
+    except OSError:
+        pass
+
+
+def _read_plaintext_refresh_token() -> str | None:
     for path in (_token_file(), LEGACY_TOKEN_FILE):
         try:
             with open(path) as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+                rt = json.load(f).get("refresh_token")
+        except (OSError, json.JSONDecodeError, AttributeError):
             continue
-    return {}
+        if rt:
+            return rt
+    return None
 
 
-def _save_tokens(data: dict) -> None:
+def _remove_plaintext_tokens() -> list[str]:
+    removed = []
+    for path in (_token_file(), LEGACY_TOKEN_FILE):
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
+
+
+def _load_refresh_token() -> str | None:
+    """The stored refresh token. A plaintext `tokens.json` left by an older version is
+    moved into the keychain (and the file deleted) the first time it's read."""
+    rt = _kr_get("refresh_token")
+    if rt:
+        return rt
+    rt = _read_plaintext_refresh_token()
+    if rt and _kr_set("refresh_token", rt):
+        _remove_plaintext_tokens()
+    return rt
+
+
+def _save_refresh_token(rt: str) -> None:
+    if _kr_set("refresh_token", rt):
+        _remove_plaintext_tokens()
+        return
     os.makedirs(_data_dir(), exist_ok=True)
-    with open(_token_file(), "w") as f:
-        json.dump(data, f, indent=2)
+    _write_private_file(_token_file(), json.dumps({"refresh_token": rt}, indent=2))
+
+
+def _clear_tokens(client_id: str | None = None) -> None:
+    _kr_delete("refresh_token", client_id)
+    _remove_plaintext_tokens()
+    _user_token_cache.update(token=None, expires_at=0)
 
 
 # ---------------------------------------------------------------------------
-# 3-legged OAuth flow
+# 3-legged OAuth flow (authorization code + PKCE, with a `state` check)
 # ---------------------------------------------------------------------------
 
-def _build_auth_url() -> str:
+# Access token for the 3-legged flow; memory only (see the storage note above).
+_user_token_cache: dict = {"token": None, "expires_at": 0}
+
+# How long the local callback server waits for the browser login before giving up.
+_AUTH_CALLBACK_TIMEOUT = 300
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """(code_verifier, S256 code_challenge) per RFC 7636."""
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
+
+
+def _build_auth_url(state: str, code_challenge: str) -> str:
     params = urllib.parse.urlencode({
         "response_type": "code",
         "client_id": APS_CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "scope": SCOPES,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
     })
     return f"{APS_BASE}/authentication/v2/authorize?{params}"
 
 
-def _wait_for_callback() -> str:
-    """Spin up a one-shot HTTP server on port 8080 and block until the auth code arrives."""
+def _wait_for_callback(expected_state: str, timeout: float | None = None) -> str:
+    """Spin up a one-shot HTTP server on port 8080 and block until the auth code arrives.
+
+    A callback whose `state` doesn't match this login is rejected (login CSRF / code
+    injection), and the server gives up after `timeout` seconds instead of listening forever."""
     received: dict[str, str] = {}
 
     class Handler(BaseHTTPRequestHandler):
@@ -119,7 +256,18 @@ def _wait_for_callback() -> str:
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
             code = qs.get("code", [None])[0]
-            if code:
+            state = qs.get("state", [None])[0]
+            error = qs.get("error", [None])[0]
+            if state is None or not secrets.compare_digest(state, expected_state):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"<h2>Invalid or missing state parameter.</h2>")
+            elif error:
+                received["error"] = error
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"<h2>Authorization was not granted. You can close this tab.</h2>")
+            elif code:
                 received["code"] = code
                 self.send_response(200)
                 self.end_headers()
@@ -132,22 +280,30 @@ def _wait_for_callback() -> str:
         def log_message(self, *args):
             pass  # suppress access log noise
 
+    deadline = time.monotonic() + (timeout or _AUTH_CALLBACK_TIMEOUT)
     server = HTTPServer(("localhost", 8080), Handler)
-    server.timeout = 120  # 2 min to complete login
-    while "code" not in received:
-        server.handle_request()
-    server.server_close()
+    try:
+        while "code" not in received and "error" not in received:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Timed out waiting for the Autodesk login callback.")
+            server.timeout = min(remaining, 5)
+            server.handle_request()
+    finally:
+        server.server_close()
+    if "error" in received:
+        raise RuntimeError(f"Autodesk authorization failed: {received['error']}")
     return received["code"]
 
 
 def _get_basic_auth_header() -> str:
     """Build the Basic auth header value for client_credentials flows."""
     return base64.b64encode(
-        f"{APS_CLIENT_ID}:{APS_CLIENT_SECRET}".encode()
+        f"{APS_CLIENT_ID}:{_client_secret()}".encode()
     ).decode()
 
 
-async def _exchange_code(code: str) -> dict:
+async def _exchange_code(code: str, code_verifier: str) -> dict:
     creds = _get_basic_auth_header()
     async with httpx.AsyncClient() as client:
         res = await client.post(
@@ -160,6 +316,7 @@ async def _exchange_code(code: str) -> dict:
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
+                "code_verifier": code_verifier,
             },
         )
         res.raise_for_status()
@@ -184,48 +341,64 @@ async def _refresh_tokens(refresh_token: str) -> dict:
         return res.json()
 
 
+def _remember_tokens(data: dict, previous_refresh_token: str | None = None) -> str:
+    """Cache the access token in memory and persist the (rotated) refresh token."""
+    _user_token_cache.update(
+        token=data["access_token"],
+        expires_at=time.time() + data.get("expires_in", 3600),
+    )
+    # APS rotates refresh tokens — always save the new one
+    rt = data.get("refresh_token") or previous_refresh_token
+    if rt:
+        _save_refresh_token(rt)
+    return data["access_token"]
+
+
+async def _refresh_from_store() -> str | None:
+    """Refresh using the stored refresh token; None when there is none or it's dead."""
+    rt = _load_refresh_token()
+    if not rt:
+        return None
+    try:
+        data = await _refresh_tokens(rt)
+    except httpx.HTTPStatusError:
+        # Another forma-mcp process may have rotated the token under us — retry once
+        # with whatever is stored now; otherwise it has expired (14-day window).
+        latest = _load_refresh_token()
+        if not latest or latest == rt:
+            return None
+        try:
+            data = await _refresh_tokens(latest)
+        except httpx.HTTPStatusError:
+            return None
+        rt = latest
+    return _remember_tokens(data, rt)
+
+
 async def get_access_token() -> str:
     """Return a valid 3-legged access token, refreshing or re-authorizing as needed."""
-    now = time.time()
-    stored = _load_tokens()
-
     # Happy path: valid access token still in window
-    if stored.get("access_token") and now < stored.get("expires_at", 0) - 60:
-        return stored["access_token"]
+    if _user_token_cache["token"] and time.time() < _user_token_cache["expires_at"] - 60:
+        return _user_token_cache["token"]
 
-    # Try refresh if we have a refresh token
-    if stored.get("refresh_token"):
-        try:
-            data = await _refresh_tokens(stored["refresh_token"])
-            stored = {
-                "access_token": data["access_token"],
-                # APS rotates refresh tokens — always save the new one
-                "refresh_token": data.get("refresh_token", stored["refresh_token"]),
-                "expires_at": now + data.get("expires_in", 3600),
-            }
-            _save_tokens(stored)
-            return stored["access_token"]
-        except httpx.HTTPStatusError:
-            # Refresh token expired (14-day window passed) — fall through to re-auth
-            pass
+    token = await _refresh_from_store()
+    if token:
+        return token
 
     # Full re-authorization needed — open browser and wait for callback
-    auth_url = _build_auth_url()
-    print(f"\n[APS Auth] Opening browser for authorization...\n{auth_url}\n", flush=True)
+    state = secrets.token_urlsafe(32)
+    verifier, challenge = _pkce_pair()
+    auth_url = _build_auth_url(state, challenge)
+    # stderr: stdout is the MCP stdio channel
+    print(f"\n[APS Auth] Opening browser for authorization...\n{auth_url}\n", file=sys.stderr, flush=True)
     webbrowser.open(auth_url)
 
     # _wait_for_callback blocks the thread; run in executor so asyncio loop stays alive
     loop = asyncio.get_event_loop()
-    code = await loop.run_in_executor(None, _wait_for_callback)
+    code = await loop.run_in_executor(None, _wait_for_callback, state)
 
-    data = await _exchange_code(code)
-    stored = {
-        "access_token": data["access_token"],
-        "refresh_token": data["refresh_token"],
-        "expires_at": now + data.get("expires_in", 3600),
-    }
-    _save_tokens(stored)
-    return stored["access_token"]
+    data = await _exchange_code(code, verifier)
+    return _remember_tokens(data)
 
 
 def auth_headers(token: str) -> dict:
@@ -238,19 +411,9 @@ async def _force_refresh_access_token() -> str:
     Used when APS returns 401 mid-batch: a long bulk run can outlive a token
     even though our cached `expires_at` hasn't elapsed (e.g. the token was
     revoked). Refreshes via the stored refresh token; falls back to the full
-    `get_access_token` flow (browser re-auth) if no refresh token is available.
+    `get_access_token` flow (browser re-auth) if that isn't possible.
     """
-    stored = _load_tokens()
-    if stored.get("refresh_token"):
-        data = await _refresh_tokens(stored["refresh_token"])
-        now = time.time()
-        stored = {
-            "access_token": data["access_token"],
-            "refresh_token": data.get("refresh_token", stored["refresh_token"]),
-            "expires_at": now + data.get("expires_in", 3600),
-        }
-        _save_tokens(stored)
-        return stored["access_token"]
+    _user_token_cache.update(token=None, expires_at=0)
     return await get_access_token()
 
 
@@ -6681,14 +6844,88 @@ async def main():
         await app.run(r, w, app.create_initialization_options())
 
 
-def run():
-    """Console-script entry point (`forma-mcp`, e.g. via `uvx`)."""
-    missing = [v for v in ("APS_CLIENT_ID", "APS_CLIENT_SECRET") if not os.environ.get(v)]
+def _auth_cli(command: str, client_id: str) -> int:
+    """`forma-mcp auth <command>`: manage the credentials stored in the OS keychain."""
+    if command == "status":
+        kr = _keyring()
+        backend = type(kr.get_keyring()).__name__ if kr else "none (plaintext-file fallback)"
+        if os.environ.get("APS_CLIENT_SECRET"):
+            secret_src = "APS_CLIENT_SECRET environment variable"
+        elif client_id and _kr_get("client_secret", client_id):
+            secret_src = "OS keychain"
+        else:
+            secret_src = "MISSING"
+        if client_id and _kr_get("refresh_token", client_id):
+            token_src = "OS keychain"
+        elif _read_plaintext_refresh_token():
+            token_src = f"plaintext file ({_token_file()})"
+        else:
+            token_src = "none (browser login on next use)"
+        print(f"keychain backend : {backend}")
+        print(f"client id        : {client_id or 'MISSING (set APS_CLIENT_ID or pass --client-id)'}")
+        print(f"client secret    : {secret_src}")
+        print(f"refresh token    : {token_src}")
+        return 0
+
+    if command == "logout":
+        _clear_tokens(client_id or None)
+        print("Stored login removed; the next tool call opens a browser login.")
+        return 0
+
+    if not client_id:
+        print("forma-mcp: no client id — set APS_CLIENT_ID or pass --client-id.", file=sys.stderr)
+        return 2
+    if not _keyring():
+        print("forma-mcp: no OS keychain available — keep the secret in APS_CLIENT_SECRET instead.",
+              file=sys.stderr)
+        return 1
+
+    if command == "set-secret":
+        secret = getpass.getpass(f"APS client secret for {client_id}: ").strip()
+        if not secret:
+            print("forma-mcp: empty secret, nothing stored.", file=sys.stderr)
+            return 1
+        if not _kr_set("client_secret", secret, client_id):
+            print("forma-mcp: could not write to the OS keychain.", file=sys.stderr)
+            return 1
+        print("Client secret stored in the OS keychain. You can now remove APS_CLIENT_SECRET "
+              "from your MCP server config.")
+        return 0
+
+    if command == "delete-secret":
+        if _kr_delete("client_secret", client_id):
+            print("Client secret removed from the OS keychain.")
+        else:
+            print("No client secret was stored for this client id.")
+        return 0
+
+    raise ValueError(f"Unknown auth command: {command}")
+
+
+def run(argv: list[str] | None = None):
+    """Console-script entry point (`forma-mcp`, e.g. via `uvx`).
+
+    With no arguments it serves MCP over stdio; `forma-mcp auth ...` manages credentials."""
+    parser = argparse.ArgumentParser(prog="forma-mcp", description="Forma / ACC MCP server")
+    sub = parser.add_subparsers(dest="command")
+    auth = sub.add_parser("auth", help="manage stored credentials (OS keychain)")
+    auth.add_argument("action", choices=["set-secret", "delete-secret", "logout", "status"])
+    auth.add_argument("--client-id", default=os.environ.get("APS_CLIENT_ID", ""),
+                      help="APS client id (defaults to APS_CLIENT_ID)")
+    args = parser.parse_args(argv)
+    if args.command == "auth":
+        sys.exit(_auth_cli(args.action, args.client_id.strip()))
+
+    missing = []
+    if not os.environ.get("APS_CLIENT_ID"):
+        missing.append("APS_CLIENT_ID")
+    elif not _client_secret():
+        missing.append("APS_CLIENT_SECRET")
     if missing:
         sys.exit(
-            f"forma-mcp: missing environment variable(s): {', '.join(missing)}. "
-            "Set them in your MCP server config (e.g. `claude mcp add aps -e APS_CLIENT_ID=... "
-            "-e APS_CLIENT_SECRET=... -- uvx ...`)."
+            f"forma-mcp: missing {', '.join(missing)}. Set APS_CLIENT_ID in your MCP server config "
+            "and store the secret in the OS keychain with `forma-mcp auth set-secret` "
+            "(or set APS_CLIENT_SECRET in the config)."
         )
     asyncio.run(main())
 
