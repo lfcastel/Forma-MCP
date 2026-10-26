@@ -1355,6 +1355,147 @@ def _review_list_params(arguments: dict) -> dict:
     return params
 
 
+async def _resolve_review_file_versions(
+    client: httpx.AsyncClient, token: str, hub_id: str, project_id: str,
+    hdrs: dict, arguments: dict,
+) -> list[dict]:
+    """Collect create_review's ``fileVersions`` (``[{urn}]``) from raw version URNs
+    (``file_versions``) and/or ``files`` given as ``{folder_path, file_name}`` — the
+    latter resolved to each file's tip (latest) version, listing each folder once.
+    Raises ValueError on an unknown folder/file or when no file is given."""
+    out: list[dict] = []
+    for v in (arguments.get("file_versions") or []):
+        out.append(v if isinstance(v, dict) else {"urn": v})
+
+    files = arguments.get("files") or []
+    listings: dict[str, list] = {}
+    for f in files:
+        folder_path = f.get("folder_path")
+        file_name = (f.get("file_name") or "").strip()
+        if not folder_path or not file_name:
+            raise ValueError("Each 'files' entry needs 'folder_path' and 'file_name'.")
+        if folder_path not in listings:
+            folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
+            contents = await get_all_folder_contents(client, project_id, folder_id, hdrs)
+            listings[folder_path] = [i for i in contents if i["type"] == "items"]
+        items = listings[folder_path]
+        match = next(
+            (i for i in items
+             if (i["attributes"].get("displayName") or "").lower() == file_name.lower()),
+            None,
+        )
+        if match is None:
+            available = [i["attributes"].get("displayName") for i in items]
+            raise ValueError(
+                f"File '{file_name}' not found in '{folder_path}'. Available files: {available}"
+            )
+        tip = match.get("relationships", {}).get("tip", {}).get("data", {}).get("id")
+        if not tip:
+            item_r = await client.get(
+                f"{APS_BASE}/data/v1/projects/{project_id}/items/{match['id']}", headers=hdrs,
+            )
+            item_r.raise_for_status()
+            tip = (item_r.json().get("data", {})
+                   .get("relationships", {}).get("tip", {}).get("data", {}).get("id"))
+        if not tip:
+            raise ValueError(f"Could not determine tip version for '{file_name}'.")
+        out.append({"urn": tip})
+
+    if not out:
+        raise ValueError("Provide at least one file via 'file_versions' or 'files'.")
+    if len(out) > 1000:
+        raise ValueError(f"A review holds at most 1000 file versions (got {len(out)}).")
+    return out
+
+
+_REVIEWER_KEYS = ("reviewer_users", "reviewer_roles", "reviewer_companies")
+
+
+def _review_step_overrides(arguments: dict) -> list[dict]:
+    """create_review's per-step candidate overrides: the raw ``workflow_options.steps``
+    followed by the friendly ``step_reviewers`` entries."""
+    raw = (arguments.get("workflow_options") or {}).get("steps") or []
+    return list(raw) + list(arguments.get("step_reviewers") or [])
+
+
+def _review_create_payload(
+    arguments: dict,
+    workflow_id: str,
+    file_versions: list[dict],
+    directory: "dict | None" = None,
+    step_ids_by_name: "dict | None" = None,
+    copy_folder_urn: "str | None" = None,
+) -> dict:
+    """Build the POST body for a review (snake_case → API camelCase, supplied keys
+    only). ``workflow_options`` is the base of the API's ``workflowOptions``; on top
+    of it, ``step_reviewers`` (step by ``step_id``/``step_name``, reviewers by
+    name via ``directory`` — same resolver as create_workflow) become
+    ``steps:[{id, candidates}]`` and ``copy_folder_urn`` sets
+    ``copyFilesOptions.folderUrn``. Raises ValueError on an unknown step name or a
+    step override with no candidates (the API requires at least one)."""
+    if not arguments.get("name"):
+        raise ValueError("Review 'name' is required.")
+    body: dict = {
+        "name": arguments["name"],
+        "workflowId": workflow_id,
+        "fileVersions": file_versions,
+    }
+    if arguments.get("notes") is not None:
+        body["notes"] = arguments["notes"]
+
+    opts = dict(arguments.get("workflow_options") or {})
+    steps_out = []
+    for step in _review_step_overrides(arguments):
+        step_id = step.get("id") or step.get("step_id")
+        if not step_id and step.get("step_name"):
+            step_id = (step_ids_by_name or {}).get(step["step_name"].lower())
+            if not step_id:
+                raise ValueError(
+                    f"No step named '{step['step_name']}' in the workflow. "
+                    f"Available: {sorted((step_ids_by_name or {}).keys())}"
+                )
+        if not step_id:
+            raise ValueError("Each step override needs 'step_id' or 'step_name'.")
+        candidates = _resolve_candidates(step, directory) if directory is not None else {}
+        if not candidates and step.get("candidates"):
+            candidates = step["candidates"]
+        if not candidates:
+            raise ValueError(
+                f"Step '{step.get('step_name') or step_id}': give at least one reviewer "
+                f"(reviewer_users / reviewer_roles / reviewer_companies)."
+            )
+        steps_out.append({"id": step_id, "candidates": candidates})
+    if steps_out:
+        opts["steps"] = steps_out
+    elif "steps" in opts:
+        del opts["steps"]
+    if copy_folder_urn:
+        opts["copyFilesOptions"] = {**(opts.get("copyFilesOptions") or {}), "folderUrn": copy_folder_urn}
+    if opts:
+        body["workflowOptions"] = opts
+    return body
+
+
+def _workflow_options_need_directory(arguments: dict) -> bool:
+    """True when create_review's step overrides name reviewers that must be resolved
+    to Autodesk IDs (so the project directory is only built when needed)."""
+    return any(s.get(k) for s in _review_step_overrides(arguments) for k in _REVIEWER_KEYS)
+
+
+def _workflow_step_ids_by_name(workflow: dict) -> dict:
+    """{lower-cased step name: step id} for a workflow, used to address a step by the
+    name shown in the UI. Raises ValueError if two steps share a name."""
+    out: dict = {}
+    for s in workflow.get("steps") or []:
+        key = (s.get("name") or "").lower()
+        if not key:
+            continue
+        if key in out:
+            raise ValueError(f"Workflow has several steps named '{s['name']}' — use step_id.")
+        out[key] = s.get("id")
+    return out
+
+
 async def _resolve_review_ref(
     client: httpx.AsyncClient, rv_hdrs: dict, bare_project_id: str, arguments: dict
 ) -> str:
@@ -3974,6 +4115,65 @@ async def list_tools() -> list[Tool]:
                     "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
                 },
                 "required": [],
+            },
+        ),
+        Tool(
+            name="create_review",
+            description=(
+                "Start a file review in an ACC project from an existing approval "
+                "workflow (by workflow_id or workflow_name). Files are given as raw "
+                "version URNs (file_versions) and/or as {folder_path, file_name} pairs "
+                "(files), which resolve to each file's latest version. Posts immediately "
+                "and notifies the workflow's reviewers — pass dry_run=true to preview the "
+                "resolved request body first. Optional overrides for this review only: "
+                "step_reviewers replaces a step's default reviewers (step by id or name, "
+                "reviewers by name/email/role/company, resolved like create_workflow) and "
+                "copy_to_folder sets where approved files are copied. Not compatible "
+                "with BIM 360 projects."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "name": {"type": "string", "description": "Review name (max 255)."},
+                    "workflow_id": {"type": "string", "description": "Approval workflow UUID (see list_workflows). Provide this or workflow_name."},
+                    "workflow_name": {"type": "string", "description": "Approval workflow name (exact, case-insensitive) — resolved via one list call. Provide this or workflow_id."},
+                    "notes": {"type": "string", "description": "Review description shown in the UI (max 4096)."},
+                    "file_versions": {"type": "array", "items": {"type": "string"}, "description": "File version URNs (e.g. 'urn:adsk.wipemea.fs.file:vf.xxx?version=2') to review."},
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "folder_path": {"type": "string", "description": "Folder path from the project root, e.g. 'Project Files/Design'."},
+                                "file_name": {"type": "string", "description": "File display name in that folder (case-insensitive exact match)."},
+                            },
+                            "required": ["folder_path", "file_name"],
+                        },
+                        "description": "Files to review by location — each resolves to its latest version. Combined with file_versions (≤1000 total).",
+                    },
+                    "step_reviewers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step_id": {"type": "string", "description": "Workflow step ID (see get_workflow). Provide this or step_name."},
+                                "step_name": {"type": "string", "description": "Workflow step name as shown in the UI (case-insensitive) — resolved via one get_workflow call."},
+                                "reviewer_users": {"type": "array", "items": {"type": "string"}, "description": "Users by name or email (raw autodeskId also accepted)."},
+                                "reviewer_roles": {"type": "array", "items": {"type": "string"}, "description": "Roles by name (resolved like create_workflow) or raw numeric autodeskId."},
+                                "reviewer_companies": {"type": "array", "items": {"type": "string"}, "description": "Companies by name or raw autodeskId."},
+                            },
+                        },
+                        "description": "Replace the workflow's default reviewers/approvers for specific steps of this review. Steps not listed keep the workflow defaults. Each entry needs at least one reviewer.",
+                    },
+                    "copy_to_folder": {"type": "string", "description": "Folder path (e.g. 'Project Files/Approved') or folder URN to copy approved files to when the review completes — overrides the workflow's target folder (sets workflowOptions.copyFilesOptions.folderUrn)."},
+                    "workflow_options": {"type": "object", "description": "Advanced: a raw workflowOptions object ({copyFilesOptions:{folderUrn}, steps:[{id, candidates:{users/roles/companies:[{autodeskId}]}}]}) used as the base; step_reviewers and copy_to_folder are applied on top."},
+                    "dry_run": {"type": "boolean", "description": "If true, return the resolved request body without posting. Default false."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+                },
+                "required": ["name"],
             },
         ),
     ]
@@ -6831,6 +7031,57 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     else {"error": wr.status_code, "body": _error_body(wr)}
                 )
             return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+        if name == "create_review":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            bare_id = _to_bare_id(project_id)
+            rv_hdrs = {**hdrs, "x-ads-region": REVIEWS_REGION, "Content-Type": "application/json"}
+            if not arguments.get("workflow_id") and not arguments.get("workflow_name"):
+                raise ValueError("Provide 'workflow_id' or 'workflow_name'.")
+            workflow_id = await _resolve_workflow_ref(client, rv_hdrs, bare_id, {
+                "workflow_id": arguments.get("workflow_id"),
+                "name": arguments.get("workflow_name"),
+            })
+            file_versions = await _resolve_review_file_versions(
+                client, token, hub_id, project_id, hdrs, arguments,
+            )
+            directory = (
+                await _build_project_directory(client, token, bare_id)
+                if _workflow_options_need_directory(arguments) else None
+            )
+            step_ids_by_name = None
+            if any(s.get("step_name") and not (s.get("id") or s.get("step_id"))
+                   for s in _review_step_overrides(arguments)):
+                wr = await client.get(
+                    f"{WORKFLOWS_URL.format(pid=bare_id)}/{workflow_id}", headers=rv_hdrs,
+                )
+                wr.raise_for_status()
+                step_ids_by_name = _workflow_step_ids_by_name(wr.json())
+            copy_folder_urn = None
+            if arguments.get("copy_to_folder"):
+                copy_folder_urn, _ = await _resolve_folder(
+                    client, token, hub_id, project_id, arguments["copy_to_folder"],
+                )
+            body = _review_create_payload(
+                arguments, workflow_id, file_versions, directory,
+                step_ids_by_name, copy_folder_urn,
+            )
+            if arguments.get("dry_run", False):
+                return [TextContent(type="text", text=json.dumps({
+                    "project": resolved_name,
+                    "dry_run": True,
+                    "status": "would_create",
+                    "request_body": body,
+                }, indent=2))]
+            r = await client.post(REVIEWS_URL.format(pid=bare_id), headers=rv_hdrs, json=body)
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps(
+                    {"error": r.status_code, "body": _error_body(r)}, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                "project": resolved_name,
+                "status": "created",
+                "review": r.json(),
+            }, indent=2))]
 
     raise ValueError(f"Unknown tool: {name}")
 

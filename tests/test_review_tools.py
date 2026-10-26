@@ -247,3 +247,166 @@ async def test_get_review_surfaces_error_body():
 
     data = _parse(result)
     assert data["error"] == 404
+
+
+# ===========================================================================
+# create_review
+# ===========================================================================
+
+from conftest import (  # noqa: E402
+    PROJECT_ID, FAKE_APP_TOKEN, PROJECT_MEMBERS_RESPONSE,
+    USER_A_EMAIL, USER_A_AUTODESK_ID,
+)
+
+FOLDER_ID = "urn:adsk.wipprod:fs.folder:co.design"
+TIP_URN = "urn:adsk.wipprod:fs.file:vf.abc?version=3"
+ADMIN_USERS = f"{BASE}/construction/admin/v1/projects/{BARE_PROJECT_ID}/users"
+
+
+def _mock_folder(router: respx.MockRouter):
+    router.get(f"{BASE}/project/v1/hubs/{HUB_ID}/projects/{PROJECT_ID}/topFolders").mock(
+        return_value=httpx.Response(200, json={"data": [
+            {"id": FOLDER_ID, "type": "folders",
+             "attributes": {"name": "Design", "displayName": "Design"}},
+        ]}))
+    router.get(f"{BASE}/data/v1/projects/{PROJECT_ID}/folders/{FOLDER_ID}/contents").mock(
+        return_value=httpx.Response(200, json={"data": [
+            {"id": "urn:item-1", "type": "items",
+             "attributes": {"displayName": "plan.pdf"},
+             "relationships": {"tip": {"data": {"id": TIP_URN}}}},
+        ]}))
+
+
+@respx.mock
+async def test_create_review_posts_files_and_workflow_by_name():
+    _mock_resolve(respx)
+    _mock_folder(respx)
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=WORKFLOWS_RESPONSE))
+    post = respx.post(RV_BASE).mock(return_value=httpx.Response(201, json=REVIEW))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME,
+            "name": "Test Review",
+            "workflow_name": "design review",
+            "notes": "Please check",
+            "file_versions": ["urn:raw:v1"],
+            "files": [{"folder_path": "Design", "file_name": "PLAN.pdf"}],
+        })
+
+    data = _parse(result)
+    assert data["status"] == "created"
+    assert data["review"]["id"] == REVIEW_ID
+    req = post.calls[0].request
+    assert req.headers["x-ads-region"] == aps_mcp.REVIEWS_REGION
+    body = json.loads(req.content)
+    assert body == {
+        "name": "Test Review",
+        "workflowId": WORKFLOW_ID,
+        "fileVersions": [{"urn": "urn:raw:v1"}, {"urn": TIP_URN}],
+        "notes": "Please check",
+    }
+
+
+@respx.mock
+async def test_create_review_dry_run_does_not_post():
+    _mock_resolve(respx)
+    post = respx.post(RV_BASE).mock(return_value=httpx.Response(201, json=REVIEW))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME, "name": "R", "workflow_id": WORKFLOW_ID,
+            "file_versions": ["urn:raw:v1"], "dry_run": True,
+        })
+
+    data = _parse(result)
+    assert data["status"] == "would_create"
+    assert data["request_body"]["fileVersions"] == [{"urn": "urn:raw:v1"}]
+    assert not post.called
+
+
+@respx.mock
+async def test_create_review_resolves_override_step_reviewers():
+    _mock_resolve(respx)
+    respx.get(ADMIN_USERS).mock(return_value=httpx.Response(200, json=PROJECT_MEMBERS_RESPONSE))
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=WORKFLOWS_RESPONSE))
+    post = respx.post(RV_BASE).mock(return_value=httpx.Response(201, json=REVIEW))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+        await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME, "name": "R", "workflow_id": WORKFLOW_ID,
+            "file_versions": ["urn:raw:v1"],
+            "workflow_options": {"steps": [{"id": "step-1", "reviewer_users": [USER_A_EMAIL]}]},
+        })
+
+    step = json.loads(post.calls[0].request.content)["workflowOptions"]["steps"][0]
+    assert step == {"id": "step-1", "candidates": {"users": [{"autodeskId": USER_A_AUTODESK_ID}]}}
+
+
+@respx.mock
+async def test_create_review_requires_files():
+    _mock_resolve(respx)
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         pytest.raises(ValueError, match="at least one file"):
+        await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME, "name": "R", "workflow_id": WORKFLOW_ID,
+        })
+
+
+@respx.mock
+async def test_create_review_surfaces_error_body():
+    _mock_resolve(respx)
+    respx.post(RV_BASE).mock(return_value=httpx.Response(400, json={"detail": "bad urn"}))
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN):
+        result = await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME, "name": "R", "workflow_id": WORKFLOW_ID,
+            "file_versions": ["urn:bad"],
+        })
+    data = _parse(result)
+    assert data["error"] == 400
+
+
+@respx.mock
+async def test_create_review_step_reviewers_by_name_and_copy_folder():
+    _mock_resolve(respx)
+    _mock_folder(respx)
+    respx.get(ADMIN_USERS).mock(return_value=httpx.Response(200, json=PROJECT_MEMBERS_RESPONSE))
+    respx.get(WF_BASE).mock(return_value=httpx.Response(200, json=WORKFLOWS_RESPONSE))
+    respx.get(f"{WF_BASE}/{WORKFLOW_ID}").mock(return_value=httpx.Response(200, json={
+        "id": WORKFLOW_ID,
+        "steps": [{"id": "step-0", "name": "Start", "type": "INITIATOR"},
+                  {"id": "step-1", "name": "Final Approval", "type": "APPROVER"}],
+    }))
+    post = respx.post(RV_BASE).mock(return_value=httpx.Response(201, json=REVIEW))
+
+    with patch("aps_mcp.get_access_token", return_value=FAKE_TOKEN), \
+         patch("aps_mcp.get_app_token", return_value=FAKE_APP_TOKEN):
+        await aps_mcp.call_tool("create_review", {
+            "project_name": PROJECT_NAME, "name": "R", "workflow_id": WORKFLOW_ID,
+            "file_versions": ["urn:raw:v1"],
+            "step_reviewers": [{"step_name": "final approval", "reviewer_users": [USER_A_EMAIL]}],
+            "copy_to_folder": "Design",
+        })
+
+    opts = json.loads(post.calls[0].request.content)["workflowOptions"]
+    assert opts == {
+        "steps": [{"id": "step-1", "candidates": {"users": [{"autodeskId": USER_A_AUTODESK_ID}]}}],
+        "copyFilesOptions": {"folderUrn": FOLDER_ID},
+    }
+
+
+async def test_review_payload_rejects_step_without_reviewers():
+    with pytest.raises(ValueError, match="at least one reviewer"):
+        aps_mcp._review_create_payload(
+            {"name": "R", "step_reviewers": [{"step_id": "step-1"}]},
+            WORKFLOW_ID, [{"urn": "urn:raw:v1"}],
+        )
+
+
+async def test_review_payload_unknown_step_name():
+    with pytest.raises(ValueError, match="No step named"):
+        aps_mcp._review_create_payload(
+            {"name": "R", "step_reviewers": [{"step_name": "Nope", "candidates": {"users": [{"autodeskId": "X"}]}}]},
+            WORKFLOW_ID, [{"urn": "urn:raw:v1"}], step_ids_by_name={"start": "step-0"},
+        )

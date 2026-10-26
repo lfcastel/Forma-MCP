@@ -271,6 +271,7 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 |------|-------------|------|
 | `list_reviews` | List file reviews (instances started from a workflow); filter by `status` (OPEN/CLOSED/VOID/FAILED), `workflow_id`/`workflow_name`, `name`, `sequence_id`, date ranges (`created_at`, `updated_at`, `finished_at`, `current_step_due_date`, `approved_at`, `archived_at` as `start..end`), next-action user/role/company, `approved_by`, `archived`; `sort`; auto-paginates. Archived reviews are hidden unless `archived=true` | 3-legged |
 | `get_review` | Get one review by `review_id` (UUID) or `sequence_id` (the UI number); `include` any of `progress` (per-step state, who acted, notes), `versions` (files in the latest round with approval status, filterable by `approve_status` label) and `workflow` (the workflow snapshot the review used) | 3-legged |
+| `create_review` | Start a review from an existing workflow (`workflow_id` or `workflow_name`) on files given as raw version URNs (`file_versions`) and/or `files: [{folder_path, file_name}]` (→ latest version); optional `notes`; per-review overrides `step_reviewers` (replace a step's default reviewers — step by `step_id` or `step_name`, reviewers by name/email/role/company, resolved like `create_workflow`) and `copy_to_folder` (path or URN for approved copies); raw `workflow_options` for advanced use. Posts immediately and notifies reviewers — `dry_run=true` returns the resolved body | 3-legged (`data:write`) |
 
 ---
 
@@ -367,6 +368,7 @@ flowchart LR
     subgraph REVIEWS["File reviews · Reviews · 3-legged OAuth · x-ads-region: EMEA"]
         T52(list_reviews)
         T53(get_review)
+        T54(create_review)
     end
 
     E1["GET /project/v1/hubs"]
@@ -409,6 +411,7 @@ flowchart LR
     E38["GET /construction/reviews/v1/projects/{p}/reviews"]
     E39["GET /construction/reviews/v1/projects/{p}/reviews/{r}"]
     E40["GET /construction/reviews/v1/projects/{p}/reviews/{r}/progress · /versions · /workflow"]
+    E41["POST /construction/reviews/v1/projects/{p}/reviews"]
 
     T1 --> E1
     T2 --> E2
@@ -501,10 +504,12 @@ flowchart LR
     T53 --> E38
     T53 --> E39
     T53 --> E40
+    T54 --> E35
+    T54 --> E41
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40 get
-    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37 post
+    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41 post
     class E15,E17,E20,E25,E26,E34 patch
     class E16 del
 ```
@@ -607,6 +612,8 @@ List the open reviews in "Northgate Tower" whose current step is due this week
 Show the progress of review 42 in "Northgate Tower"
 Which files in review 42 were rejected?
 List every closed review created from the "Design Review" workflow in "Northgate Tower"
+Start a review "Facade IFC check" in "Northgate Tower" with the "Design Review" workflow on Project Files/Design/facade.ifc (preview first)
+Start a review on Project Files/Design/plan.pdf in "Northgate Tower" using "Design Review", with Alice as approver on the "Final Approval" step and approved copies going to Project Files/Approved
 ```
 
 ---
@@ -684,7 +691,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 53 tools
+├── aps_mcp.py                  # MCP server — 54 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build)
 ├── pyproject.toml              # packaging: `forma-mcp` console script for uvx
