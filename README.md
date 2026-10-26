@@ -74,7 +74,7 @@ uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.3.0 forma-mcp auth set-s
 **2. Register the server with Claude Code.** Only the (non-secret) Client ID goes in the config:
 
 ```bash
-claude mcp add aps --scope user \
+claude mcp add forma-mcp --scope user \
   -e APS_CLIENT_ID=your_client_id \
   -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.3.0 forma-mcp
 ```
@@ -83,7 +83,7 @@ Or add it by hand to `~/.claude.json`:
 
 ```json
 "mcpServers": {
-  "aps": {
+  "forma-mcp": {
     "type": "stdio",
     "command": "uvx",
     "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.3.0", "forma-mcp"],
@@ -96,14 +96,14 @@ Or add it by hand to `~/.claude.json`:
 
 No keychain on the machine (e.g. a headless Linux box)? Put `APS_CLIENT_SECRET` in the `env` block instead — an env value always wins over the keychain, so existing configs keep working.
 
-Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `aps` should show as connected. The first tool call opens a browser for the Autodesk login.
+Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `forma-mcp` should show as connected. The first tool call opens a browser for the Autodesk login.
 
 **Upgrading:** change the tag (`@v0.3.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
 
 ```bash
-claude mcp add aps --scope user \
+claude mcp add forma-mcp --scope user \
   -e APS_CLIENT_ID=your_client_id \
   -- uvx --refresh --from git+https://github.com/lfcastel/Forma-MCP forma-mcp
 ```
