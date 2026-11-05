@@ -126,7 +126,7 @@ claude mcp add forma-mcp --scope user \
 
 or in `~/.claude.json`: `"args": ["--refresh", "--from", "git+https://github.com/lfcastel/Forma-MCP", "forma-mcp"]`. Pin a tag instead when you want everyone on the same reproducible build.
 
-> **`mcp` is pinned to the 1.x line** (`mcp>=1.0.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
+> **`mcp` is pinned to the 1.x line** (`mcp>=1.30.0,<2`). The MCP Python SDK 2.0 removed the low-level `Server.list_tools()` / `Server.call_tool()` decorator API this server is built on, so a 2.x install fails at import with `'Server' object has no attribute 'list_tools'`. Don't bump the pin without porting the server.
 
 ### Optional environment variables
 
