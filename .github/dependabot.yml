@@ -9,6 +9,12 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
+    ignore:
+      # MCP SDK 2.x removed the low-level Server.list_tools()/call_tool() API this
+      # server is built on (see the `mcp<2` pin in pyproject.toml). Drop this rule
+      # only together with a port to the 2.x API.
+      - dependency-name: mcp
+        versions: [">=2"]
   # Pinned GitHub Actions SHAs in .github/workflows
   - package-ecosystem: github-actions
     directory: /
