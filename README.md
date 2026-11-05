@@ -307,12 +307,14 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | Tool | What it does | Auth |
 |------|-------------|------|
 | `list_submittals` | List submittal items with `search`, title, `state_id`, `status_id`, spec, package, item type, manager, subcontractor, ball-in-court user, due date; `sort`; auto-paginates (50/page) | 3-legged |
-| `get_submittal` | Get one item; by default with its review steps and their tasks; optionally `include_revisions` and `include_attachments` | 3-legged |
+| `get_submittal` | Get one item with `allowed_transitions` (the states *you* may move it to now, and each one's required fields); by default with its review steps and their tasks; optionally `include_revisions` and `include_attachments` | 3-legged |
 | `list_submittal_types` | Item types plus (by default) review responses — reference data for create/update and decoding | 3-legged |
 | `list_submittal_specs` | Spec sections (identifier, title, UUID); `search`, `identifier` | 3-legged |
 | `list_submittal_packages` | Submittal packages (read-only in the API); `package_id` returns one | 3-legged |
-| `create_submittal` | Create an item — requires `title`, `type_id`, `spec_id`, `state_id` (`draft`, `sbc-1`, `mgr-1`; the state decides which other fields are required); posts immediately | 3-legged (`data:write`) |
+| `create_submittal` | Create an item — requires `title`, `type_id`, `spec_id`, `state_id` (`draft`, `sbc-1`, `mgr-1`; the state decides which other fields are required); `manager_type`/`subcontractor_type` as `user`/`company`/`role`; posts immediately | 3-legged (`data:write`) |
 | `update_submittal` | Update an item's fields (not its workflow state); posts immediately | 3-legged (`data:write`) |
+| `transition_submittal` | Move an item through the workflow (`sbc-1` waiting for submission → `mgr-1` submitted → `rev` in review → `mgr-2` reviewed → `sbc-2` closed, or `void`). **Pre-checks** the item's live permitted actions: a transition you may not make, or a missing required field (e.g. `manager` when submitting, the final `response` when closing), returns the allowed options and posts nothing. Final response by name (`response: "Approved"`) or id; `mail_note`, `step_due_date` | 3-legged (`data:write`) |
+| `submit_submittal_review` | As a reviewer, submit your response (by name or id, plus comment) on your open review task — found automatically (the task where you hold the close action); ACC advances the item when the last task is done | 3-legged (`data:write`) |
 
 ### Transmittals & file packages (Docs)
 
@@ -437,6 +439,8 @@ flowchart LR
         T65(list_submittal_packages)
         T66(create_submittal)
         T67(update_submittal)
+        T71(transition_submittal)
+        T72(submit_submittal_review)
     end
 
     subgraph TRANS["Transmittals & file packages · 3-legged OAuth · read-only"]
@@ -497,6 +501,8 @@ flowchart LR
     E50["PATCH /construction/submittals/v2/projects/{p}/items/{i}"]
     E51["GET /construction/transmittals/v1/projects/{p}/transmittals · /{t}/documents · /recipients · /folders"]
     E52["GET /construction/packages/v1/projects/{p}/packages · /{k}/resources"]
+    E53["POST /construction/submittals/v2/projects/{p}/items/{i}:transition"]
+    E54["POST /construction/submittals/v2/projects/{p}/items/{i}/steps/{s}/tasks/{t}:close"]
 
     T1 --> E1
     T2 --> E2
@@ -608,10 +614,14 @@ flowchart LR
     T68 --> E51
     T69 --> E51
     T70 --> E52
+    T71 --> E47
+    T71 --> E53
+    T72 --> E47
+    T72 --> E54
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70,T71,T72 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40,E43,E44,E47,E48,E51,E52 get
-    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41,E42,E45,E49 post
+    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41,E42,E45,E49,E53,E54 post
     class E15,E17,E20,E25,E26,E34,E46,E50 patch
     class E16 del
 ```
@@ -727,6 +737,9 @@ Create a draft RFI "Pipe size room 3" in "Northgate Tower" asking whether the 50
 Close RFI 012 with the official response "Use 63mm" (answered)
 List the submittals in "Northgate Tower" that are with the manager (mgr-1), grouped by spec section
 Show submittal package "Doors & hardware" and its items
+Submit submittal 033000-004 to the manager (Alice) with the note "for review"
+Approve my review task on submittal 033000-004 with the comment "OK, see markups"
+Close submittal 033000-004 with the final response Approved
 List the transmittals sent from "Northgate Tower" this month and the documents in the latest one
 List the file packages in "Northgate Tower" and the files in each
 ```
@@ -809,7 +822,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 70 tools
+├── aps_mcp.py                  # MCP server — 72 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build + dependency audit)
 ├── .github/dependabot.yml      # weekly dependency / action updates (14-day cooldown)

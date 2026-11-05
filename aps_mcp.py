@@ -2649,6 +2649,78 @@ _SUBMITTAL_BODY_MAP = {
     "package_id": "packageId", "template_id": "templateId",
 }
 
+# Submittal manager/subcontractor types are numeric codes in the API.
+_SUBMITTAL_ACTOR_TYPES = {"user": "1", "company": "2", "role": "3"}
+_SUBMITTAL_STATES = (
+    "sbc-1 = Waiting for submission (responsible contractor), mgr-1 = Open - submitted "
+    "(manager prepares for review), rev = Open - in review, mgr-2 = Open - reviewed (manager "
+    "sets the final response), sbc-2 = Closed, void = Voided. Items can leave draft but never return to it."
+)
+
+
+def _submittal_actor_type(value: "Any") -> str:
+    """Accept user/company/role or the API's codes 1/2/3."""
+    v = str(value).strip().lower()
+    if v in _SUBMITTAL_ACTOR_TYPES:
+        return _SUBMITTAL_ACTOR_TYPES[v]
+    if v in _SUBMITTAL_ACTOR_TYPES.values():
+        return v
+    raise ValueError(f"Unknown actor type '{value}': use user, company or role (or 1, 2, 3).")
+
+
+_SUBMITTAL_TRANSFORMS = {
+    "manager_type": _submittal_actor_type, "subcontractor_type": _submittal_actor_type,
+}
+
+
+def _submittal_transitions(item: dict) -> dict:
+    """Summarise the `Item::wf_transition` permitted action of a submittal item: the
+    transitions the *current user* may make right now and the fields each requires."""
+    acts = item.get("permittedActions") or []
+    if isinstance(acts, dict):
+        acts = list(acts.values())
+    wf = next((a for a in acts if isinstance(a, dict) and a.get("id") == "Item::wf_transition"), None)
+    if not wf:
+        return {"can_transition": False, "transitions": []}
+    general = [f for f in (wf.get("mandatoryFields") or []) if f != "stateId"]
+    out = []
+    for t in wf.get("transitions") or []:
+        out.append({
+            "to": (t.get("stateTo") or {}).get("id"),
+            "name": t.get("name"),
+            "required_fields": sorted(set(general) | set(t.get("mandatoryFields") or [])),
+            "optional_fields": [f for f in (t.get("transitionFields") or [])
+                                if f not in (t.get("mandatoryFields") or [])],
+        })
+    return {"can_transition": True, "transitions": out}
+
+
+# snake_case arg → camelCase body field, for the transition endpoint.
+_TRANSITION_BODY_MAP = {
+    "mail_note": "mailNote", "step_due_date": "stepDueDate", "response_id": "responseId",
+    "response_comment": "responseComment", "manager": "manager", "manager_type": "managerType",
+    "subcontractor": "subcontractor", "subcontractor_type": "subcontractorType",
+    "submitter_due_date": "submitterDueDate", "manager_due_date": "managerDueDate",
+    "custom_identifier": "customIdentifier",
+}
+
+
+async def _resolve_submittal_response(client, hdrs: dict, sbase: str, arguments: dict) -> "str | None":
+    """A review response id from `response_id`, or from `response` (its name, e.g. 'Approved')."""
+    if arguments.get("response_id"):
+        return arguments["response_id"]
+    name = arguments.get("response")
+    if not name:
+        return None
+    rows = await _get_all_issues(client, f"{sbase}/responses", hdrs, page_limit=50)
+    want = str(name).strip().lower()
+    for row in rows:
+        labels = [str(row.get(k, "")).strip().lower() for k in ("value", "name", "label", "title")]
+        if want in labels:
+            return row["id"]
+    known = sorted({str(row.get("value") or row.get("name") or row.get("label") or row.get("id")) for row in rows})
+    raise ValueError(f"No submittal response named '{name}'. Known responses: {known}")
+
 _RFI_STATUS_HELP = (
     "Single-reviewer (US) workflow: draft, submitted, open, answered, rejected, closed, void. "
     "Multi-reviewer (EMEA) workflow: draft, submitted, openRev1, openRev2, answeredRev1, "
@@ -2681,9 +2753,9 @@ _SUBMITTAL_WRITE_PROPS = {
     "description": {"type": "string", "description": "Item description."},
     "priority": {"type": "string", "description": "Low, Normal or High."},
     "manager": {"type": "string", "description": "Manager Autodesk ID (user) or role/company ID per manager_type."},
-    "manager_type": {"type": "string", "description": "Type of `manager`: user, role or company."},
+    "manager_type": {"type": "string", "description": "Type of `manager`: user, company or role (sent as the API codes 1/2/3)."},
     "subcontractor": {"type": "string", "description": "Responsible contractor/submitter ID."},
-    "subcontractor_type": {"type": "string", "description": "Type of `subcontractor`: user, role or company."},
+    "subcontractor_type": {"type": "string", "description": "Type of `subcontractor`: user, company or role (sent as the API codes 1/2/3)."},
     "watchers": {"type": "array", "items": {"type": "object"}, "description": "Raw watcher objects as the API expects ([{id, type}])."},
     "required_on_job_date": {"type": "string", "description": "YYYY-MM-DD."},
     "lead_time": {"type": "integer", "description": "Lead time in days."},
@@ -2885,6 +2957,52 @@ _BUILD_TOOLS = [
             **_SUBMITTAL_WRITE_PROPS,
         }, "required": ["submittal_id"]},
     ),
+    Tool(
+        name="transition_submittal",
+        description=(
+            "Move a submittal item to another workflow state. Posts immediately, but first checks "
+            "the item's live permittedActions: if the transition isn't allowed for you, or a "
+            "required field is missing, nothing is posted and the allowed transitions (with their "
+            "required fields) are returned. States: " + _SUBMITTAL_STATES + " Moving to rev needs "
+            "a review template with steps and a custom identifier. Reviewers don't use this — "
+            "they use submit_submittal_review."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "submittal_id": {"type": "string", "description": "Submittal item UUID."},
+            "state_id": {"type": "string", "description": "Target state: sbc-1, mgr-1, rev, mgr-2, sbc-2 or void."},
+            "mail_note": {"type": "string", "description": "Note sent in the notification email and shown in the activity log."},
+            "step_due_date": {"type": "string", "description": "Due date of the next review step, YYYY-MM-DD (when moving to rev)."},
+            "response": {"type": "string", "description": "Final response by name, e.g. 'Approved' (when closing: mgr-2 → sbc-2)."},
+            "response_id": {"type": "string", "description": "Final response UUID (alternative to `response`)."},
+            "response_comment": {"type": "string", "description": "Comment with the final response."},
+            "manager": {"type": "string", "description": "Manager ID (e.g. when submitting to the manager)."},
+            "manager_type": {"type": "string", "description": "user, company or role."},
+            "subcontractor": {"type": "string", "description": "Responsible contractor ID (e.g. when sending to the submitter)."},
+            "subcontractor_type": {"type": "string", "description": "user, company or role."},
+            "submitter_due_date": {"type": "string", "description": "YYYY-MM-DD."},
+            "manager_due_date": {"type": "string", "description": "YYYY-MM-DD."},
+            "custom_identifier": {"type": "string", "description": "Set the custom number in the same call (required before moving to rev if not set yet)."},
+        }, "required": ["submittal_id", "state_id"]},
+    ),
+    Tool(
+        name="submit_submittal_review",
+        description=(
+            "As a reviewer, submit your response on a submittal's review task (e.g. 'Approved', "
+            "'Revise and resubmit'). Posts immediately. Finds your open task automatically when "
+            "step_id/task_id are omitted (the task where you have the close action). When the "
+            "last required task of the last step is done, ACC moves the item to mgr-2 itself."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "submittal_id": {"type": "string", "description": "Submittal item UUID."},
+            "response": {"type": "string", "description": "Response by name, e.g. 'Approved' (see list_submittal_types)."},
+            "response_id": {"type": "string", "description": "Response UUID (alternative to `response`)."},
+            "response_comment": {"type": "string", "description": "Your review comment."},
+            "step_id": {"type": "string", "description": "Review step UUID (optional; auto-detected)."},
+            "task_id": {"type": "string", "description": "Review task UUID (optional; auto-detected)."},
+        }, "required": ["submittal_id"]},
+    ),
     # --- Docs: transmittals & file packages (read-only APIs) ---------------
     Tool(
         name="list_transmittals",
@@ -3011,7 +3129,9 @@ async def _dispatch_build_tool(name: str, arguments: dict, client: "httpx.AsyncC
         r = await client.get(f"{sbase}/items/{sid}", headers=hdrs)
         if not r.is_success:
             return _api_error(r)
-        payload = {"project": resolved_name, "submittal": r.json()}
+        item = r.json()
+        payload = {"project": resolved_name, "submittal": item,
+                   "allowed_transitions": _submittal_transitions(item)}
         if arguments.get("include_steps", True):
             steps = await _get_all_issues(client, f"{sbase}/items/{sid}/steps", hdrs, page_limit=50)
             for step in steps:
@@ -3051,7 +3171,7 @@ async def _dispatch_build_tool(name: str, arguments: dict, client: "httpx.AsyncC
         return _json_result({"project": resolved_name, "result_count": len(pkgs), "packages": pkgs})
 
     if name == "create_submittal":
-        body = _map_body(arguments, _SUBMITTAL_BODY_MAP)
+        body = _map_body(arguments, _SUBMITTAL_BODY_MAP, _SUBMITTAL_TRANSFORMS)
         r = await client.post(f"{sbase}/items", headers=jhdrs, json=body)
         if not r.is_success:
             return _api_error(r)
@@ -3059,13 +3179,77 @@ async def _dispatch_build_tool(name: str, arguments: dict, client: "httpx.AsyncC
 
     if name == "update_submittal":
         body = _map_body(arguments, {k: v for k, v in _SUBMITTAL_BODY_MAP.items()
-                                     if k not in ("state_id", "template_id")})
+                                     if k not in ("state_id", "template_id")}, _SUBMITTAL_TRANSFORMS)
         if not body:
             raise ValueError("Nothing to update — supply at least one field to change.")
         r = await client.patch(f"{sbase}/items/{arguments['submittal_id']}", headers=jhdrs, json=body)
         if not r.is_success:
             return _api_error(r)
         return _json_result({"project": resolved_name, "status": "updated", "submittal": r.json()})
+
+    if name == "transition_submittal":
+        sid = arguments["submittal_id"]
+        target = str(arguments["state_id"]).strip()
+        r = await client.get(f"{sbase}/items/{sid}", headers=hdrs)
+        if not r.is_success:
+            return _api_error(r)
+        allowed = _submittal_transitions(r.json())
+        match = next((t for t in allowed["transitions"] if t["to"] == target), None)
+        if match is None:
+            return _json_result({"error": "transition_not_allowed", "project": resolved_name,
+                                 "message": f"You can't move this submittal to '{target}' right now.",
+                                 "allowed_transitions": allowed})
+        body = {"stateId": target, **_map_body(arguments, _TRANSITION_BODY_MAP, _SUBMITTAL_TRANSFORMS)}
+        response_id = await _resolve_submittal_response(client, hdrs, sbase, arguments)
+        if response_id:
+            body["responseId"] = response_id
+        missing = [f for f in match["required_fields"] if f not in body]
+        if missing:
+            return _json_result({"error": "missing_required_fields", "project": resolved_name,
+                                 "message": f"Moving to '{target}' ({match['name']}) requires: {missing}.",
+                                 "transition": match})
+        r = await client.post(f"{sbase}/items/{sid}:transition", headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "transitioned",
+                             "transition": match["name"], "submittal": r.json()})
+
+    if name == "submit_submittal_review":
+        sid = arguments["submittal_id"]
+        response_id = await _resolve_submittal_response(client, hdrs, sbase, arguments)
+        if not response_id:
+            raise ValueError("Provide 'response' (e.g. 'Approved') or 'response_id'.")
+        step_id, task_id = arguments.get("step_id"), arguments.get("task_id")
+        if not (step_id and task_id):
+            candidates = []
+            for step in await _get_all_issues(client, f"{sbase}/items/{sid}/steps", hdrs, page_limit=50):
+                if step_id and step.get("id") != step_id:
+                    continue
+                tasks = await _get_all_issues(
+                    client, f"{sbase}/items/{sid}/steps/{step['id']}/tasks", hdrs, page_limit=50)
+                for task in tasks:
+                    acts = task.get("permittedActions") or []
+                    ids = [a.get("id") if isinstance(a, dict) else a for a in acts]
+                    if "Task::close" in ids and (not task_id or task.get("id") == task_id):
+                        candidates.append((step["id"], task["id"]))
+            if len(candidates) != 1:
+                return _json_result({
+                    "error": "no_open_task" if not candidates else "multiple_open_tasks",
+                    "project": resolved_name,
+                    "message": ("You have no review task to close on this submittal." if not candidates
+                                else "You have several open review tasks — pass step_id and task_id."),
+                    "candidates": [{"step_id": s_, "task_id": t_} for s_, t_ in candidates],
+                })
+            step_id, task_id = candidates[0]
+        body = {"responseId": response_id}
+        if arguments.get("response_comment"):
+            body["responseComment"] = arguments["response_comment"]
+        r = await client.post(f"{sbase}/items/{sid}/steps/{step_id}/tasks/{task_id}:close",
+                              headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "review_submitted",
+                             "step_id": step_id, "task_id": task_id, "task": r.json()})
 
     # --- Transmittals & file packages ------------------------------------
     tbase = _TRANSMITTALS_BASE.format(pid=pid)
@@ -4837,7 +5021,7 @@ class UnsafeArgumentError(ValueError):
 # Arguments whose value is placed in an APS URL path as-is.
 _URL_ID_ARG_KEYS = frozenset({
     "hub_id", "folder_id", "item_id", "issue_id", "review_id", "workflow_id", "request_id",
-    "rfi_id", "submittal_id", "transmittal_id", "package_id",
+    "rfi_id", "submittal_id", "transmittal_id", "package_id", "step_id", "task_id",
 })
 # Folder-path arguments: a display-name path is matched against listings (never put in
 # a URL), but a value starting with `urn:` is used directly in the URL, so it's checked.
