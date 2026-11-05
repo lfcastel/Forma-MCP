@@ -291,6 +291,37 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | `get_review` | Get one review by `review_id` (UUID) or `sequence_id` (the UI number); `include` any of `progress` (per-step state, who acted, notes), `versions` (files in the latest round with approval status, filterable by `approve_status` label) and `workflow` (the workflow snapshot the review used) | 3-legged |
 | `create_review` | Start a review from an existing workflow (`workflow_id` or `workflow_name`) on files given as raw version URNs (`file_versions`) and/or `files: [{folder_path, file_name}]` (→ latest version); optional `notes`; per-review overrides `step_reviewers` (replace a step's default reviewers — step by `step_id` or `step_name`, reviewers by name/email/role/company, resolved like `create_workflow`) and `copy_to_folder` (path or URN for approved copies); raw `workflow_options` for advanced use. Posts immediately and notifies reviewers — `dry_run=true` returns the resolved body | 3-legged (`data:write`) |
 
+### RFIs
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_rfis` | List RFIs via `POST search:rfis`: free-text `search`, `status` (US or EMEA workflow statuses), assignee/creator, `due_date` (date or `start..end`), priority, discipline, category, RFI type, official-response status, `include_hidden`; `sort_by`/`sort_order`; `fields` slims each row; auto-paginates (200/page) | 3-legged |
+| `get_rfi` | Get one RFI by `rfi_id` or `custom_identifier` (the RFI number) with responses, attachments and `permittedActions` (allowed transitions, required attributes, allowed assignees); comments included by default | 3-legged |
+| `list_rfi_types` | RFI types with defaults and allowed values (priority, discipline, category, impacts, `dueDateOffset`) plus, by default, `users/me` (your `workflowType` and whether you may create RFIs) | 3-legged |
+| `create_rfi` | Create an RFI — requires `title`, `status`; assignees/watchers/co-reviewers as Autodesk IDs; posts immediately | 3-legged (`data:write`) |
+| `update_rfi` | Update fields or transition an RFI (by `rfi_id`/`custom_identifier`); close with `official_response` + `official_response_status`; posts only supplied fields | 3-legged (`data:write`) |
+| `add_rfi_comment` | Add a comment to an RFI; posts immediately | 3-legged (`data:write`) |
+
+### Submittals
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_submittals` | List submittal items with `search`, title, `state_id`, `status_id`, spec, package, item type, manager, subcontractor, ball-in-court user, due date; `sort`; auto-paginates (50/page) | 3-legged |
+| `get_submittal` | Get one item; by default with its review steps and their tasks; optionally `include_revisions` and `include_attachments` | 3-legged |
+| `list_submittal_types` | Item types plus (by default) review responses — reference data for create/update and decoding | 3-legged |
+| `list_submittal_specs` | Spec sections (identifier, title, UUID); `search`, `identifier` | 3-legged |
+| `list_submittal_packages` | Submittal packages (read-only in the API); `package_id` returns one | 3-legged |
+| `create_submittal` | Create an item — requires `title`, `type_id`, `spec_id`, `state_id` (`draft`, `sbc-1`, `mgr-1`; the state decides which other fields are required); posts immediately | 3-legged (`data:write`) |
+| `update_submittal` | Update an item's fields (not its workflow state); posts immediately | 3-legged (`data:write`) |
+
+### Transmittals & file packages (Docs)
+
+| Tool | What it does | Auth |
+|------|-------------|------|
+| `list_transmittals` | List the project's transmittals (sequence id, title, status, sender, recipients, document count) — the API is read-only | 3-legged |
+| `get_transmittal` | One transmittal with its `documents` (file versions), `recipients` and `folders` (choose with `include`) | 3-legged |
+| `list_file_packages` | List Docs file packages; with `package_id`, list the files (resources) in that package — read-only API | 3-legged |
+
 ---
 
 ## Tools & API endpoints
@@ -389,6 +420,31 @@ flowchart LR
         T54(create_review)
     end
 
+    subgraph RFIS["RFIs · 3-legged OAuth · x-ads-region: EMEA"]
+        T55(list_rfis)
+        T56(get_rfi)
+        T57(list_rfi_types)
+        T58(create_rfi)
+        T59(update_rfi)
+        T60(add_rfi_comment)
+    end
+
+    subgraph SUBM["Submittals · 3-legged OAuth · x-ads-region: EMEA"]
+        T61(list_submittals)
+        T62(get_submittal)
+        T63(list_submittal_types)
+        T64(list_submittal_specs)
+        T65(list_submittal_packages)
+        T66(create_submittal)
+        T67(update_submittal)
+    end
+
+    subgraph TRANS["Transmittals & file packages · 3-legged OAuth · read-only"]
+        T68(list_transmittals)
+        T69(get_transmittal)
+        T70(list_file_packages)
+    end
+
     E1["GET /project/v1/hubs"]
     E2["GET /project/v1/hubs/{hub}/projects"]
     E3["GET /project/v1/.../projects/{p}/topFolders"]
@@ -430,6 +486,17 @@ flowchart LR
     E39["GET /construction/reviews/v1/projects/{p}/reviews/{r}"]
     E40["GET /construction/reviews/v1/projects/{p}/reviews/{r}/progress · /versions · /workflow"]
     E41["POST /construction/reviews/v1/projects/{p}/reviews"]
+    E42["POST /construction/rfis/v3/projects/{p}/search:rfis"]
+    E43["GET /construction/rfis/v3/projects/{p}/rfis/{r} · /comments"]
+    E44["GET /construction/rfis/v3/projects/{p}/rfi-types · /users/me"]
+    E45["POST /construction/rfis/v3/projects/{p}/rfis · /rfis/{r}/comments"]
+    E46["PATCH /construction/rfis/v3/projects/{p}/rfis/{r}"]
+    E47["GET /construction/submittals/v2/projects/{p}/items · /items/{i} · /steps · /tasks · /revisions · /attachments"]
+    E48["GET /construction/submittals/v2/projects/{p}/item-types · /responses · /specs · /packages"]
+    E49["POST /construction/submittals/v2/projects/{p}/items"]
+    E50["PATCH /construction/submittals/v2/projects/{p}/items/{i}"]
+    E51["GET /construction/transmittals/v1/projects/{p}/transmittals · /{t}/documents · /recipients · /folders"]
+    E52["GET /construction/packages/v1/projects/{p}/packages · /{k}/resources"]
 
     T1 --> E1
     T2 --> E2
@@ -524,11 +591,28 @@ flowchart LR
     T53 --> E40
     T54 --> E35
     T54 --> E41
+    T55 --> E42
+    T56 --> E42
+    T56 --> E43
+    T57 --> E44
+    T58 --> E45
+    T59 --> E46
+    T60 --> E45
+    T61 --> E47
+    T62 --> E47
+    T63 --> E48
+    T64 --> E48
+    T65 --> E48
+    T66 --> E49
+    T67 --> E50
+    T68 --> E51
+    T69 --> E51
+    T70 --> E52
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54 tool
-    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40 get
-    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41 post
-    class E15,E17,E20,E25,E26,E34 patch
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70 tool
+    class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40,E43,E44,E47,E48,E51,E52 get
+    class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41,E42,E45,E49 post
+    class E15,E17,E20,E25,E26,E34,E46,E50 patch
     class E16 del
 ```
 
@@ -634,6 +718,19 @@ Start a review "Facade IFC check" in "Northgate Tower" with the "Design Review" 
 Start a review on Project Files/Design/plan.pdf in "Northgate Tower" using "Design Review", with Alice as approver on the "Final Approval" step and approved copies going to Project Files/Approved
 ```
 
+### RFIs, submittals & transmittals
+
+```
+List the open RFIs in "Northgate Tower" that are overdue, with only number, title, assignee and due date
+Show RFI 012 in "Northgate Tower" with its comments, and tell me which statuses I can move it to
+Create a draft RFI "Pipe size room 3" in "Northgate Tower" asking whether the 50mm pipe is correct
+Close RFI 012 with the official response "Use 63mm" (answered)
+List the submittals in "Northgate Tower" that are with the manager (mgr-1), grouped by spec section
+Show submittal package "Doors & hardware" and its items
+List the transmittals sent from "Northgate Tower" this month and the documents in the latest one
+List the file packages in "Northgate Tower" and the files in each
+```
+
 ---
 
 ## Security & credentials
@@ -712,7 +809,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 54 tools
+├── aps_mcp.py                  # MCP server — 70 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build + dependency audit)
 ├── .github/dependabot.yml      # weekly dependency / action updates (14-day cooldown)
