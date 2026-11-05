@@ -218,7 +218,7 @@ async def test_add_hub_companies_execute_calls_import():
         f"{BASE}/hq/v1/accounts/{ACCOUNT_ID}/companies/import"
     ).mock(return_value=httpx.Response(201, json=COMPANY_IMPORT_SUCCESS_RESPONSE))
     data = _parse(await _call("bulk_add_hub_companies", {
-        "companies": [{"name": NEW_COMPANY_NAME, "trade": "Electrical", "city": "Brussels"}],
+        "companies": [{"name": NEW_COMPANY_NAME, "trade": "Electrical", "city": "Springfield"}],
         "dry_run": False,
     }))
     assert import_route.called

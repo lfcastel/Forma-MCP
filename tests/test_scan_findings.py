@@ -1,5 +1,5 @@
 """
-Regression tests for the Aikido AI-code-analysis findings (Nov 2026):
+Regression tests for the findings of an external static-analysis scan (Nov 2026):
 company scoping, offboarding scope, clone name collisions, UUID fast-path disclosure,
 symlink-safe token writes, review size limit, bounded gather, list-size caps,
 audit-file collisions and the OAuth callback port.
