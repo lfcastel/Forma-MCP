@@ -2520,6 +2520,586 @@ def _write_audit_csv(rows: list[dict], operation: str) -> str:
 # Tool definitions
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Build & Docs workflow tools: RFIs, Submittals, Transmittals, File packages
+# ---------------------------------------------------------------------------
+# All user-scoped (3-legged) and region-routed like Issues/Reviews. Every list
+# endpoint returns the `{results, pagination:{limit, offset, totalResults}}`
+# envelope, so `_get_all_issues` pages them — except RFIs, whose list is a
+# `POST search:rfis` with limit/offset in the JSON body (`_search_all_rfis`).
+# Writes post immediately (no dry_run), like create_issue/update_issue.
+
+BUILD_REGION = "EMEA"
+
+_RFIS_BASE = APS_BASE + "/construction/rfis/v3/projects/{pid}"
+_SUBMITTALS_BASE = APS_BASE + "/construction/submittals/v2/projects/{pid}"
+_TRANSMITTALS_BASE = APS_BASE + "/construction/transmittals/v1/projects/{pid}"
+_FILE_PACKAGES_BASE = APS_BASE + "/construction/packages/v1/projects/{pid}"
+
+# Shared schema fragments for the project argument (same contract as every tool).
+_PROJECT_PROPS = {
+    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+    "hub_name": {"type": "string", "description": "Hub display name (partial match ok). Use when multiple hubs share the same region."},
+    "region": {"type": "string", "description": "Hub region for name resolution. Defaults to EMEA."},
+}
+_ACTOR_LIST = {"type": "array", "items": {"type": "string"},
+               "description": "Autodesk IDs of users (from list_project_members `autodesk_id`)."}
+
+
+def _as_list(value: "Any") -> "list | None":
+    """Accept a list or a comma-separated string; None/'' → None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, list):
+        return value
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def _users_ref(ids: "Any") -> "list | None":
+    """RFI actor lists are `[{id, type:'user'}]`; accept bare Autodesk IDs too."""
+    vals = _as_list(ids)
+    if vals is None:
+        return None
+    return [v if isinstance(v, dict) else {"id": v, "type": "user"} for v in vals]
+
+
+def _map_body(arguments: dict, body_map: dict, transforms: "dict | None" = None) -> dict:
+    """snake_case args → API camelCase body, only for supplied keys."""
+    transforms = transforms or {}
+    body = {}
+    for arg_key, body_key in body_map.items():
+        val = arguments.get(arg_key)
+        if val is None:
+            continue
+        body[body_key] = transforms[arg_key](val) if arg_key in transforms else val
+    return body
+
+
+def _json_result(payload: "Any") -> list:
+    return [TextContent(type="text", text=json.dumps(payload, indent=2))]
+
+
+def _api_error(r: "httpx.Response") -> list:
+    return _json_result({"error": r.status_code, "body": _error_body(r)})
+
+
+async def _search_all_rfis(client: "httpx.AsyncClient", hdrs: dict, pid: str, body: dict) -> list:
+    """Page through `POST search:rfis` (limit/offset live in the JSON body, max 200)."""
+    url = _RFIS_BASE.format(pid=pid) + "/search:rfis"
+    items: list = []
+    offset = 0
+    while True:
+        page_body = {**body, "limit": 200, "offset": offset}
+        res = await _request_with_retry(client, "post", url, headers=hdrs, json=page_body)
+        res.raise_for_status()
+        data = res.json()
+        page = data.get("results") or []
+        items.extend(page)
+        total = (data.get("pagination") or {}).get("totalResults", len(items))
+        if len(items) >= total or not page:
+            return items
+        offset = len(items)
+
+
+async def _resolve_rfi_ref(client, hdrs: dict, pid: str, arguments: dict) -> str:
+    """An RFI's UUID from `rfi_id`, or from `custom_identifier` (the number shown in
+    the UI, e.g. '012') via one slim search over id/customIdentifier."""
+    if arguments.get("rfi_id"):
+        return arguments["rfi_id"]
+    ident = arguments.get("custom_identifier")
+    if not ident:
+        raise ValueError("Provide 'rfi_id' (UUID) or 'custom_identifier' (the RFI number).")
+    rows = await _search_all_rfis(client, hdrs, pid, {"fields": ["id", "customIdentifier"]})
+    want = str(ident).strip().lower()
+    for row in rows:
+        if str(row.get("customIdentifier", "")).strip().lower() == want:
+            return row["id"]
+    raise ValueError(f"No RFI with custom identifier '{ident}' in this project.")
+
+
+_RFI_BODY_MAP = {
+    "title": "title", "status": "status", "question": "question",
+    "suggested_answer": "suggestedAnswer", "assigned_to": "assignedTo",
+    "due_date": "dueDate", "priority": "priority", "discipline": "discipline",
+    "category": "category", "reference": "reference", "rfi_type_id": "rfiTypeId",
+    "location_description": "locationDescription", "locations": "locations",
+    "cost_impact": "costImpact", "schedule_impact": "scheduleImpact",
+    "watchers": "watchers", "co_reviewers": "coReviewers",
+    "custom_attributes": "customAttributes",
+}
+_RFI_UPDATE_EXTRA = {
+    "official_response": "officialResponse",
+    "official_response_status": "officialResponseStatus",
+}
+_RFI_TRANSFORMS = {
+    "assigned_to": _users_ref, "watchers": _users_ref, "co_reviewers": _users_ref,
+    "discipline": _as_list, "category": _as_list, "locations": _as_list,
+}
+
+_SUBMITTAL_BODY_MAP = {
+    "custom_identifier": "customIdentifier", "type_id": "typeId", "spec_id": "specId",
+    "subsection": "subsection", "title": "title", "description": "description",
+    "priority": "priority", "state_id": "stateId", "manager": "manager",
+    "manager_type": "managerType", "subcontractor": "subcontractor",
+    "subcontractor_type": "subcontractorType", "watchers": "watchers",
+    "required_on_job_date": "requiredOnJobDate", "lead_time": "leadTime",
+    "required_date": "requiredDate", "required_approval_date": "requiredApprovalDate",
+    "submitter_due_date": "submitterDueDate", "manager_due_date": "managerDueDate",
+    "package_id": "packageId", "template_id": "templateId",
+}
+
+_RFI_STATUS_HELP = (
+    "Single-reviewer (US) workflow: draft, submitted, open, answered, rejected, closed, void. "
+    "Multi-reviewer (EMEA) workflow: draft, submitted, openRev1, openRev2, answeredRev1, "
+    "answeredManager, closed, void. list_rfi_types(include_my_permissions=true) shows the project's workflowType."
+)
+_RFI_WRITE_PROPS = {
+    "question": {"type": "string", "description": "The RFI question."},
+    "suggested_answer": {"type": "string", "description": "Suggested answer."},
+    "assigned_to": {**_ACTOR_LIST, "description": "Assignee Autodesk IDs (required when moving out of draft). get_rfi's permittedActions lists allowed assignees per status."},
+    "due_date": {"type": "string", "description": "Due date, ISO 8601 (e.g. 2026-12-01T12:00:00.000Z). Not auto-calculated: list_rfi_types gives dueDateOffset."},
+    "priority": {"type": "string", "description": "Priority, as configured in the project (e.g. High, Normal, Low)."},
+    "discipline": {"type": "array", "items": {"type": "string"}, "description": "Disciplines (project-specific; see list_rfi_types)."},
+    "category": {"type": "array", "items": {"type": "string"}, "description": "Categories (project-specific, case-sensitive; see list_rfi_types)."},
+    "reference": {"type": "string", "description": "External reference, max 20 chars."},
+    "rfi_type_id": {"type": "string", "description": "RFI type UUID (from list_rfi_types)."},
+    "location_description": {"type": "string", "description": "Free-text location."},
+    "locations": {"type": "array", "items": {"type": "string"}, "description": "Location (LBS) node IDs."},
+    "cost_impact": {"type": "string", "description": "Yes, No or Unknown."},
+    "schedule_impact": {"type": "string", "description": "Yes, No or Unknown."},
+    "watchers": {**_ACTOR_LIST, "description": "Watcher Autodesk IDs."},
+    "co_reviewers": {**_ACTOR_LIST, "description": "Co-reviewer Autodesk IDs."},
+    "custom_attributes": {"type": "array", "items": {"type": "object"}, "description": "Raw custom attributes: [{id, values:[...]}]."},
+}
+_SUBMITTAL_WRITE_PROPS = {
+    "custom_identifier": {"type": "string", "description": "Custom number; omit to let ACC assign the next one."},
+    "type_id": {"type": "string", "description": "Item type UUID (from list_submittal_types)."},
+    "spec_id": {"type": "string", "description": "Spec section UUID (from list_submittal_specs)."},
+    "subsection": {"type": "string", "description": "Spec subsection, e.g. '2.1.A'."},
+    "title": {"type": "string", "description": "Item title."},
+    "description": {"type": "string", "description": "Item description."},
+    "priority": {"type": "string", "description": "Low, Normal or High."},
+    "manager": {"type": "string", "description": "Manager Autodesk ID (user) or role/company ID per manager_type."},
+    "manager_type": {"type": "string", "description": "Type of `manager`: user, role or company."},
+    "subcontractor": {"type": "string", "description": "Responsible contractor/submitter ID."},
+    "subcontractor_type": {"type": "string", "description": "Type of `subcontractor`: user, role or company."},
+    "watchers": {"type": "array", "items": {"type": "object"}, "description": "Raw watcher objects as the API expects ([{id, type}])."},
+    "required_on_job_date": {"type": "string", "description": "YYYY-MM-DD."},
+    "lead_time": {"type": "integer", "description": "Lead time in days."},
+    "required_date": {"type": "string", "description": "YYYY-MM-DD."},
+    "required_approval_date": {"type": "string", "description": "YYYY-MM-DD."},
+    "submitter_due_date": {"type": "string", "description": "YYYY-MM-DD."},
+    "manager_due_date": {"type": "string", "description": "YYYY-MM-DD."},
+    "package_id": {"type": "string", "description": "Submittal package UUID (from list_submittal_packages)."},
+}
+
+
+def _paging_props(what: str) -> dict:
+    return {"sort": {"type": "string", "description": f"Sort fields for {what}, comma-separated, as the API expects (e.g. 'title asc')."}}
+
+
+_BUILD_TOOLS = [
+    # --- RFIs -------------------------------------------------------------
+    Tool(
+        name="list_rfis",
+        description=(
+            "List RFIs in an ACC/Forma project (Project Management → RFIs). Auto-paginates all "
+            "matches. RFI objects are large — use `fields` to slim rows. Assignees and creators "
+            "are Autodesk IDs (decode with list_project_members). Not compatible with BIM 360."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "search": {"type": "string", "description": "Free text over title, question and official response."},
+            "status": {"type": "array", "items": {"type": "string"}, "description": "Status filter (one or more). " + _RFI_STATUS_HELP},
+            "assigned_to": {**_ACTOR_LIST, "description": "Filter by assignee Autodesk IDs."},
+            "created_by": {**_ACTOR_LIST, "description": "Filter by creator Autodesk IDs."},
+            "due_date": {"type": "string", "description": "Due-date filter: an ISO date or a range 'start..end'."},
+            "priority": {"type": "string", "description": "Filter by priority."},
+            "discipline": {"type": "string", "description": "Filter by discipline."},
+            "category": {"type": "string", "description": "Filter by category."},
+            "rfi_type_id": {"type": "array", "items": {"type": "string"}, "description": "Filter by RFI type UUIDs."},
+            "official_response_status": {"type": "string", "description": "answered or unanswered."},
+            "include_hidden": {"type": "boolean", "description": "Include hidden RFIs."},
+            "sort_by": {"type": "string", "description": "Field to sort on, e.g. createdAt, dueDate, customIdentifier."},
+            "sort_order": {"type": "string", "description": "ASC or DESC (default DESC when sort_by is set)."},
+            "fields": {"type": "array", "items": {"type": "string"}, "description": "Only return these attributes per RFI, e.g. ['id','customIdentifier','title','status','dueDate']."},
+        }, "required": []},
+    ),
+    Tool(
+        name="get_rfi",
+        description=(
+            "Get one RFI with its responses, attachments and permittedActions (which statuses you "
+            "may move it to, required attributes and allowed assignees — check this before "
+            "update_rfi). Address it by rfi_id or by custom_identifier (the RFI number)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "rfi_id": {"type": "string", "description": "RFI UUID."},
+            "custom_identifier": {"type": "string", "description": "The RFI number shown in ACC (alternative to rfi_id)."},
+            "include_comments": {"type": "boolean", "description": "Also return the RFI's comments (default true)."},
+        }, "required": []},
+    ),
+    Tool(
+        name="list_rfi_types",
+        description=(
+            "List the project's RFI types with their defaults and allowed values (priority, "
+            "discipline, category, cost/schedule impact, dueDateOffset). With "
+            "include_my_permissions, also returns GET users/me: your workflowType (US single- vs "
+            "EMEA multi-reviewer) and whether you may create RFIs."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "include_my_permissions": {"type": "boolean", "description": "Also return users/me (default true)."},
+        }, "required": []},
+    ),
+    Tool(
+        name="create_rfi",
+        description=(
+            "Create an RFI. Posts immediately (no dry_run). Requires the creator or manager RFI "
+            "workflow role. Leaving draft needs an assignee. " + _RFI_STATUS_HELP
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "title": {"type": "string", "description": "RFI title."},
+            "status": {"type": "string", "description": "Initial status, usually 'draft' or 'submitted'/'open'."},
+            **_RFI_WRITE_PROPS,
+        }, "required": ["title", "status"]},
+    ),
+    Tool(
+        name="update_rfi",
+        description=(
+            "Update an RFI (fields and/or status transition). Posts immediately. Only the creator "
+            "(in draft) or the current assignee may update. To close: set status 'closed' with "
+            "official_response and official_response_status. Call get_rfi first and follow its "
+            "permittedActions."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "rfi_id": {"type": "string", "description": "RFI UUID."},
+            "custom_identifier": {"type": "string", "description": "RFI number (alternative to rfi_id)."},
+            "title": {"type": "string", "description": "New title."},
+            "status": {"type": "string", "description": "New status. " + _RFI_STATUS_HELP},
+            "official_response": {"type": "string", "description": "Final official response (when closing)."},
+            "official_response_status": {"type": "string", "description": "answered or rejected (when closing)."},
+            **_RFI_WRITE_PROPS,
+        }, "required": []},
+    ),
+    Tool(
+        name="add_rfi_comment",
+        description="Add a comment to an RFI. Posts immediately.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "rfi_id": {"type": "string", "description": "RFI UUID."},
+            "custom_identifier": {"type": "string", "description": "RFI number (alternative to rfi_id)."},
+            "body": {"type": "string", "description": "Comment text."},
+        }, "required": ["body"]},
+    ),
+    # --- Submittals -------------------------------------------------------
+    Tool(
+        name="list_submittals",
+        description=(
+            "List submittal items in an ACC/Forma project (Build → Submittals). Auto-paginates. "
+            "IDs (type, spec, package, status) are UUIDs: decode with list_submittal_types, "
+            "list_submittal_specs and list_submittal_packages."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "search": {"type": "string", "description": "Free text over identifier, title, spec identifier and ball-in-court."},
+            "title": {"type": "string", "description": "Filter by title."},
+            "state_id": {"type": "string", "description": "Filter by workflow state ID (e.g. draft, sbc-1 = with submitter, mgr-1 = with manager); comma-separate multiple."},
+            "status_id": {"type": "string", "description": "Filter by status ID; comma-separate multiple."},
+            "spec_id": {"type": "string", "description": "Filter by spec section UUID."},
+            "package_id": {"type": "string", "description": "Filter by submittal package UUID."},
+            "type_id": {"type": "string", "description": "Filter by item type UUID."},
+            "manager": {"type": "string", "description": "Filter by manager ID."},
+            "subcontractor": {"type": "string", "description": "Filter by responsible contractor ID."},
+            "ball_in_court_users": {"type": "string", "description": "Filter by ball-in-court user Autodesk ID(s)."},
+            "due_date": {"type": "string", "description": "Filter by due date (YYYY-MM-DD or 'start..end')."},
+            **_paging_props("items"),
+        }, "required": []},
+    ),
+    Tool(
+        name="get_submittal",
+        description="Get one submittal item; optionally with its review steps (with tasks), revisions and attachments.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "submittal_id": {"type": "string", "description": "Submittal item UUID (from list_submittals)."},
+            "include_steps": {"type": "boolean", "description": "Include review steps and their tasks (default true)."},
+            "include_revisions": {"type": "boolean", "description": "Include revisions (default false)."},
+            "include_attachments": {"type": "boolean", "description": "Include attachments (default false)."},
+        }, "required": ["submittal_id"]},
+    ),
+    Tool(
+        name="list_submittal_types",
+        description="List the project's submittal item types and (by default) the review responses (e.g. Approved, Revise and resubmit) — the reference data for create/update and for decoding list_submittals.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "include_responses": {"type": "boolean", "description": "Also list review responses (default true)."},
+        }, "required": []},
+    ),
+    Tool(
+        name="list_submittal_specs",
+        description="List the project's submittal spec sections (identifier + title + UUID).",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "search": {"type": "string", "description": "Free-text search."},
+            "identifier": {"type": "string", "description": "Filter by spec identifier, e.g. '033000'."},
+            **_paging_props("specs"),
+        }, "required": []},
+    ),
+    Tool(
+        name="list_submittal_packages",
+        description="List submittal packages (read-only in the API — packages are created in the ACC UI). Pass package_id to get one package.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "package_id": {"type": "string", "description": "Return only this package (UUID)."},
+            "search": {"type": "string", "description": "Free-text search."},
+            "title": {"type": "string", "description": "Filter by title."},
+            "identifier": {"type": "string", "description": "Filter by package identifier."},
+            "spec_id": {"type": "string", "description": "Filter by spec section UUID."},
+            **_paging_props("packages"),
+        }, "required": []},
+    ),
+    Tool(
+        name="create_submittal",
+        description=(
+            "Create a submittal item. Posts immediately (no dry_run). state_id sets the starting "
+            "point and decides which fields are required: 'draft'; 'sbc-1' (with submitter — needs "
+            "manager + manager_type); 'mgr-1' (with manager — needs subcontractor, "
+            "subcontractor_type and submitter_due_date)."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            **_SUBMITTAL_WRITE_PROPS,
+            "state_id": {"type": "string", "description": "draft, sbc-1 or mgr-1."},
+            "template_id": {"type": "string", "description": "Review template UUID (optional)."},
+        }, "required": ["title", "type_id", "spec_id", "state_id"]},
+    ),
+    Tool(
+        name="update_submittal",
+        description="Update a submittal item's fields (not its workflow state). Posts immediately.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "submittal_id": {"type": "string", "description": "Submittal item UUID."},
+            **_SUBMITTAL_WRITE_PROPS,
+        }, "required": ["submittal_id"]},
+    ),
+    # --- Docs: transmittals & file packages (read-only APIs) ---------------
+    Tool(
+        name="list_transmittals",
+        description="List transmittals sent from the project's Docs (read-only API): sequence number, title, status, sender, recipients and document count.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            **_paging_props("transmittals"),
+        }, "required": []},
+    ),
+    Tool(
+        name="get_transmittal",
+        description="Get one transmittal with its documents (file versions), recipients and folders.",
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "transmittal_id": {"type": "string", "description": "Transmittal UUID (from list_transmittals)."},
+            "include": {"type": "array", "items": {"type": "string", "enum": ["documents", "recipients", "folders"]},
+                        "description": "Sub-resources to include (default all three)."},
+        }, "required": ["transmittal_id"]},
+    ),
+    Tool(
+        name="list_file_packages",
+        description=(
+            "List Docs file packages (read-only API). Pass package_id to list the files "
+            "(resources) inside one package instead."
+        ),
+        inputSchema={"type": "object", "properties": {
+            **_PROJECT_PROPS,
+            "package_id": {"type": "string", "description": "List the resources of this package (UUID)."},
+            **_paging_props("packages"),
+        }, "required": []},
+    ),
+]
+
+BUILD_TOOL_NAMES = frozenset(t.name for t in _BUILD_TOOLS)
+
+
+async def _dispatch_build_tool(name: str, arguments: dict, client: "httpx.AsyncClient", token: str) -> list:
+    pid, resolved_name = await _resolve_issue_project(client, token, arguments)
+    hdrs = {**auth_headers(token), "x-ads-region": BUILD_REGION}
+    jhdrs = {**hdrs, "Content-Type": "application/json"}
+
+    # --- RFIs -------------------------------------------------------------
+    if name == "list_rfis":
+        flt = _map_body(arguments, {
+            "status": "status", "assigned_to": "assignedTo", "created_by": "createdBy",
+            "due_date": "dueDate", "priority": "priority", "discipline": "discipline",
+            "category": "category", "rfi_type_id": "rfiTypeId",
+            "official_response_status": "officialResponseStatus", "include_hidden": "includeHidden",
+        }, {"status": _as_list, "assigned_to": _as_list, "created_by": _as_list, "rfi_type_id": _as_list})
+        body: dict = {}
+        if flt:
+            body["filter"] = flt
+        if arguments.get("search"):
+            body["search"] = arguments["search"]
+        if arguments.get("fields"):
+            body["fields"] = _as_list(arguments["fields"])
+        if arguments.get("sort_by"):
+            body["sort"] = [{"field": arguments["sort_by"], "order": (arguments.get("sort_order") or "DESC").upper()}]
+        rfis = await _search_all_rfis(client, jhdrs, pid, body)
+        return _json_result({"project": resolved_name, "result_count": len(rfis), "rfis": rfis})
+
+    if name == "get_rfi":
+        rfi_id = await _resolve_rfi_ref(client, jhdrs, pid, arguments)
+        base = _RFIS_BASE.format(pid=pid)
+        r = await client.get(f"{base}/rfis/{rfi_id}", headers=hdrs)
+        if not r.is_success:
+            return _api_error(r)
+        payload = {"project": resolved_name, "rfi": r.json()}
+        if arguments.get("include_comments", True):
+            payload["comments"] = await _get_all_issues(client, f"{base}/rfis/{rfi_id}/comments", hdrs, page_limit=200)
+        return _json_result(payload)
+
+    if name == "list_rfi_types":
+        base = _RFIS_BASE.format(pid=pid)
+        payload = {"project": resolved_name,
+                   "types": await _get_all_issues(client, f"{base}/rfi-types", hdrs, page_limit=200)}
+        if arguments.get("include_my_permissions", True):
+            r = await client.get(f"{base}/users/me", headers=hdrs)
+            payload["me"] = r.json() if r.is_success else {"error": r.status_code, "body": _error_body(r)}
+        return _json_result(payload)
+
+    if name == "create_rfi":
+        body = _map_body(arguments, _RFI_BODY_MAP, _RFI_TRANSFORMS)
+        r = await client.post(_RFIS_BASE.format(pid=pid) + "/rfis", headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "created", "rfi": r.json()})
+
+    if name == "update_rfi":
+        rfi_id = await _resolve_rfi_ref(client, jhdrs, pid, arguments)
+        body = _map_body(arguments, {**_RFI_BODY_MAP, **_RFI_UPDATE_EXTRA}, _RFI_TRANSFORMS)
+        if not body:
+            raise ValueError("Nothing to update — supply at least one field to change.")
+        r = await client.patch(_RFIS_BASE.format(pid=pid) + f"/rfis/{rfi_id}", headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "updated", "rfi": r.json()})
+
+    if name == "add_rfi_comment":
+        rfi_id = await _resolve_rfi_ref(client, jhdrs, pid, arguments)
+        r = await client.post(_RFIS_BASE.format(pid=pid) + f"/rfis/{rfi_id}/comments",
+                              headers=jhdrs, json={"body": arguments["body"]})
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "created", "comment": r.json()})
+
+    # --- Submittals -------------------------------------------------------
+    sbase = _SUBMITTALS_BASE.format(pid=pid)
+
+    if name == "list_submittals":
+        params = _map_body(arguments, {
+            "search": "search", "title": "filter[title]", "state_id": "filter[stateId]",
+            "status_id": "filter[statusId]", "spec_id": "filter[specId]",
+            "package_id": "filter[packageId]", "type_id": "filter[typeId]",
+            "manager": "filter[manager]", "subcontractor": "filter[subcontractor]",
+            "ball_in_court_users": "filter[ballInCourtUsers]", "due_date": "filter[dueDate]",
+            "sort": "sort",
+        })
+        items = await _get_all_issues(client, f"{sbase}/items", hdrs, params, page_limit=50)
+        return _json_result({"project": resolved_name, "result_count": len(items), "submittals": items})
+
+    if name == "get_submittal":
+        sid = arguments["submittal_id"]
+        r = await client.get(f"{sbase}/items/{sid}", headers=hdrs)
+        if not r.is_success:
+            return _api_error(r)
+        payload = {"project": resolved_name, "submittal": r.json()}
+        if arguments.get("include_steps", True):
+            steps = await _get_all_issues(client, f"{sbase}/items/{sid}/steps", hdrs, page_limit=50)
+            for step in steps:
+                if step.get("id"):
+                    step["tasks"] = await _get_all_issues(
+                        client, f"{sbase}/items/{sid}/steps/{step['id']}/tasks", hdrs, page_limit=50)
+            payload["steps"] = steps
+        if arguments.get("include_revisions"):
+            payload["revisions"] = await _get_all_issues(client, f"{sbase}/items/{sid}/revisions", hdrs, page_limit=50)
+        if arguments.get("include_attachments"):
+            payload["attachments"] = await _get_all_issues(client, f"{sbase}/items/{sid}/attachments", hdrs, page_limit=50)
+        return _json_result(payload)
+
+    if name == "list_submittal_types":
+        payload = {"project": resolved_name,
+                   "item_types": await _get_all_issues(client, f"{sbase}/item-types", hdrs, page_limit=50)}
+        if arguments.get("include_responses", True):
+            payload["responses"] = await _get_all_issues(client, f"{sbase}/responses", hdrs, page_limit=50)
+        return _json_result(payload)
+
+    if name == "list_submittal_specs":
+        params = _map_body(arguments, {"search": "search", "identifier": "filter[identifier]", "sort": "sort"})
+        specs = await _get_all_issues(client, f"{sbase}/specs", hdrs, params, page_limit=50)
+        return _json_result({"project": resolved_name, "result_count": len(specs), "specs": specs})
+
+    if name == "list_submittal_packages":
+        if arguments.get("package_id"):
+            r = await client.get(f"{sbase}/packages/{arguments['package_id']}", headers=hdrs)
+            if not r.is_success:
+                return _api_error(r)
+            return _json_result({"project": resolved_name, "package": r.json()})
+        params = _map_body(arguments, {
+            "search": "search", "title": "filter[title]", "identifier": "filter[identifier]",
+            "spec_id": "filter[specId]", "sort": "sort",
+        })
+        pkgs = await _get_all_issues(client, f"{sbase}/packages", hdrs, params, page_limit=50)
+        return _json_result({"project": resolved_name, "result_count": len(pkgs), "packages": pkgs})
+
+    if name == "create_submittal":
+        body = _map_body(arguments, _SUBMITTAL_BODY_MAP)
+        r = await client.post(f"{sbase}/items", headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "created", "submittal": r.json()})
+
+    if name == "update_submittal":
+        body = _map_body(arguments, {k: v for k, v in _SUBMITTAL_BODY_MAP.items()
+                                     if k not in ("state_id", "template_id")})
+        if not body:
+            raise ValueError("Nothing to update — supply at least one field to change.")
+        r = await client.patch(f"{sbase}/items/{arguments['submittal_id']}", headers=jhdrs, json=body)
+        if not r.is_success:
+            return _api_error(r)
+        return _json_result({"project": resolved_name, "status": "updated", "submittal": r.json()})
+
+    # --- Transmittals & file packages ------------------------------------
+    tbase = _TRANSMITTALS_BASE.format(pid=pid)
+
+    if name == "list_transmittals":
+        params = _map_body(arguments, {"sort": "sort"})
+        rows = await _get_all_issues(client, f"{tbase}/transmittals", hdrs, params, page_limit=50)
+        return _json_result({"project": resolved_name, "result_count": len(rows), "transmittals": rows})
+
+    if name == "get_transmittal":
+        tid = arguments["transmittal_id"]
+        r = await client.get(f"{tbase}/transmittals/{tid}", headers=hdrs)
+        if not r.is_success:
+            return _api_error(r)
+        payload = {"project": resolved_name, "transmittal": r.json()}
+        for sub in (_as_list(arguments.get("include")) or ["documents", "recipients", "folders"]):
+            if sub in ("documents", "recipients", "folders"):
+                payload[sub] = await _get_all_issues(client, f"{tbase}/transmittals/{tid}/{sub}", hdrs, page_limit=50)
+        return _json_result(payload)
+
+    if name == "list_file_packages":
+        fbase = _FILE_PACKAGES_BASE.format(pid=pid)
+        if arguments.get("package_id"):
+            res = await _get_all_issues(
+                client, f"{fbase}/packages/{arguments['package_id']}/resources", hdrs, page_limit=200)
+            return _json_result({"project": resolved_name, "package_id": arguments["package_id"],
+                                 "result_count": len(res), "resources": res})
+        params = _map_body(arguments, {"sort": "sort"})
+        pkgs = await _get_all_issues(client, f"{fbase}/packages", hdrs, params, page_limit=200)
+        return _json_result({"project": resolved_name, "result_count": len(pkgs), "packages": pkgs})
+
+    raise ValueError(f"Unknown tool: {name}")
+
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
@@ -4219,7 +4799,7 @@ async def list_tools() -> list[Tool]:
                 "required": ["name"],
             },
         ),
-    ]
+    ] + _BUILD_TOOLS
 
 
 # ---------------------------------------------------------------------------
@@ -4257,6 +4837,7 @@ class UnsafeArgumentError(ValueError):
 # Arguments whose value is placed in an APS URL path as-is.
 _URL_ID_ARG_KEYS = frozenset({
     "hub_id", "folder_id", "item_id", "issue_id", "review_id", "workflow_id", "request_id",
+    "rfi_id", "submittal_id", "transmittal_id", "package_id",
 })
 # Folder-path arguments: a display-name path is matched against listings (never put in
 # a URL), but a value starting with `urn:` is used directly in the URL, so it's checked.
@@ -4366,6 +4947,9 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
     async with _make_client(timeout=30) as client:
         hdrs = auth_headers(token)
+
+        if name in BUILD_TOOL_NAMES:
+            return await _dispatch_build_tool(name, arguments, client, token)
 
         if name == "list_hubs":
             res = await client.get(f"{APS_BASE}/project/v1/hubs", headers=hdrs)
