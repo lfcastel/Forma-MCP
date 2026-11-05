@@ -98,6 +98,22 @@ No keychain on the machine (e.g. a headless Linux box)? Put `APS_CLIENT_SECRET` 
 
 Restart Claude Code (or `/mcp` → reconnect), then run `claude mcp list`. `forma-mcp` should show as connected. The first tool call opens a browser for the Autodesk login.
 
+### Hardened install (recommended for managed / company machines)
+
+The plain install above resolves the *latest* compatible versions of the server's dependencies at install time. For a fully reproducible, reviewable install, pin **both** the server and its dependency set:
+
+```bash
+claude mcp add forma-mcp --scope user \
+  -e APS_CLIENT_ID=your_client_id \
+  -e FORMA_MCP_REQUIRE_KEYCHAIN=1 \
+  -- uvx -c https://raw.githubusercontent.com/lfcastel/Forma-MCP/<commit-sha>/constraints.txt \
+         --from git+https://github.com/lfcastel/Forma-MCP@<commit-sha> forma-mcp
+```
+
+- **`@<commit-sha>`** — a full 40-character commit hash is immutable. Release tags (`v*`) are also protected on GitHub (a ruleset blocks moving or deleting them), but a commit hash doesn't depend on repository settings. `git ls-remote https://github.com/lfcastel/Forma-MCP refs/tags/v0.4.0` prints a tag's commit.
+- **`-c …/constraints.txt`** — pins every direct *and* transitive dependency to an exact version (generated with `uv pip compile --universal --generate-hashes` and a 14-day cooling-off window, so no freshly published release is ever picked up). CI installs this exact set and scans it with `pip-audit` on every change. Note: `uvx` enforces the *versions* in a constraints file but not its hashes; for a **hash-verified** install use a venv: `uv pip install --require-hashes -r constraints.txt && uv pip install --no-deps git+https://github.com/lfcastel/Forma-MCP@<commit-sha>`.
+- **`FORMA_MCP_REQUIRE_KEYCHAIN=1`** — keychain-only mode: see [Optional environment variables](#optional-environment-variables).
+
 **Upgrading:** change the tag (`@v0.4.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
@@ -118,7 +134,9 @@ Add these to the `-e` flags or the `env` block as needed.
 
 `FORMA_MCP_HOME` (optional, default `~/.forma-mcp`) is the per-user data directory; see [Data directory](#data-directory).
 
-`APS_CLIENT_SECRET` (optional) supplies the client secret directly instead of the OS keychain; it takes precedence when set. `FORMA_MCP_KEYRING=0` turns the keychain off entirely (the secret must then come from `APS_CLIENT_SECRET`, and the refresh token falls back to an owner-only `tokens.json` in the data directory).
+`APS_CLIENT_SECRET` (optional) supplies the client secret directly instead of the OS keychain; it takes precedence when set. Because that usually means the secret sits in plain text in the MCP config, the server prints a **warning** at startup (and `forma-mcp auth status` shows it) whenever the env var is used although a keychain is available.
+
+`FORMA_MCP_REQUIRE_KEYCHAIN=1` (optional, recommended on managed machines) is **keychain-only mode**: `APS_CLIENT_SECRET` is ignored, so the secret can only come from the OS keychain, and the refresh token is never written to a plaintext file — if no keychain is usable it is kept in memory for that process only. `FORMA_MCP_KEYRING=0` turns the keychain off entirely (the secret must then come from `APS_CLIENT_SECRET`, and the refresh token falls back to an owner-only `tokens.json` in the data directory).
 
 `APS_RATE_HEADROOM` (optional, default `0.8`) is the fraction of each published Data Management rate limit the server allows itself — lower it if the same APS client ID is shared by several people/sessions; `APS_RATE_LIMITING=0` switches the client-side pacing off entirely (see Known Limitations).
 
@@ -633,7 +651,10 @@ Start a review on Project Files/Design/plan.pdf in "Northgate Tower" using "Desi
   | `forma-mcp auth logout [--client-id ID]` | Removes the stored login (keychain entry and any `tokens.json`); the next tool call opens a browser login |
 
   Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`. `--client-id` defaults to `APS_CLIENT_ID`.
-- Each user authenticates with **their own Autodesk account** via 3-legged OAuth. The server acts with their permissions, not with elevated app-level rights.
+- **Hardened tool arguments** — every argument that ends up in an API URL path (`hub_id`, `folder_id`, `item_id`, `issue_id`, `review_id`, `workflow_id`, `request_id`, and folder arguments given as a raw `urn:`) is checked against a strict id charset before any request is made. A value containing `/`, `?`, `#`, `%`, whitespace or `..` is rejected with an `unsafe_argument` error, so text the model picked up from ACC content (a file name, an issue description) can't redirect a call to a different API endpoint with your token.
+- **Credentials pinned to Autodesk** — the HTTP client refuses to send any `Authorization` header anywhere except `https://developer.api.autodesk.com`. The only other host ever contacted is the pre-signed (credential-free) download URL that a Data Connector job returns.
+- **Supply chain** — 3 direct dependencies; a hash-pinned `constraints.txt` for reproducible installs; CI actions pinned by commit SHA with a read-only workflow token; `pip-audit` on every change; Dependabot (with a 14-day cooldown), secret scanning and push protection enabled; release tags immutable.
+- **Whose permissions apply** — the 3-legged tools (navigation, folders, files, project membership, issues, reviews) act as **the signed-in user**, with their ACC permissions. The **2-legged** tools (account users/companies directory, hub onboarding/offboarding, project lookup by id) act as the **app**, with `account:read account:write`, on every account where the integration is activated — independent of the signed-in user's own rights. Activating the Custom Integration is therefore an account-admin decision, and revoking it disables the server for that account.
 - Bulk write tools default to `dry_run: true` — no changes are made without explicit confirmation.
 
 ---
@@ -693,8 +714,10 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 forma-mcp/
 ├── aps_mcp.py                  # MCP server — 54 tools
 ├── tests/                      # pytest test suite
-├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build)
+├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build + dependency audit)
+├── .github/dependabot.yml      # weekly dependency / action updates (14-day cooldown)
 ├── pyproject.toml              # packaging: `forma-mcp` console script for uvx
+├── constraints.txt             # hash-pinned full dependency set for hardened installs
 ├── requirements.txt
 ├── README.md
 └── .gitignore
