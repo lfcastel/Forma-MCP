@@ -6,14 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for the workflow token: CI only needs to read the repo.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # Actions are pinned to a full commit SHA (tags can be moved); Dependabot bumps them.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
@@ -26,3 +33,27 @@ jobs:
           /tmp/wheel-venv/bin/pip install dist/*.whl
           test -x /tmp/wheel-venv/bin/forma-mcp
           cd /tmp && /tmp/wheel-venv/bin/python -c "import aps_mcp; assert callable(aps_mcp.run)"
+
+  # Supply chain: the pinned dependency set users install (constraints.txt) must
+  # install hash-verified and carry no known vulnerabilities.
+  audit:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Install the pinned set with hash verification
+        run: |
+          python -m venv /tmp/pinned
+          /tmp/pinned/bin/pip install --require-hashes -r constraints.txt
+          /tmp/pinned/bin/pip install --no-deps .
+          cd /tmp && /tmp/pinned/bin/python -c "import aps_mcp; assert callable(aps_mcp.run)"
+      - name: Scan for known vulnerabilities
+        run: |
+          pip install pip-audit
+          pip-audit -r constraints.txt --require-hashes --strict

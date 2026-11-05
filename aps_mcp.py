@@ -147,9 +147,29 @@ def _kr_delete(key: str, client_id: str | None = None) -> bool:
         return False
 
 
+def _require_keychain() -> bool:
+    """`FORMA_MCP_REQUIRE_KEYCHAIN=1`: keychain-only mode for managed machines. The
+    `APS_CLIENT_SECRET` env var is ignored (so the secret can't sit in plaintext in an
+    MCP config file) and the refresh token is never written to a plaintext file."""
+    return os.environ.get("FORMA_MCP_REQUIRE_KEYCHAIN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _client_secret() -> str:
-    """`APS_CLIENT_SECRET` from the environment, else the keychain (`forma-mcp auth set-secret`)."""
-    return os.environ.get("APS_CLIENT_SECRET") or _kr_get("client_secret") or ""
+    """`APS_CLIENT_SECRET` from the environment, else the keychain (`forma-mcp auth set-secret`).
+    In keychain-only mode (`FORMA_MCP_REQUIRE_KEYCHAIN=1`) the env var is ignored."""
+    env = "" if _require_keychain() else os.environ.get("APS_CLIENT_SECRET")
+    return env or _kr_get("client_secret") or ""
+
+
+def _env_secret_warning() -> str | None:
+    """A warning when the client secret comes from `APS_CLIENT_SECRET` although an OS
+    keychain is available — usually that means it sits in plaintext in an MCP config."""
+    if _require_keychain() or not os.environ.get("APS_CLIENT_SECRET") or not _keyring():
+        return None
+    return ("APS_CLIENT_SECRET is set in the environment (typically in plaintext in the MCP "
+            "config file) although an OS keychain is available. Move it there with "
+            "`forma-mcp auth set-secret`, remove it from the config, and consider "
+            "FORMA_MCP_REQUIRE_KEYCHAIN=1 to forbid the env var.")
 
 
 def _write_private_file(path: str, text: str) -> None:
@@ -202,6 +222,12 @@ def _load_refresh_token() -> str | None:
 def _save_refresh_token(rt: str) -> None:
     if _kr_set("refresh_token", rt):
         _remove_plaintext_tokens()
+        return
+    if _require_keychain():
+        # Keychain-only mode: keep the refresh token in memory for this process only;
+        # the next process does a fresh browser login rather than touch disk.
+        print("[APS Auth] FORMA_MCP_REQUIRE_KEYCHAIN=1 but no OS keychain is usable; the "
+              "refresh token is kept in memory only.", file=sys.stderr, flush=True)
         return
     os.makedirs(_data_dir(), exist_ok=True)
     _write_private_file(_token_file(), json.dumps({"refresh_token": rt}, indent=2))
@@ -705,11 +731,28 @@ async def _note_rate_limited(response: httpx.Response) -> None:
     _bucket_for(key).penalize(min(wait, _RETRY_AFTER_CAP))
 
 
+_API_HOST = urllib.parse.urlsplit(APS_BASE).hostname
+
+
+async def _guard_request(request: httpx.Request) -> None:
+    """httpx `request` event hook: a bearer/basic credential may only ever be sent over
+    HTTPS to the APS API host. Requests without credentials (e.g. the pre-signed S3
+    download URL a Data Connector job hands back) may go elsewhere."""
+    if "authorization" not in request.headers:
+        return
+    if request.url.scheme != "https" or request.url.host != _API_HOST:
+        raise RuntimeError(
+            f"Refusing to send APS credentials to {request.url.scheme}://{request.url.host} "
+            f"(only https://{_API_HOST} is allowed)."
+        )
+
+
 def _make_client(**kwargs) -> httpx.AsyncClient:
-    """The AsyncClient every tool dispatch uses: all requests are paced through
-    the per-endpoint buckets, and every 429 is fed back into them."""
+    """The AsyncClient every tool dispatch uses: credentials are pinned to the APS host,
+    all requests are paced through the per-endpoint buckets, and every 429 is fed back
+    into them."""
     return httpx.AsyncClient(
-        event_hooks={"request": [_pace_request], "response": [_note_rate_limited]},
+        event_hooks={"request": [_guard_request, _pace_request], "response": [_note_rate_limited]},
         **kwargs,
     )
 
@@ -4197,6 +4240,74 @@ def _quota_error_result(message: str, retry_after: "int | None") -> CallToolResu
     )
 
 
+# ---------------------------------------------------------------------------
+# Argument hardening: IDs that get interpolated into API URL paths
+# ---------------------------------------------------------------------------
+# Tool arguments come from the LLM, which may be steered by content it read (a file
+# name, an issue description). An ID like `x/../../hq/v1/accounts/...` dropped into
+# an f-string URL would reach a *different* APS endpoint with the same bearer token.
+# Every argument that ends up in a URL path is therefore checked against a strict
+# charset before any request is made. Real APS ids (UUIDs, `b.`-prefixed ids,
+# `urn:adsk...` URNs) only ever use these characters.
+
+class UnsafeArgumentError(ValueError):
+    """A tool argument that would end up in a URL path is not a well-formed id."""
+
+
+# Arguments whose value is placed in an APS URL path as-is.
+_URL_ID_ARG_KEYS = frozenset({
+    "hub_id", "folder_id", "item_id", "issue_id", "review_id", "workflow_id", "request_id",
+})
+# Folder-path arguments: a display-name path is matched against listings (never put in
+# a URL), but a value starting with `urn:` is used directly in the URL, so it's checked.
+_FOLDER_PATH_ARG_KEYS = frozenset({
+    "folder_path", "source", "destination", "parent", "source_folder_path",
+    "destination_folder_path", "destination_parent_path", "parent_folder_path",
+})
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:~=-]{1,512}$")
+
+
+def _check_url_id(key: str, value: "Any") -> None:
+    if not isinstance(value, str):
+        return
+    if not _SAFE_ID_RE.match(value) or ".." in value:
+        raise UnsafeArgumentError(
+            f"Argument '{key}' is not a well-formed APS id: {value[:80]!r}. "
+            "Ids may only contain letters, digits and . _ : ~ = - (no '/', '?', '#', "
+            "'%', spaces or '..')."
+        )
+
+
+def _validate_id_args(obj: "Any", _key: str = "") -> None:
+    """Recursively reject unsafe URL-bound ids anywhere in a tool's arguments
+    (incl. inside bulk-tool row lists, e.g. `items[].item_id`)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in _URL_ID_ARG_KEYS:
+                if isinstance(v, list):
+                    for x in v:
+                        _check_url_id(k, x)
+                else:
+                    _check_url_id(k, v)
+            elif k in _FOLDER_PATH_ARG_KEYS and isinstance(v, str) and v.startswith("urn:"):
+                _check_url_id(k, v)
+            else:
+                _validate_id_args(v, k)
+    elif isinstance(obj, list):
+        for x in obj:
+            _validate_id_args(x, _key)
+
+
+def _unsafe_argument_result(message: str) -> CallToolResult:
+    return CallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps({
+            "error": "unsafe_argument",
+            "message": message,
+        }, indent=2))],
+    )
+
+
 def _shape_bulk_response(payload: dict, results: list, detail: "str | None",
                          noteworthy, failure=None) -> dict:
     """Gate a bulk tool's per-item `results` array on `response_detail`, leaving the
@@ -4233,6 +4344,10 @@ async def call_tool(name: str, arguments: dict) -> "list[TextContent] | CallTool
     clean error result (`isError=True` with a readable message) so the calling
     agent is told it can't proceed (and why) instead of hanging or seeing an
     opaque error."""
+    try:
+        _validate_id_args(arguments or {})
+    except UnsafeArgumentError as e:
+        return _unsafe_argument_result(str(e))
     try:
         return await _dispatch_tool(name, arguments)
     except APSQuotaError as e:
@@ -7100,7 +7215,7 @@ def _auth_cli(command: str, client_id: str) -> int:
     if command == "status":
         kr = _keyring()
         backend = type(kr.get_keyring()).__name__ if kr else "none (plaintext-file fallback)"
-        if os.environ.get("APS_CLIENT_SECRET"):
+        if os.environ.get("APS_CLIENT_SECRET") and not _require_keychain():
             secret_src = "APS_CLIENT_SECRET environment variable"
         elif client_id and _kr_get("client_secret", client_id):
             secret_src = "OS keychain"
@@ -7116,6 +7231,10 @@ def _auth_cli(command: str, client_id: str) -> int:
         print(f"client id        : {client_id or 'MISSING (set APS_CLIENT_ID or pass --client-id)'}")
         print(f"client secret    : {secret_src}")
         print(f"refresh token    : {token_src}")
+        print(f"keychain-only    : {'on (FORMA_MCP_REQUIRE_KEYCHAIN)' if _require_keychain() else 'off'}")
+        warning = _env_secret_warning()
+        if warning:
+            print(f"WARNING          : {warning}")
         return 0
 
     if command == "logout":
@@ -7127,8 +7246,10 @@ def _auth_cli(command: str, client_id: str) -> int:
         print("forma-mcp: no client id — set APS_CLIENT_ID or pass --client-id.", file=sys.stderr)
         return 2
     if not _keyring():
-        print("forma-mcp: no OS keychain available — keep the secret in APS_CLIENT_SECRET instead.",
-              file=sys.stderr)
+        hint = ("FORMA_MCP_REQUIRE_KEYCHAIN=1 is set, so the APS_CLIENT_SECRET fallback is "
+                "disabled too." if _require_keychain()
+                else "keep the secret in APS_CLIENT_SECRET instead.")
+        print(f"forma-mcp: no OS keychain available — {hint}", file=sys.stderr)
         return 1
 
     if command == "set-secret":
@@ -7171,13 +7292,16 @@ def run(argv: list[str] | None = None):
     if not os.environ.get("APS_CLIENT_ID"):
         missing.append("APS_CLIENT_ID")
     elif not _client_secret():
-        missing.append("APS_CLIENT_SECRET")
+        missing.append("client secret (OS keychain)" if _require_keychain() else "APS_CLIENT_SECRET")
     if missing:
         sys.exit(
             f"forma-mcp: missing {', '.join(missing)}. Set APS_CLIENT_ID in your MCP server config "
-            "and store the secret in the OS keychain with `forma-mcp auth set-secret` "
-            "(or set APS_CLIENT_SECRET in the config)."
+            "and store the secret in the OS keychain with `forma-mcp auth set-secret`"
+            + ("." if _require_keychain() else " (or set APS_CLIENT_SECRET in the config).")
         )
+    warning = _env_secret_warning()
+    if warning:
+        print(f"[forma-mcp] WARNING: {warning}", file=sys.stderr, flush=True)
     asyncio.run(main())
 
 
