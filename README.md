@@ -68,7 +68,7 @@ No clone or virtualenv needed: `uvx` installs the server straight from this repo
 **1. Store the client secret in your OS keychain** (once per machine — run it in a normal terminal; it prompts without echoing):
 
 ```bash
-uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.6.0 forma-mcp auth set-secret --client-id your_client_id
+uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.7.1 forma-mcp auth set-secret --client-id your_client_id
 ```
 
 **2. Register the server with Claude Code.** Only the (non-secret) Client ID goes in the config:
@@ -76,7 +76,7 @@ uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.6.0 forma-mcp auth set-s
 ```bash
 claude mcp add forma-mcp --scope user \
   -e APS_CLIENT_ID=your_client_id \
-  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.6.0 forma-mcp
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.7.1 forma-mcp
 ```
 
 Or add it by hand to `~/.claude.json`:
@@ -86,7 +86,7 @@ Or add it by hand to `~/.claude.json`:
   "forma-mcp": {
     "type": "stdio",
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.6.0", "forma-mcp"],
+    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.7.1", "forma-mcp"],
     "env": {
       "APS_CLIENT_ID": "your_client_id"
     }
@@ -114,7 +114,7 @@ claude mcp add forma-mcp --scope user \
 - **`-c …/constraints.txt`** — pins every direct *and* transitive dependency to an exact version (generated with `uv pip compile --universal --generate-hashes` and a 14-day cooling-off window, so no freshly published release is ever picked up). CI installs this exact set and scans it with `pip-audit` on every change. Note: `uvx` enforces the *versions* in a constraints file but not its hashes; for a **hash-verified** install use a venv: `uv pip install --require-hashes -r constraints.txt && uv pip install --no-deps git+https://github.com/lfcastel/Forma-MCP@<commit-sha>`.
 - **`FORMA_MCP_REQUIRE_KEYCHAIN=1`** — keychain-only mode: see [Optional environment variables](#optional-environment-variables).
 
-**Upgrading:** change the tag (`@v0.6.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
+**Upgrading:** change the tag (`@v0.7.1` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
 
