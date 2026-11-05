@@ -279,12 +279,25 @@ def test_callback_times_out():
 async def test_browser_login_sends_code_verifier(fake_keyring, monkeypatch):
     captured = {}
 
-    def fake_wait(state, timeout=None):
+    def fake_wait(state, timeout=None, server=None):
         captured["state"] = state
+        captured["server"] = server
         return "the_code"
 
+    order = []
+    sentinel_server = object()
+
+    def fake_bind(*a):
+        order.append("bind")
+        return sentinel_server
+
+    def fake_open(url):
+        order.append("browser")
+        captured["url"] = url
+
+    monkeypatch.setattr(aps_mcp, "_bind_callback_server", fake_bind)
     monkeypatch.setattr(aps_mcp, "_wait_for_callback", fake_wait)
-    monkeypatch.setattr(aps_mcp.webbrowser, "open", lambda url: captured.setdefault("url", url))
+    monkeypatch.setattr(aps_mcp.webbrowser, "open", fake_open)
 
     def _token(request):
         captured["form"] = urllib.parse.parse_qs(request.content.decode())
@@ -300,6 +313,9 @@ async def test_browser_login_sends_code_verifier(fake_keyring, monkeypatch):
     assert url_qs["code_challenge"][0] == base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
     assert fake_keyring.store[_rt_key()] == "rt"
+    # The callback listener is bound before the browser opens, and handed to the waiter.
+    assert order == ["bind", "browser"]
+    assert captured["server"] is sentinel_server
 
 
 # ---------------------------------------------------------------------------

@@ -28,7 +28,10 @@ from mcp.types import Tool, TextContent, CallToolResult
 APS_CLIENT_ID = os.environ.get("APS_CLIENT_ID", "")
 # The client secret is read per call by `_client_secret()`: env first, then the OS keychain.
 APS_BASE = "https://developer.api.autodesk.com"
-REDIRECT_URI = "http://localhost:8080/oauth/callback"
+# The callback port must match the redirect URI registered on the APS app. Override with
+# APS_CALLBACK_PORT (and register http://localhost:<port>/oauth/callback) if 8080 is taken.
+CALLBACK_PORT = int(os.environ.get("APS_CALLBACK_PORT", "8080"))
+REDIRECT_URI = f"http://localhost:{CALLBACK_PORT}/oauth/callback"
 SCOPES = "data:read data:write data:create account:read account:write"
 
 # The ACC Issues API routes per-region; all our Issues traffic is EMEA. Sent as
@@ -172,20 +175,46 @@ def _env_secret_warning() -> str | None:
             "FORMA_MCP_REQUIRE_KEYCHAIN=1 to forbid the env var.")
 
 
+def _check_private_dir(path: str) -> None:
+    """Refuse a state directory that is a symlink or (on POSIX) not owned by this user,
+    and tighten it to 0700 — another local user must not be able to plant entries in it."""
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing to use {path}: it is a symbolic link.")
+    if hasattr(os, "getuid"):
+        st = os.stat(path)
+        if st.st_uid != os.getuid():
+            raise RuntimeError(f"Refusing to use {path}: it is owned by another user.")
+        if st.st_mode & 0o077:
+            os.chmod(path, 0o700)
+
+
 def _write_private_file(path: str, text: str) -> None:
     """Write `text` readable by the owner only (0600 on POSIX; on Windows the user-profile
-    ACLs already restrict it)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
+    ACLs already restrict it). Symlink-safe: the directory is checked, the content goes to
+    a fresh temp file created with O_EXCL (+ O_NOFOLLOW where available) and is then
+    atomically renamed over `path` — a pre-planted symlink at `path` is replaced, never
+    followed."""
+    directory = os.path.dirname(os.path.abspath(path))
+    _check_private_dir(directory)
+    tmp = os.path.join(directory, f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
     try:
-        os.chmod(path, 0o600)  # an older file keeps its old mode through O_CREAT
-    except OSError:
-        pass
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _read_plaintext_refresh_token() -> str | None:
     for path in (_token_file(), LEGACY_TOKEN_FILE):
+        if os.path.islink(path):
+            continue  # never read a token through a planted symlink
         try:
             with open(path) as f:
                 rt = json.load(f).get("refresh_token")
@@ -229,7 +258,7 @@ def _save_refresh_token(rt: str) -> None:
         print("[APS Auth] FORMA_MCP_REQUIRE_KEYCHAIN=1 but no OS keychain is usable; the "
               "refresh token is kept in memory only.", file=sys.stderr, flush=True)
         return
-    os.makedirs(_data_dir(), exist_ok=True)
+    os.makedirs(_data_dir(), mode=0o700, exist_ok=True)
     _write_private_file(_token_file(), json.dumps({"refresh_token": rt}, indent=2))
 
 
@@ -270,7 +299,23 @@ def _build_auth_url(state: str, code_challenge: str) -> str:
     return f"{APS_BASE}/authentication/v2/authorize?{params}"
 
 
-def _wait_for_callback(expected_state: str, timeout: float | None = None) -> str:
+def _bind_callback_server(handler_cls=BaseHTTPRequestHandler) -> HTTPServer:
+    """Bind the local OAuth callback listener, failing with a clear message if the port
+    is taken (another process squatting it would otherwise only surface after the
+    browser login)."""
+    try:
+        return HTTPServer(("localhost", CALLBACK_PORT), handler_cls)
+    except OSError as e:
+        raise RuntimeError(
+            f"Can't start the Autodesk login callback on localhost:{CALLBACK_PORT} ({e}). "
+            "Another program is using that port: close it, or set APS_CALLBACK_PORT to a free "
+            "port and register http://localhost:<port>/oauth/callback as a callback URL on "
+            "your APS app."
+        ) from e
+
+
+def _wait_for_callback(expected_state: str, timeout: float | None = None,
+                       server: "HTTPServer | None" = None) -> str:
     """Spin up a one-shot HTTP server on port 8080 and block until the auth code arrives.
 
     A callback whose `state` doesn't match this login is rejected (login CSRF / code
@@ -307,7 +352,10 @@ def _wait_for_callback(expected_state: str, timeout: float | None = None) -> str
             pass  # suppress access log noise
 
     deadline = time.monotonic() + (timeout or _AUTH_CALLBACK_TIMEOUT)
-    server = HTTPServer(("localhost", 8080), Handler)
+    if server is None:
+        server = _bind_callback_server(Handler)
+    else:
+        server.RequestHandlerClass = Handler
     try:
         while "code" not in received and "error" not in received:
             remaining = deadline - time.monotonic()
@@ -415,13 +463,15 @@ async def get_access_token() -> str:
     state = secrets.token_urlsafe(32)
     verifier, challenge = _pkce_pair()
     auth_url = _build_auth_url(state, challenge)
+    # Bind the listener first: if the port is taken we fail before sending the user to log in.
+    server = _bind_callback_server()
     # stderr: stdout is the MCP stdio channel
     print(f"\n[APS Auth] Opening browser for authorization...\n{auth_url}\n", file=sys.stderr, flush=True)
     webbrowser.open(auth_url)
 
     # _wait_for_callback blocks the thread; run in executor so asyncio loop stays alive
     loop = asyncio.get_event_loop()
-    code = await loop.run_in_executor(None, _wait_for_callback, state)
+    code = await loop.run_in_executor(None, _wait_for_callback, state, None, server)
 
     data = await _exchange_code(code, verifier)
     return _remember_tokens(data)
@@ -1160,9 +1210,11 @@ async def _resolve_by_id(
         hubs = await _get_all_hubs(client, token)
         hub = next((h for h in hubs if _to_bare_id(h["id"]) == account_id), None)
         if hub is None:
-            # Admin can see the project but the user token can't list the hub — still
-            # emit the hub id we know, without a display name/region.
-            hub = {"id": _ensure_b_prefix(account_id), "attributes": {}}
+            # The app token can see the project, but the signed-in user can't see its hub:
+            # treat it as not found rather than disclose the project's name and account.
+            raise ValueError(
+                f"Project {bare_uuid} not found — check the ID or your token's account access."
+            )
     return _project_ref(
         _ensure_b_prefix(bare_uuid),
         data.get("name"),
@@ -1406,11 +1458,13 @@ async def _resolve_review_file_versions(
     (``file_versions``) and/or ``files`` given as ``{folder_path, file_name}`` — the
     latter resolved to each file's tip (latest) version, listing each folder once.
     Raises ValueError on an unknown folder/file or when no file is given."""
+    files = arguments.get("files") or []
+    requested = len(arguments.get("file_versions") or []) + len(files)
+    if requested > 1000:
+        raise ValueError(f"A review holds at most 1000 file versions (got {requested}).")
     out: list[dict] = []
     for v in (arguments.get("file_versions") or []):
         out.append(v if isinstance(v, dict) else {"urn": v})
-
-    files = arguments.get("files") or []
     listings: dict[str, list] = {}
     for f in files:
         folder_path = f.get("folder_path")
@@ -1913,13 +1967,17 @@ async def _subtree_file_info(
 async def _gather_bounded(max_concurrency: int, factories: list) -> list:
     """Run a list of zero-arg async factories concurrently, capped at
     `max_concurrency` in flight at once, preserving input order in the results."""
-    sem = asyncio.Semaphore(max(1, max_concurrency))
+    # A fixed pool of workers pulls the next factory — only `max_concurrency` coroutines
+    # ever exist at once, however long the input list is.
+    results: list = [None] * len(factories)
+    it = iter(enumerate(factories))
 
-    async def _run(factory):
-        async with sem:
-            return await factory()
+    async def _worker():
+        for i, factory in it:
+            results[i] = await factory()
 
-    return await asyncio.gather(*[_run(f) for f in factories])
+    await asyncio.gather(*[_worker() for _ in range(min(max(1, max_concurrency), len(factories)) or 1)])
+    return results
 
 
 def _folder_create_payload(folder_name: str, parent_id: str) -> dict:
@@ -2501,15 +2559,19 @@ def _role_display(role_spec: "Any") -> str:
 
 def _write_audit_csv(rows: list[dict], operation: str) -> str:
     """Write audit rows to a timestamped CSV in the data dir's audit_logs/ folder. Returns file path."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Microsecond timestamp + random suffix, created exclusively ("x"): two runs of the
+    # same operation in the same second can never overwrite each other's audit record.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     audit_dir = os.path.join(_data_dir(), "audit_logs")
     os.makedirs(audit_dir, exist_ok=True)
-    filepath = os.path.join(audit_dir, f"audit_{operation}_{timestamp}.csv")
+    filepath = os.path.join(audit_dir, f"audit_{operation}_{timestamp}_{secrets.token_hex(3)}.csv")
+    if not rows:
+        open(filepath, "x", encoding="utf-8").close()
     if rows:
         # Union of keys across all rows (first-seen order) so heterogeneous rows
         # — e.g. only error rows carry a "message" — don't trip DictWriter.
         fieldnames = list(dict.fromkeys(k for row in rows for k in row.keys()))
-        with open(filepath, "w", newline="", encoding="utf-8") as f:
+        with open(filepath, "x", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
             writer.writeheader()
             writer.writerows(rows)
@@ -3914,7 +3976,9 @@ async def list_tools() -> list[Tool]:
             name="remove_users_from_projects",
             description=(
                 "Remove one or more users from one or more ACC projects (Leaver / offboarding). "
-                "Pass an empty project_names list to remove users from ALL projects they are members of. "
+                "Pass an empty project_names list to remove users from every project they are a member of "
+                "in ONE hub (the hub resolved from hub_name/region); set all_hubs=true to cover every hub "
+                "you can see. The response lists the hubs scanned. "
                 "Set dry_run=true (default) to preview before executing."
             ),
             inputSchema={
@@ -3927,9 +3991,10 @@ async def list_tools() -> list[Tool]:
                     "project_names": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Projects to remove users from. Empty list = all projects they are members of.",
+                        "description": "Projects to remove users from. Empty list = all their projects in the resolved hub (or in every hub with all_hubs=true).",
                     },
                     "dry_run": {"type": "boolean"},
+                    "all_hubs": {"type": "boolean", "description": "With an empty project_names: scan every hub you can see, not just the resolved one (full offboarding). Default false."},
                     "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
                     "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
                 },
@@ -5063,6 +5128,23 @@ def _validate_id_args(obj: "Any", _key: str = "") -> None:
             _validate_id_args(x, _key)
 
 
+_MAX_LIST_ITEMS = 5000
+
+
+def _check_list_sizes(obj: "Any", _key: str = "") -> None:
+    """Reject absurdly long list arguments (resource exhaustion guard)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _check_list_sizes(v, k)
+    elif isinstance(obj, list):
+        if len(obj) > _MAX_LIST_ITEMS:
+            raise UnsafeArgumentError(
+                f"Argument '{_key}' has {len(obj)} items; at most {_MAX_LIST_ITEMS} per call — split the batch."
+            )
+        for x in obj:
+            _check_list_sizes(x, _key)
+
+
 def _unsafe_argument_result(message: str) -> CallToolResult:
     return CallToolResult(
         isError=True,
@@ -5111,6 +5193,7 @@ async def call_tool(name: str, arguments: dict) -> "list[TextContent] | CallTool
     opaque error."""
     try:
         _validate_id_args(arguments or {})
+        _check_list_sizes(arguments or {})
     except UnsafeArgumentError as e:
         return _unsafe_argument_result(str(e))
     try:
@@ -6107,7 +6190,9 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 async with sem:
                     pid = proj["id"]
                     pname = proj["name"]
-                    role_spec = role_overrides.get(pname.lower(), default_role)
+                    # Project id first (clone_user_access keys by id, so same-named
+                    # projects can't swap role profiles), then the user's name-keyed overrides.
+                    role_spec = role_overrides.get(pid, role_overrides.get(pname.lower(), default_role))
                     role_display = _role_display(role_spec) or "(none)"
                     proj_results: list[dict] = []
 
@@ -6443,6 +6528,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
             resolved_projects_list: list[dict] = []
             project_errors_list: list[dict] = []
+            hubs_scanned: "list | None" = None
             if project_names:
                 for pname in project_names:
                     try:
@@ -6453,13 +6539,17 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                     except ValueError as e:
                         project_errors_list.append({"project": pname, "error": str(e)})
             else:
-                # All projects in hub
-                all_projs = await get_all_pages(
-                    client, f"{APS_BASE}/project/v1/hubs/{hub_id}/projects", hdrs
-                )
-                resolved_projects_list = [
-                    {"id": p["id"], "name": p["attributes"]["name"]} for p in all_projs
-                ]
+                # All projects in the resolved hub — or in every visible hub with all_hubs.
+                scan_hubs = (await _get_all_hubs(client, token)) if arguments.get("all_hubs") \
+                    else [{"id": hub_id, "attributes": {}}]
+                for h in scan_hubs:
+                    all_projs = await get_all_pages(
+                        client, f"{APS_BASE}/project/v1/hubs/{h['id']}/projects", hdrs
+                    )
+                    resolved_projects_list.extend(
+                        {"id": p["id"], "name": p["attributes"]["name"]} for p in all_projs
+                    )
+                hubs_scanned = [h.get("attributes", {}).get("name") or h["id"] for h in scan_hubs]
 
             results: list[dict] = []
             for pentry in project_errors_list:
@@ -6528,6 +6618,11 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "dry_run": dry_run, "operation": "remove_users_from_projects",
                 "summary": summary, "results": results,
                 "audit_file": audit_file,
+                **({"scope": {"hubs_scanned": hubs_scanned,
+                              "note": None if arguments.get("all_hubs") else
+                              "Only this hub was scanned — memberships in other hubs are untouched. "
+                              "Use all_hubs=true for a full offboarding."}}
+                   if hubs_scanned is not None else {}),
             }, indent=2))]
 
         if name == "clone_user_access":
@@ -6575,7 +6670,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             role_overrides: dict[str, list[str]] = {}
             for entry in ref_project_roles:
                 role_names = entry["role_names"]
-                role_overrides[entry["name"].lower()] = role_names or ["Viewer"]
+                role_overrides[entry["id"]] = role_names or ["Viewer"]
 
             results, warnings, api_calls_made = await _execute_bulk_assign(
                 ref_project_roles, target_emails, "", role_overrides, dry_run
@@ -6602,7 +6697,9 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
         if name == "bulk_assign_company_users":
             region = _norm_region(arguments)
             dry_run = arguments.get("dry_run", True)
-            company_name = arguments["company_name"].lower()
+            company_name = (arguments.get("company_name") or "").strip().lower()
+            if not company_name:
+                raise ValueError("company_name must not be empty — it would match every user in the account.")
             project_names = arguments["project_names"]
             default_role = arguments.get("default_role") or ""
             role_overrides = {k.lower(): v for k, v in (arguments.get("role_overrides") or {}).items()}
@@ -6616,10 +6713,20 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
             account_users = await _get_all_accounts_users_map(
                 client, token, app_token, hub_name=arguments.get("hub_name")
             )
-            company_emails = [
-                email for email, u in account_users.items()
-                if company_name in (u.get("company_name") or u.get("companyName") or "").lower()
-            ]
+            def _company_of(u: dict) -> str:
+                return (u.get("company_name") or u.get("companyName") or "").strip()
+
+            matched = {_company_of(u) for u in account_users.values()
+                       if company_name in _company_of(u).lower()}
+            exact = {c for c in matched if c.lower() == company_name}
+            if len(matched) > 1 and not exact:
+                return [TextContent(type="text", text=json.dumps({
+                    "error": "ambiguous_company",
+                    "message": f"'{arguments['company_name']}' matches several companies — use the full name.",
+                    "matches": sorted(matched),
+                }, indent=2))]
+            chosen = exact or matched
+            company_emails = [email for email, u in account_users.items() if _company_of(u) in chosen]
 
             if not company_emails:
                 return [TextContent(type="text", text=json.dumps({
@@ -6934,7 +7041,7 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if name == "deactivate_hub_companies":
             dry_run = arguments.get("dry_run", True)
-            company_names = arguments.get("company_names") or []
+            company_names = list(dict.fromkeys(arguments.get("company_names") or []))  # de-dupe, keep order
             detail = arguments.get("response_detail")
             max_conc = arguments.get("max_concurrency", 8)
 
