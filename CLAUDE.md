@@ -11,8 +11,9 @@ MCP (Model Context Protocol) stdio server for managing an Autodesk Construction 
 ## Commands
 
 ```bash
-# Activate virtual environment (Windows)
-.venv\Scripts\activate
+# Activate virtual environment
+source .venv/bin/activate      # macOS / Linux
+.venv\Scripts\activate         # Windows
 
 # Install dependencies (editable, with test deps)
 pip install -e ".[dev]"
@@ -82,7 +83,7 @@ Located in `tests/`. Uses `respx` for HTTP mocking and `unittest.mock.patch` to 
 1. **Sync first, then branch.** At the start of a piece of work: `git checkout main && git pull --ff-only`, then `git checkout -b <feat|fix|docs>/<short-name>`. Branch off a *fresh* `main` so the branch never starts stale. (If coding started on `main` by accident, just branch **before the first commit** — uncommitted changes follow you across the checkout. The rule is *branch before you commit*, not before you code.)
 2. **One branch per logical unit** of work — not per tiny edit. Trivial doc tweaks can wait and ride along in the next feature branch.
 3. **Land via PR.** Push the branch (`git push -u origin <branch>`), open a PR, let CI's `test` check run, then merge. Prefer a **fast-forward / linear history** (`git merge --ff-only` locally; if `main` moved, `git fetch && git rebase origin/main` on the branch first). No merge commits.
-4. **`gh` CLI is not installed** (see the no-gh memory) — open PRs via the GitHub web UI, or with `gh pr create` once it's available. Plain `git push` needs no `gh` (credentials are cached by Git Credential Manager).
+4. **Open PRs with `gh pr create`** (`gh` is installed and authenticated on the Mac dev machine; on a machine without it, use the GitHub web UI). Plain `git push` needs no `gh`.
 5. Only commit/push when the user asks. Run the Sensitive Data Check below before staging.
 
 ## Public Repo — Sensitive Data Check
