@@ -39,8 +39,8 @@ SCOPES = "data:read data:write data:create account:read account:write"
 # One-line change here if a US hub is ever added.
 ISSUES_REGION = "EMEA"
 
-# The ACC Reviews (approval workflows) API is region-routed just like Issues; all
-# Brussels Airport traffic is EMEA. Sent as `x-ads-region` on every Reviews call.
+# The ACC Reviews (approval workflows) API is region-routed just like Issues; set this
+# to your hubs' region. Sent as `x-ads-region` on every Reviews call.
 REVIEWS_REGION = "EMEA"
 
 
