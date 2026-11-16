@@ -1537,6 +1537,170 @@ async def _resolve_review_file_versions(
     return out
 
 
+# ---------------------------------------------------------------------------
+# File download (Data Management version -> OSS storage object -> signed S3 URL)
+# ---------------------------------------------------------------------------
+
+_DOWNLOAD_DEFAULT_MAX_MB = 200
+_DOWNLOAD_HARD_MAX_MB = 2048
+_STORAGE_URN_PREFIX = "urn:adsk.objects:os.object:"
+_BUCKET_KEY_RE = re.compile(r"^[a-z0-9._-]{3,128}$")
+
+
+def _downloads_dir() -> str:
+    """Where download_file saves files. Fixed under the per-user data dir — the model
+    never picks the destination, so a download can't overwrite an arbitrary file."""
+    return os.path.join(_data_dir(), "downloads")
+
+
+def _safe_download_name(display_name: str, version_number: "int | None") -> str:
+    """A local file name derived from an ACC display name: the basename only (no
+    directory parts), control/reserved characters replaced, the version number
+    inserted before the extension (`MIDP.xlsx` -> `MIDP.v12.xlsx`)."""
+    base = (display_name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    base = re.sub(r'[\x00-\x1f<>:"|?*]', "_", base).strip(" .") or "download"
+    stem, ext = os.path.splitext(base)
+    if not stem:
+        stem, ext = ext or "download", ""
+    if version_number is not None:
+        stem = f"{stem}.v{version_number}"
+    return stem[:180] + ext[:20]
+
+
+def _parse_storage_urn(urn: str) -> tuple[str, str]:
+    """Split a version's storage id (`urn:adsk.objects:os.object:<bucket>/<key>`) into
+    (bucket_key, object_key)."""
+    if not isinstance(urn, str) or not urn.startswith(_STORAGE_URN_PREFIX):
+        raise ValueError(f"Unexpected storage id: {str(urn)[:120]!r}")
+    bucket, _, key = urn[len(_STORAGE_URN_PREFIX):].partition("/")
+    if not _BUCKET_KEY_RE.match(bucket) or not key:
+        raise ValueError(f"Unexpected storage id: {urn[:120]!r}")
+    return bucket, key
+
+
+async def _find_item_in_folder(
+    client: httpx.AsyncClient, token: str, hub_id: str, project_id: str,
+    hdrs: dict, folder_path: str, file_name: str,
+) -> dict:
+    """Return the item whose display name matches `file_name` (case-insensitive) in
+    `folder_path`; ValueError listing the available names otherwise."""
+    folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
+    contents = await get_all_folder_contents(client, project_id, folder_id, hdrs)
+    items = [i for i in contents if i["type"] == "items"]
+    wanted = file_name.strip().lower()
+    match = next(
+        (i for i in items if (i["attributes"].get("displayName") or "").lower() == wanted),
+        None,
+    )
+    if match is None:
+        available = [i["attributes"].get("displayName") for i in items]
+        raise ValueError(
+            f"File '{file_name}' not found in '{folder_path}'. Available files: {available}"
+        )
+    return match
+
+
+async def _resolve_download_version(
+    client: httpx.AsyncClient, token: str, hub_id: str, project_id: str,
+    hdrs: dict, arguments: dict,
+) -> dict:
+    """Return the Data Management version object download_file should fetch: an
+    explicit `version_urn`, else the item's (`item_id`, or `folder_path`+`file_name`)
+    tip, or the version with `version_number`."""
+    version_urn = arguments.get("version_urn")
+    if version_urn:
+        if not isinstance(version_urn, str) or not version_urn.startswith("urn:adsk.") \
+                or len(version_urn) > 512:
+            raise ValueError("version_urn must be a version URN (urn:adsk.wipprod:fs.file:...?version=N).")
+        r = await _request_with_retry(
+            client, "get",
+            f"{APS_BASE}/data/v1/projects/{project_id}/versions/"
+            f"{urllib.parse.quote(version_urn, safe='')}",
+            headers=hdrs,
+        )
+        r.raise_for_status()
+        return r.json().get("data") or {}
+
+    item_id = arguments.get("item_id")
+    if not item_id:
+        folder_path, file_name = arguments.get("folder_path"), arguments.get("file_name")
+        if not folder_path or not (file_name or "").strip():
+            raise ValueError(
+                "Identify the file with 'version_urn', 'item_id', or 'folder_path' + 'file_name'."
+            )
+        item = await _find_item_in_folder(
+            client, token, hub_id, project_id, hdrs, folder_path, file_name,
+        )
+        item_id = item["id"]
+
+    version_number = arguments.get("version_number")
+    if version_number is None:
+        r = await _request_with_retry(
+            client, "get", f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}/tip",
+            headers=hdrs,
+        )
+        r.raise_for_status()
+        return r.json().get("data") or {}
+
+    url: "str | None" = f"{APS_BASE}/data/v1/projects/{project_id}/items/{item_id}/versions"
+    seen: list = []
+    while url:
+        r = await _request_with_retry(client, "get", url, headers=hdrs)
+        r.raise_for_status()
+        body = r.json()
+        for v in body.get("data", []):
+            n = (v.get("attributes") or {}).get("versionNumber")
+            if n == int(version_number):
+                return v
+            seen.append(n)
+        nxt = (body.get("links") or {}).get("next")
+        url = nxt.get("href") if isinstance(nxt, dict) else (nxt if isinstance(nxt, str) else None)
+    raise ValueError(f"Version {version_number} not found. Available versions: {sorted(n for n in seen if n is not None)}")
+
+
+async def _stream_to_private_file(
+    client: httpx.AsyncClient, urls: list[str], dest_path: str, max_bytes: int,
+) -> tuple[int, str]:
+    """Stream the (pre-signed, credential-free) `urls` — concatenated in order — into
+    `dest_path`, owner-only and symlink-safe like `_write_private_file()` (temp file with
+    O_EXCL|O_NOFOLLOW, then `os.replace`). Aborts once more than `max_bytes` arrive.
+    Returns (size_bytes, sha1_hex)."""
+    directory = os.path.dirname(os.path.abspath(dest_path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    _check_private_dir(directory)
+    tmp = os.path.join(directory, f".{os.path.basename(dest_path)}.{secrets.token_hex(8)}.part")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, 0o600)
+    sha1 = hashlib.sha1()
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for url in urls:
+                if urllib.parse.urlsplit(url).scheme != "https":
+                    raise ValueError("Refusing a non-HTTPS download URL.")
+                async with client.stream(
+                    "GET", url, timeout=httpx.Timeout(30.0, read=300.0),
+                ) as r:
+                    r.raise_for_status()
+                    async for chunk in r.aiter_bytes():
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise ValueError(
+                                f"File exceeds max_size_mb ({max_bytes // (1024 * 1024)} MB); "
+                                "raise max_size_mb to download it."
+                            )
+                        sha1.update(chunk)
+                        f.write(chunk)
+        os.replace(tmp, dest_path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return size, sha1.hexdigest()
+
+
 _REVIEWER_KEYS = ("reviewer_users", "reviewer_roles", "reviewer_companies")
 
 
@@ -3760,6 +3924,36 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="download_file",
+            description=(
+                "Download a file's contents from ACC Docs to the local machine (read-only; needs "
+                "only data:read). Identify the file by 'folder_path' + 'file_name', by 'item_id' "
+                "(lineage URN), or by an exact 'version_urn'. Defaults to the latest version; "
+                "pass 'version_number' for an older one. The file is saved under the server's "
+                "data dir (~/.forma-mcp/downloads/, or $FORMA_MCP_HOME/downloads/) as "
+                "'<name>.v<N>.<ext>' — the destination is fixed, not chosen by the caller — and "
+                "re-downloading the same version overwrites it. Returns the local path, size and "
+                "SHA-1; read the file with your own file tools afterwards (e.g. a PDF/XLSX "
+                "converter). Files larger than max_size_mb are refused."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "folder_path": {"type": "string", "description": "Folder holding the file: slash-separated path or a raw folder URN. Use with file_name."},
+                    "file_name": {"type": "string", "description": "Display name of the file (exact match, case-insensitive). Use with folder_path."},
+                    "item_id": {"type": "string", "description": "Item (lineage) URN, e.g. from list_all_files/find_files. Alternative to folder_path + file_name."},
+                    "version_urn": {"type": "string", "description": "Exact version URN (urn:adsk.wipprod:fs.file:vf.xxx?version=N). Overrides the other file selectors and version_number."},
+                    "version_number": {"type": "integer", "minimum": 1, "description": "Version to download (default: latest)."},
+                    "max_size_mb": {"type": "integer", "minimum": 1, "maximum": _DOWNLOAD_HARD_MAX_MB, "description": f"Refuse files larger than this (default {_DOWNLOAD_DEFAULT_MAX_MB}, max {_DOWNLOAD_HARD_MAX_MB})."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="list_project_roles",
             description=(
                 "List all roles defined in an ACC project and show which members hold each role. "
@@ -5777,6 +5971,96 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "project": resolved_name,
                 "scope": folder_path or "(entire project)",
                 "result_count": len(results), "files": results,
+            }, indent=2))]
+
+        if name == "download_file":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            max_mb = int(arguments.get("max_size_mb") or _DOWNLOAD_DEFAULT_MAX_MB)
+            if not 1 <= max_mb <= _DOWNLOAD_HARD_MAX_MB:
+                raise ValueError(f"max_size_mb must be between 1 and {_DOWNLOAD_HARD_MAX_MB}.")
+            max_bytes = max_mb * 1024 * 1024
+
+            version = await _resolve_download_version(
+                client, token, hub_id, project_id, hdrs, arguments,
+            )
+            attrs = version.get("attributes") or {}
+            rels = version.get("relationships") or {}
+            display_name = attrs.get("displayName") or attrs.get("name") or "download"
+            version_number = attrs.get("versionNumber")
+            base_info = {
+                "project": resolved_name,
+                "file_name": display_name,
+                "version_number": version_number,
+                "version_urn": version.get("id"),
+                "item_id": ((rels.get("item") or {}).get("data") or {}).get("id"),
+            }
+            storage_id = ((rels.get("storage") or {}).get("data") or {}).get("id")
+            if not storage_id:
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info,
+                    "error": "no_storage",
+                    "message": "This version has no downloadable storage object (e.g. a "
+                               "cloud-workshared model or a still-processing upload).",
+                }, indent=2))]
+            if attrs.get("storageSize") and attrs["storageSize"] > max_bytes:
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info,
+                    "error": "too_large",
+                    "size_bytes": attrs["storageSize"],
+                    "message": f"File is larger than max_size_mb ({max_mb} MB).",
+                }, indent=2))]
+
+            bucket, key = _parse_storage_urn(storage_id)
+            r = await _request_with_retry(
+                client, "get",
+                f"{APS_BASE}/oss/v2/buckets/{bucket}/objects/"
+                f"{urllib.parse.quote(key, safe='')}/signeds3download",
+                headers=hdrs,
+            )
+            if not r.is_success:
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info,
+                    "error": r.status_code,
+                    "message": "Could not get a download URL"
+                               + (" — you may lack download permission on this folder."
+                                  if r.status_code == 403 else "."),
+                    "body": _error_body(r),
+                }, indent=2))]
+            signed = r.json()
+            urls = [signed["url"]] if signed.get("url") else list(signed.get("urls") or [])
+            if not urls:
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info, "error": "no_download_url", "body": signed,
+                }, indent=2))]
+            if signed.get("size") and signed["size"] > max_bytes:
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info,
+                    "error": "too_large",
+                    "size_bytes": signed["size"],
+                    "message": f"File is larger than max_size_mb ({max_mb} MB).",
+                }, indent=2))]
+
+            dest = os.path.join(_downloads_dir(), _safe_download_name(display_name, version_number))
+            size, sha1 = await _stream_to_private_file(client, urls, dest, max_bytes)
+            expected = signed.get("sha1")
+            if expected and expected.lower() != sha1:
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                return [TextContent(type="text", text=json.dumps({
+                    **base_info, "error": "checksum_mismatch",
+                    "expected_sha1": expected, "actual_sha1": sha1,
+                }, indent=2))]
+            return [TextContent(type="text", text=json.dumps({
+                **base_info,
+                "file_type": attrs.get("fileType"),
+                "mime_type": attrs.get("mimeType"),
+                "last_modified": attrs.get("lastModifiedTime"),
+                "size_bytes": size,
+                "sha1": sha1,
+                "saved_to": dest,
+                "status": "downloaded",
             }, indent=2))]
 
         if name == "export_deliverables_manifest":
