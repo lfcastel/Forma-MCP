@@ -173,6 +173,8 @@ The server keeps its per-user state in `~/.forma-mcp/` (override with `FORMA_MCP
 | `tokens.json` | Only when no OS keychain is available: the 3-legged refresh token, owner-only. Normally absent — the token lives in the keychain |
 | `audit_logs/` | Timestamped audit CSVs written by the bulk tools when run live |
 | `role_id_cache.json` | Optional role-name cache (see `APS_ROLE_CACHE` above) |
+| `data_connector/<job_id>/` | Extract ZIP + unpacked CSV tables from `get_data_request_results` (owner-only) |
+| `file_attributes/` | Full file-register CSVs written by `get_file_attributes` for large runs (owner-only) |
 | `downloads/` | Files fetched by `download_file`, saved as `<name>.v<N>.<ext>` (owner-only; re-downloading a version overwrites it) |
 
 Upgrading from v0.2.x or a repo-clone install? An existing plaintext `tokens.json` (in `~/.forma-mcp/` or next to `aps_mcp.py`) is moved into the OS keychain on first use and the file is deleted.
@@ -217,6 +219,7 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | `find_files` | Search for files by name across a project | 3-legged |
 | `list_all_files` | Recursively list **every** file in a project (or a folder + subfolders) with full paths | 3-legged |
 | `export_deliverables_manifest` | Compact **filename-only** recursive list (deduped, sorted, no metadata) for cross-checking against an external deliverable list | 3-legged |
+| `get_file_attributes` | Current Docs metadata per file: **revision**, **review/approval status**, title/number and every filled-in **custom attribute** (e.g. status S0/A2) — by folder (optionally recursive), item ids, version URNs, or **the whole project** (no selector = full file register); above 200 files the rows go to a CSV in `~/.forma-mcp/file_attributes/` with per-attribute missing counts (`output`: auto/json/csv; up to 20 000 files); `include_definitions` adds the folder's full attribute catalogue | 3-legged |
 | `download_file` | Download a file's contents (latest or a given version) to `~/.forma-mcp/downloads/` so the agent can read it locally — e.g. an Excel tracker or a PDF; by `folder_path`+`file_name`, `item_id` or `version_urn`; size-capped (`max_size_mb`, default 200) and SHA-1-verified | 3-legged |
 | `find_folder` | Search for folders by name across a project | 3-legged |
 | `delete_folder` | Soft-delete (hide) an empty folder | 3-legged |
@@ -239,12 +242,14 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | `export_permission_matrix` | Export a full permission matrix for a folder tree (role columns labelled from the permissions endpoint, falling back to `role_id_cache.json` for nameless/empty roles) | 3-legged |
 | `apply_permission_changes` | Apply batched permission changes to folders | 3-legged |
 
-### Role & data export
+### Role & data export (Data Connector)
 
 | Tool | What it does | Auth |
 |------|-------------|------|
 | `create_role_data_export` | Trigger a Data Connector `admin` export to resolve the full project-roles catalog (id ↔ name, **empty roles included**) — for assigning users to an unused role or labelling `export_permission_matrix` | 3-legged |
 | `get_data_connector_requests` | Poll & download a completed Data Connector export; returns the `role_id → name` map | 3-legged |
+| `create_data_request` | Start a one-time Data Connector extract for up to 50 projects of one hub, choosing the `service_groups` the question needs (`admin`, `issues`, `reviews`, `rfis`, `submittalsacc`, `activities` + date range, …). Needs `data:create` (**not in read-only mode**) and project-admin rights; 24 jobs/hub/day | 3-legged |
+| `get_data_request_results` | Wait for the request's job, download the extract and unpack its CSV tables to `~/.forma-mcp/data_connector/<job_id>/`; returns table names, paths, row counts and columns (not the data) | 3-legged |
 
 ### Bulk user management
 
@@ -377,6 +382,7 @@ flowchart LR
         T6(find_files)
         T39(list_all_files)
         T40(export_deliverables_manifest)
+        T74(get_file_attributes)
         T73(download_file)
         T23(find_folder)
         T24(delete_folder)
@@ -395,9 +401,11 @@ flowchart LR
         T12(apply_permission_changes)
     end
 
-    subgraph ROLES["Role Export · 3-legged OAuth"]
+    subgraph ROLES["Role & Data Connector export · 3-legged OAuth"]
         T13(create_role_data_export)
         T14(get_data_connector_requests)
+        T75(create_data_request)
+        T76(get_data_request_results)
     end
 
     subgraph BULK["Bulk User Management · 3-legged + account:write · dry_run=true by default"]
@@ -530,6 +538,7 @@ flowchart LR
     E54["POST /construction/submittals/v2/projects/{p}/items/{i}/steps/{s}/tasks/{t}:close"]
     E55["GET /data/v1/projects/{p}/items/{i}/tip · /versions · /versions/{v}"]
     E56["GET /oss/v2/buckets/{b}/objects/{o}/signeds3download → signed S3 URL (no auth)"]
+    E57["POST /bim360/docs/v1/projects/{p}/versions:batch-get · GET .../folders/{f}/custom-attribute-definitions"]
 
     T1 --> E1
     T2 --> E2
@@ -648,9 +657,14 @@ flowchart LR
     T73 --> E4
     T73 --> E55
     T73 --> E56
+    T74 --> E4
+    T74 --> E57
+    T75 --> E12
+    T76 --> E13
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70,T71,T72,T73 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70,T71,T72,T73,T74,T75,T76 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40,E43,E44,E47,E48,E51,E52,E55,E56 get
+    class E57 post
     class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41,E42,E45,E49,E53,E54 post
     class E15,E17,E20,E25,E26,E34,E46,E50 patch
     class E16 del
@@ -684,6 +698,10 @@ List every file in "Northgate Tower"
 List all files under Project Files/Drawings in "Northgate Tower" (including subfolders)
 What files were modified in the last 7 days in "Northgate Tower"?
 Download Project Files/Trackers/MIDP.xlsx from "Northgate Tower" and summarise the open deliverables
+Show revision, review status and the Status attribute of every PDF under Project Files/Drawings in "Northgate Tower"
+Which files in Project Files/Shared have no value for the Description attribute?
+Export a full file register (revision, review status, all attributes) for "Northgate Tower"
+Run a Data Connector extract of reviews and issues for "Northgate Tower" and tell me how many issues have no Discipline
 ```
 
 ### User & access management
@@ -857,7 +875,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 73 tools
+├── aps_mcp.py                  # MCP server — 76 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build + dependency audit)
 ├── .github/dependabot.yml      # weekly dependency / action updates (14-day cooldown)
