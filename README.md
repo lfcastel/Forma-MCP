@@ -68,7 +68,7 @@ No clone or virtualenv needed: `uvx` installs the server straight from this repo
 **1. Store the client secret in your OS keychain** (once per machine — run it in a normal terminal; it prompts without echoing):
 
 ```bash
-uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.7.1 forma-mcp auth set-secret --client-id your_client_id
+uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.8.0 forma-mcp auth set-secret --client-id your_client_id
 ```
 
 **2. Register the server with Claude Code.** Only the (non-secret) Client ID goes in the config:
@@ -76,7 +76,7 @@ uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.7.1 forma-mcp auth set-s
 ```bash
 claude mcp add forma-mcp --scope user \
   -e APS_CLIENT_ID=your_client_id \
-  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.7.1 forma-mcp
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.8.0 forma-mcp
 ```
 
 Or add it by hand to `~/.claude.json`:
@@ -86,7 +86,7 @@ Or add it by hand to `~/.claude.json`:
   "forma-mcp": {
     "type": "stdio",
     "command": "uvx",
-    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.7.1", "forma-mcp"],
+    "args": ["--from", "git+https://github.com/lfcastel/Forma-MCP@v0.8.0", "forma-mcp"],
     "env": {
       "APS_CLIENT_ID": "your_client_id"
     }
@@ -132,7 +132,7 @@ claude mcp add forma-mcp-readonly --scope user \
 
 > **A safety net, not access control.** The flag lives in the user's own MCP config, so anyone can remove it and log in with full access. To make sure a tester *can't* change data, give them view-only permissions in ACC: a token never exceeds the signed-in user's ACC permissions, whatever its scopes. The exception is the 2-legged (app) token: it acts as the app, not the user, so ACC permissions don't limit it. In a normal install it can still write to the account directory; only read-only mode narrows it.
 
-**Upgrading:** change the tag (`@v0.7.1` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
+**Upgrading:** change the tag (`@v0.8.0` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
 
