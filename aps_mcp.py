@@ -33,6 +33,30 @@ APS_BASE = "https://developer.api.autodesk.com"
 CALLBACK_PORT = int(os.environ.get("APS_CALLBACK_PORT", "8080"))
 REDIRECT_URI = f"http://localhost:{CALLBACK_PORT}/oauth/callback"
 SCOPES = "data:read data:write data:create account:read account:write"
+# Read-only mode (`FORMA_MCP_READ_ONLY=1` / `forma-mcp --read-only`): the tokens are
+# requested with read scopes only, so APS itself rejects any write (403) whatever tool
+# is called. A safety net for testers, not access control — the user can drop the flag.
+READ_ONLY_SCOPES = "data:read account:read"
+APP_SCOPES = "account:read account:write"
+READ_ONLY_APP_SCOPES = "account:read"
+
+
+def _read_only() -> bool:
+    return os.environ.get("FORMA_MCP_READ_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _user_scopes() -> str:
+    return READ_ONLY_SCOPES if _read_only() else SCOPES
+
+
+def _app_scopes() -> str:
+    return READ_ONLY_APP_SCOPES if _read_only() else APP_SCOPES
+
+
+def _refresh_token_key() -> str:
+    """Keychain key of the refresh token. Read-only mode keeps its own token so a stored
+    full-scope login is never reused for a read-only session (and vice versa)."""
+    return "refresh_token_readonly" if _read_only() else "refresh_token"
 
 # The ACC Issues API routes per-region; all our Issues traffic is EMEA. Sent as
 # the `x-ads-region` header on every Issues call (avoids the auto-route latency).
@@ -59,7 +83,8 @@ LEGACY_TOKEN_FILE = os.path.join(_SCRIPT_DIR, "tokens.json")
 
 
 def _token_file() -> str:
-    return os.path.join(_data_dir(), "tokens.json")
+    name = "tokens.readonly.json" if _read_only() else "tokens.json"
+    return os.path.join(_data_dir(), name)
 
 app = Server("aps-mcp")
 
@@ -211,8 +236,13 @@ def _write_private_file(path: str, text: str) -> None:
         raise
 
 
+def _plaintext_token_paths() -> tuple[str, ...]:
+    # The legacy file predates read-only mode, so it always holds a full-scope token.
+    return (_token_file(),) if _read_only() else (_token_file(), LEGACY_TOKEN_FILE)
+
+
 def _read_plaintext_refresh_token() -> str | None:
-    for path in (_token_file(), LEGACY_TOKEN_FILE):
+    for path in _plaintext_token_paths():
         if os.path.islink(path):
             continue  # never read a token through a planted symlink
         try:
@@ -227,7 +257,7 @@ def _read_plaintext_refresh_token() -> str | None:
 
 def _remove_plaintext_tokens() -> list[str]:
     removed = []
-    for path in (_token_file(), LEGACY_TOKEN_FILE):
+    for path in _plaintext_token_paths():
         try:
             os.remove(path)
             removed.append(path)
@@ -239,17 +269,17 @@ def _remove_plaintext_tokens() -> list[str]:
 def _load_refresh_token() -> str | None:
     """The stored refresh token. A plaintext `tokens.json` left by an older version is
     moved into the keychain (and the file deleted) the first time it's read."""
-    rt = _kr_get("refresh_token")
+    rt = _kr_get(_refresh_token_key())
     if rt:
         return rt
     rt = _read_plaintext_refresh_token()
-    if rt and _kr_set("refresh_token", rt):
+    if rt and _kr_set(_refresh_token_key(), rt):
         _remove_plaintext_tokens()
     return rt
 
 
 def _save_refresh_token(rt: str) -> None:
-    if _kr_set("refresh_token", rt):
+    if _kr_set(_refresh_token_key(), rt):
         _remove_plaintext_tokens()
         return
     if _require_keychain():
@@ -263,7 +293,7 @@ def _save_refresh_token(rt: str) -> None:
 
 
 def _clear_tokens(client_id: str | None = None) -> None:
-    _kr_delete("refresh_token", client_id)
+    _kr_delete(_refresh_token_key(), client_id)
     _remove_plaintext_tokens()
     _user_token_cache.update(token=None, expires_at=0)
 
@@ -291,7 +321,7 @@ def _build_auth_url(state: str, code_challenge: str) -> str:
         "response_type": "code",
         "client_id": APS_CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
-        "scope": SCOPES,
+        "scope": _user_scopes(),
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
@@ -409,6 +439,8 @@ async def _refresh_tokens(refresh_token: str) -> dict:
             data={
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
+                # Re-request the session's scopes so a refreshed token never widens.
+                "scope": _user_scopes(),
             },
         )
         res.raise_for_status()
@@ -828,7 +860,7 @@ async def get_app_token() -> str:
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Authorization": f"Basic {creds}",
             },
-            data={"grant_type": "client_credentials", "scope": "account:read account:write"},
+            data={"grant_type": "client_credentials", "scope": _app_scopes()},
         )
         res.raise_for_status()
         data = res.json()
@@ -8096,7 +8128,7 @@ def _auth_cli(command: str, client_id: str) -> int:
             secret_src = "OS keychain"
         else:
             secret_src = "MISSING"
-        if client_id and _kr_get("refresh_token", client_id):
+        if client_id and _kr_get(_refresh_token_key(), client_id):
             token_src = "OS keychain"
         elif _read_plaintext_refresh_token():
             token_src = f"plaintext file ({_token_file()})"
@@ -8107,6 +8139,8 @@ def _auth_cli(command: str, client_id: str) -> int:
         print(f"client secret    : {secret_src}")
         print(f"refresh token    : {token_src}")
         print(f"keychain-only    : {'on (FORMA_MCP_REQUIRE_KEYCHAIN)' if _require_keychain() else 'off'}")
+        print(f"mode             : {'READ-ONLY' if _read_only() else 'read/write'} "
+              f"(scopes: {_user_scopes()})")
         warning = _env_secret_warning()
         if warning:
             print(f"WARNING          : {warning}")
@@ -8154,12 +8188,18 @@ def run(argv: list[str] | None = None):
 
     With no arguments it serves MCP over stdio; `forma-mcp auth ...` manages credentials."""
     parser = argparse.ArgumentParser(prog="forma-mcp", description="Forma / ACC MCP server")
+    parser.add_argument("--read-only", action="store_true",
+                        help="request read-only OAuth scopes (same as FORMA_MCP_READ_ONLY=1)")
     sub = parser.add_subparsers(dest="command")
     auth = sub.add_parser("auth", help="manage stored credentials (OS keychain)")
     auth.add_argument("action", choices=["set-secret", "delete-secret", "logout", "status"])
+    auth.add_argument("--read-only", action="store_true", dest="auth_read_only",
+                      help="act on the read-only login (same as FORMA_MCP_READ_ONLY=1)")
     auth.add_argument("--client-id", default=os.environ.get("APS_CLIENT_ID", ""),
                       help="APS client id (defaults to APS_CLIENT_ID)")
     args = parser.parse_args(argv)
+    if args.read_only or getattr(args, "auth_read_only", False):
+        os.environ["FORMA_MCP_READ_ONLY"] = "1"
     if args.command == "auth":
         sys.exit(_auth_cli(args.action, args.client_id.strip()))
 
@@ -8177,6 +8217,9 @@ def run(argv: list[str] | None = None):
     warning = _env_secret_warning()
     if warning:
         print(f"[forma-mcp] WARNING: {warning}", file=sys.stderr, flush=True)
+    if _read_only():
+        print(f"[forma-mcp] READ-ONLY mode (scopes: {_user_scopes()}); APS rejects writes.",
+              file=sys.stderr, flush=True)
     asyncio.run(main())
 
 

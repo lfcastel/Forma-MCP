@@ -114,6 +114,24 @@ claude mcp add forma-mcp --scope user \
 - **`-c …/constraints.txt`** — pins every direct *and* transitive dependency to an exact version (generated with `uv pip compile --universal --generate-hashes` and a 14-day cooling-off window, so no freshly published release is ever picked up). CI installs this exact set and scans it with `pip-audit` on every change. Note: `uvx` enforces the *versions* in a constraints file but not its hashes; for a **hash-verified** install use a venv: `uv pip install --require-hashes -r constraints.txt && uv pip install --no-deps git+https://github.com/lfcastel/Forma-MCP@<commit-sha>`.
 - **`FORMA_MCP_REQUIRE_KEYCHAIN=1`** — keychain-only mode: see [Optional environment variables](#optional-environment-variables).
 
+### Read-only mode (for testers)
+
+Add `--read-only` to let someone explore the server without being able to change anything:
+
+```bash
+claude mcp add forma-mcp-readonly --scope user \
+  -e APS_CLIENT_ID=your_client_id \
+  -- uvx --from git+https://github.com/lfcastel/Forma-MCP@v0.8.0 forma-mcp --read-only
+```
+
+(or `"args": [..., "forma-mcp", "--read-only"]`, or `FORMA_MCP_READ_ONLY=1` in the `env` block). The server then requests **read scopes only**: `data:read account:read` for the browser login and `account:read` for the app token. Autodesk itself rejects every write with a 403, whichever tool is called. All tools stay listed: reads, searches, audits and bulk-tool **dry runs** work normally, and write calls fail with an error.
+
+- The read-only login is **stored separately** from a normal login (its own keychain entry, or `tokens.readonly.json` without a keychain), so an earlier full-access login is never reused. The first read-only call opens a browser login of its own.
+- `forma-mcp auth status --read-only` / `auth logout --read-only` act on the read-only login; without the flag they act on the normal one.
+- The server prints `READ-ONLY mode` on stderr at startup, and `auth status` shows the active mode and scopes.
+
+> **A safety net, not access control.** The flag lives in the user's own MCP config, so anyone can remove it and log in with full access. To make sure a tester *can't* change data, give them view-only permissions in ACC: a token never exceeds the signed-in user's ACC permissions, whatever its scopes. The exception is the 2-legged (app) token: it acts as the app, not the user, so ACC permissions don't limit it. In a normal install it can still write to the account directory; only read-only mode narrows it.
+
 **Upgrading:** change the tag (`@v0.7.1` → the new release) in the command or config and reconnect. Releases are listed on the repo's **Tags** page. To try an unreleased branch, use `@<branch-name>` instead of a tag.
 
 **Always the latest (unpinned):** drop the `@<tag>` to track `main` — every merged PR, including changes not yet tagged as a release. There is no `@latest` ref; omitting the tag is how you get it. Add `--refresh` so uv checks for a newer `main` each time the server starts (otherwise it may keep reusing the cached build):
@@ -139,6 +157,8 @@ Add these to the `-e` flags or the `env` block as needed.
 `APS_CALLBACK_PORT` (optional, default `8080`) is the local port of the browser-login callback. Change it only if 8080 is taken, and register `http://localhost:<port>/oauth/callback` as a callback URL on your APS app (it must match exactly).
 
 `FORMA_MCP_REQUIRE_KEYCHAIN=1` (optional, recommended on managed machines) is **keychain-only mode**: `APS_CLIENT_SECRET` is ignored, so the secret can only come from the OS keychain, and the refresh token is never written to a plaintext file — if no keychain is usable it is kept in memory for that process only. `FORMA_MCP_KEYRING=0` turns the keychain off entirely (the secret must then come from `APS_CLIENT_SECRET`, and the refresh token falls back to an owner-only `tokens.json` in the data directory).
+
+`FORMA_MCP_READ_ONLY=1` (optional) is **read-only mode**, the same as the `--read-only` flag; see [Read-only mode](#read-only-mode-for-testers).
 
 `APS_RATE_HEADROOM` (optional, default `0.8`) is the fraction of each published Data Management rate limit the server allows itself — lower it if the same APS client ID is shared by several people/sessions; `APS_RATE_LIMITING=0` switches the client-side pacing off entirely (see Known Limitations).
 
@@ -757,18 +777,19 @@ List the file packages in "Northgate Tower" and the files in each
 
   | Command | Effect |
   |---------|--------|
-  | `forma-mcp auth status` | Shows the keychain backend and *where* the secret and refresh token come from (never the values) |
+  | `forma-mcp auth status` | Shows the keychain backend, the mode (read/write or read-only, with its scopes), and *where* the secret and refresh token come from (never the values) |
   | `forma-mcp auth set-secret [--client-id ID]` | Prompts for the client secret and stores it in the keychain |
   | `forma-mcp auth delete-secret [--client-id ID]` | Removes the stored client secret |
   | `forma-mcp auth logout [--client-id ID]` | Removes the stored login (keychain entry and any `tokens.json`); the next tool call opens a browser login |
 
-  Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`. `--client-id` defaults to `APS_CLIENT_ID`.
+  Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`. `--client-id` defaults to `APS_CLIENT_ID`. Add `--read-only` to act on the separate read-only login.
 - **Hardened tool arguments** — every argument that ends up in an API URL path (`hub_id`, `folder_id`, `item_id`, `issue_id`, `review_id`, `workflow_id`, `request_id`, and folder arguments given as a raw `urn:`) is checked against a strict id charset before any request is made. A value containing `/`, `?`, `#`, `%`, whitespace or `..` is rejected with an `unsafe_argument` error, so text the model picked up from ACC content (a file name, an issue description) can't redirect a call to a different API endpoint with your token.
 - **Credentials pinned to Autodesk** — the HTTP client refuses to send any `Authorization` header anywhere except `https://developer.api.autodesk.com`. The only other host ever contacted is the pre-signed (credential-free) download URL that a Data Connector job returns.
 - **Supply chain** — 3 direct dependencies; a hash-pinned `constraints.txt` for reproducible installs; CI actions pinned by commit SHA with a read-only workflow token; `pip-audit` on every change; Dependabot (with a 14-day cooldown), secret scanning and push protection enabled; release tags immutable.
 - **Whose permissions apply** — the 3-legged tools (navigation, folders, files, project membership, issues, reviews) act as **the signed-in user**, with their ACC permissions. The **2-legged** tools (account users/companies directory, hub onboarding/offboarding, project lookup by id) act as the **app**, with `account:read account:write`, on every account where the integration is activated — independent of the signed-in user's own rights. Activating the Custom Integration is therefore an account-admin decision, and revoking it disables the server for that account.
 - **Defensive input handling** (from an external static-analysis scan, Nov 2026): an empty or ambiguous `company_name` is refused instead of matching every user; `clone_user_access` keys roles by project **ID**, so two same-named projects can't swap role sets; a project ID the signed-in user's hubs don't contain is reported as not found (no name leak via the app token); list arguments are capped at 5,000 items and bulk fan-outs run on a fixed worker pool; `create_review` checks its 1,000-file limit before any lookup; audit CSVs get collision-proof names and are never overwritten; the login callback port is bound *before* the browser opens, with a clear error if it's taken.
 - **Symlink-safe state files** — the data directory is refused if it's a symlink or owned by another user (and tightened to `0700`); `tokens.json` is written via an exclusive temp file + atomic rename, so a planted symlink is replaced, never followed, and is never read through.
+- **Read-only mode** (`--read-only`): the tokens carry read scopes only, so Autodesk rejects writes. See [Read-only mode](#read-only-mode-for-testers).
 - Bulk write tools default to `dry_run: true` — no changes are made without explicit confirmation.
 
 ---
@@ -790,6 +811,7 @@ List the file packages in "Northgate Tower" and the files in each
 
 ## Known Limitations
 
+- **Read-only mode: reads sent as POST are not yet verified live** — a few read operations use `POST` (e.g. the RFI search behind `list_rfis`). They are expected to work with `data:read`, but this hasn't been tested against a live hub yet; if one returns 403 in read-only mode, that is why.
 - **User last-activity date** — the `last_sign_in` field is only populated for **BIM360 projects**. The underlying ACC Account Admin API does not return this field for Forma projects, so activity timestamps will be absent for those users.
 - **APS rate limits** — Autodesk enforces [Data Management rate limits](https://aps.autodesk.com/en/docs/data/v2/overview/rate-limits/) **per endpoint, per client ID, per minute** (e.g. 300 rpm on `folders/{id}/contents`, 50 rpm on `hubs`/`projects` and on folder create/rename). The server paces itself to stay under them: every Data Management request goes through a per-endpoint token bucket (published limit × `APS_RATE_HEADROOM`, default 0.8, with a ~10 s burst allowance), and the recursive tree walks (`find_files`, `list_all_files`, `find_folder`, `find_recent_activity`, `export_permission_matrix`) keep at most 8 folder listings in flight. A 429 (APS's body reads `"Quota limit exceeded."` even for an ordinary rate limit) is retried after the full `Retry-After` period (capped at 60 s, up to 3 times) and also blocks that endpoint's bucket so concurrent calls back off together; only after the retries are exhausted does a tool return a clean `quota_exceeded` result with the `Retry-After` hint — wait and retry. The limits are shared by **everyone using the same APS client ID**, so if several people run this server, give each their own app registration. Set `APS_RATE_LIMITING=0` to disable the client-side pacing.
 - **Cloud-workshared Revit models can't be moved by API** — C4R models (`C4RModel`) return 403 on a move and cannot be relocated programmatically. During a `bulk_delete_folders` reorg they are what keeps a folder from being deleted: it is reported as `skipped_has_files` so a human can move them in the Revit/ACC UI first.
