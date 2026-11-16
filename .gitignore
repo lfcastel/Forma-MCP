@@ -33,3 +33,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Local copy of Autodesk Data Connector schema docs (reference only)
+data requests documentation/
+.DS_Store

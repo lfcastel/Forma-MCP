@@ -4,6 +4,8 @@ import sys
 import re
 import csv
 import zipfile
+import shutil
+import contextlib
 import base64
 import json
 import time
@@ -1658,39 +1660,21 @@ async def _resolve_download_version(
     raise ValueError(f"Version {version_number} not found. Available versions: {sorted(n for n in seen if n is not None)}")
 
 
-async def _stream_to_private_file(
-    client: httpx.AsyncClient, urls: list[str], dest_path: str, max_bytes: int,
-) -> tuple[int, str]:
-    """Stream the (pre-signed, credential-free) `urls` — concatenated in order — into
-    `dest_path`, owner-only and symlink-safe like `_write_private_file()` (temp file with
-    O_EXCL|O_NOFOLLOW, then `os.replace`). Aborts once more than `max_bytes` arrive.
-    Returns (size_bytes, sha1_hex)."""
+@contextlib.contextmanager
+def _private_output(dest_path: str):
+    """Yield a binary file object whose content lands at `dest_path` owner-only and
+    symlink-safe like `_write_private_file()`: the directory is created/checked, bytes go
+    to a fresh temp file (O_EXCL|O_NOFOLLOW, 0600) that is atomically renamed over
+    `dest_path` on success and removed on any error."""
     directory = os.path.dirname(os.path.abspath(dest_path))
     os.makedirs(directory, mode=0o700, exist_ok=True)
     _check_private_dir(directory)
     tmp = os.path.join(directory, f".{os.path.basename(dest_path)}.{secrets.token_hex(8)}.part")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     fd = os.open(tmp, flags, 0o600)
-    sha1 = hashlib.sha1()
-    size = 0
     try:
         with os.fdopen(fd, "wb") as f:
-            for url in urls:
-                if urllib.parse.urlsplit(url).scheme != "https":
-                    raise ValueError("Refusing a non-HTTPS download URL.")
-                async with client.stream(
-                    "GET", url, timeout=httpx.Timeout(30.0, read=300.0),
-                ) as r:
-                    r.raise_for_status()
-                    async for chunk in r.aiter_bytes():
-                        size += len(chunk)
-                        if size > max_bytes:
-                            raise ValueError(
-                                f"File exceeds max_size_mb ({max_bytes // (1024 * 1024)} MB); "
-                                "raise max_size_mb to download it."
-                            )
-                        sha1.update(chunk)
-                        f.write(chunk)
+            yield f
         os.replace(tmp, dest_path)
     except BaseException:
         try:
@@ -1698,7 +1682,272 @@ async def _stream_to_private_file(
         except OSError:
             pass
         raise
+
+
+async def _stream_to_private_file(
+    client: httpx.AsyncClient, urls: list[str], dest_path: str, max_bytes: int,
+) -> tuple[int, str]:
+    """Stream the (pre-signed, credential-free) `urls` — concatenated in order — into
+    `dest_path` via `_private_output()`. Aborts once more than `max_bytes` arrive.
+    Returns (size_bytes, sha1_hex)."""
+    sha1 = hashlib.sha1()
+    size = 0
+    with _private_output(dest_path) as f:
+        for url in urls:
+            if urllib.parse.urlsplit(url).scheme != "https":
+                raise ValueError("Refusing a non-HTTPS download URL.")
+            async with client.stream(
+                "GET", url, timeout=httpx.Timeout(30.0, read=300.0),
+            ) as r:
+                r.raise_for_status()
+                async for chunk in r.aiter_bytes():
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise ValueError(
+                            f"File exceeds max_size_mb ({max_bytes // (1024 * 1024)} MB); "
+                            "raise max_size_mb to download it."
+                        )
+                    sha1.update(chunk)
+                    f.write(chunk)
     return size, sha1.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# File attributes (Docs custom attributes, revision, approval status)
+# ---------------------------------------------------------------------------
+
+_ATTR_BATCH_SIZE = 50          # versions:batch-get accepts at most 50 URNs per call
+_ATTR_DEFAULT_MAX_FILES = 5000
+_ATTR_HARD_MAX_FILES = 20000
+_ATTR_CSV_THRESHOLD = 200     # output "auto" switches to a CSV file above this many files
+_ATTR_BASE_COLUMNS = (
+    "path", "name", "item_id", "version_urn", "version_number", "revision_number",
+    "approval_status", "approval_status_value", "title", "number", "process_state",
+    "last_modified", "last_modified_by",
+)
+
+
+def _file_attributes_dir() -> str:
+    return os.path.join(_data_dir(), "file_attributes")
+
+
+def _write_attributes_csv(rows: list[dict], project_name: str) -> tuple[str, list[str]]:
+    """Write get_file_attributes rows to an owner-only CSV (one column per custom attribute,
+    prefixed 'attr:'). Returns (path, attribute_names)."""
+    attr_names = sorted({k for r in rows for k in (r.get("custom_attributes") or {})}, key=str.lower)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(
+        _file_attributes_dir(),
+        _safe_download_name(f"{project_name}_{stamp}_{secrets.token_hex(3)}.csv", None),
+    )
+    with _private_output(path) as raw:
+        f = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+        w = csv.writer(f)
+        w.writerow(list(_ATTR_BASE_COLUMNS) + [f"attr:{a}" for a in attr_names])
+        for r in rows:
+            ca = r.get("custom_attributes") or {}
+            w.writerow([r.get(c) if r.get(c) is not None else "" for c in _ATTR_BASE_COLUMNS]
+                       + [ca.get(a, "") for a in attr_names])
+        f.flush()
+        f.detach()  # leave closing the raw file to _private_output
+    return path, attr_names
+
+
+def _check_adsk_urn(value: "Any", what: str) -> str:
+    if not isinstance(value, str) or not value.startswith("urn:adsk.") or len(value) > 512:
+        raise ValueError(f"{what} must be an ACC URN (urn:adsk....), got {str(value)[:80]!r}.")
+    return value
+
+
+def _version_number_from_urn(urn: "str | None") -> "int | None":
+    m = re.search(r"[?&]version=(\d+)", urn or "")
+    return int(m.group(1)) if m else None
+
+
+def _fmt_version_attrs(r: dict) -> dict:
+    """One versions:batch-get result -> a flat, token-lean row. Custom attributes become
+    a {name: value} map (only attributes that hold a value are returned by the API)."""
+    approval = r.get("approvalStatus") or {}
+    return {
+        "name": r.get("name"),
+        "item_id": r.get("itemUrn"),
+        "version_urn": r.get("urn"),
+        "version_number": _version_number_from_urn(r.get("urn")),
+        "revision_number": r.get("revisionNumber"),
+        "approval_status": approval.get("label"),
+        "approval_status_value": approval.get("value"),
+        "title": r.get("title") or None,
+        "number": r.get("number") or None,
+        "process_state": r.get("processState"),
+        "last_modified": r.get("lastModifiedTime"),
+        "last_modified_by": r.get("lastModifiedUserName"),
+        "custom_attributes": {
+            ca.get("name"): ca.get("value") for ca in (r.get("customAttributes") or [])
+            if ca.get("name") is not None
+        },
+    }
+
+
+async def _batch_get_version_attrs(
+    client: httpx.AsyncClient, hdrs: dict, bare_project_id: str, urns: list[str],
+) -> tuple[list[dict], list[dict]]:
+    """POST versions:batch-get in chunks of 50 (bounded fan-out). Returns
+    (results, errors); a failed chunk reports one error row per URN in it."""
+    url = f"{APS_BASE}/bim360/docs/v1/projects/{bare_project_id}/versions:batch-get"
+    post_hdrs = {**hdrs, "Content-Type": "application/json"}
+    chunks = [urns[i:i + _ATTR_BATCH_SIZE] for i in range(0, len(urns), _ATTR_BATCH_SIZE)]
+
+    def _factory(chunk):
+        async def run():
+            r = await _request_with_retry(client, "post", url, headers=post_hdrs, json={"urns": chunk})
+            if not r.is_success:
+                body = _error_body(r)
+                return [], [{"urn": u, "code": r.status_code, "detail": body} for u in chunk]
+            body = r.json()
+            return body.get("results") or [], body.get("errors") or []
+        return run
+
+    results: list[dict] = []
+    errors: list[dict] = []
+    for res, errs in await _gather_bounded(4, [_factory(c) for c in chunks]):
+        results.extend(res)
+        errors.extend(errs)
+    return results, errors
+
+
+async def _get_attribute_definitions(
+    client: httpx.AsyncClient, hdrs: dict, bare_project_id: str, folder_id: str,
+) -> list[dict]:
+    """Every custom attribute defined on a folder (incl. unset ones and drop-down values)."""
+    rows = await _get_all_issues(
+        client,
+        f"{APS_BASE}/bim360/docs/v1/projects/{bare_project_id}/folders/"
+        f"{urllib.parse.quote(folder_id, safe='')}/custom-attribute-definitions",
+        hdrs, page_limit=200,
+    )
+    return [
+        {k: v for k, v in (("id", d.get("id")), ("name", d.get("name")),
+                           ("type", d.get("type")), ("values", d.get("arrayValues"))) if v is not None}
+        for d in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Data Connector: generic data requests + extract download
+# ---------------------------------------------------------------------------
+
+DC_STANDARD_SERVICE_GROUPS = (
+    "all", "activities", "admin", "assets", "checklists", "cost", "dailylogs", "forms", "iq",
+    "issues", "locations", "markups", "meetingminutes", "photos", "relationships", "reviews",
+    "rfis", "schedule", "sheets", "submittals", "submittalsacc", "transmittals",
+)
+DC_CDC_SERVICE_GROUPS = (
+    "cdcadmin", "cdccost", "cdcissues", "cdclocations", "cdcrfis", "cdcschedule",
+    "cdcsubmittalsacc", "cdcsheets", "cdcmeetingminutes", "cdctransmittals",
+)
+DC_DATE_RANGES = ("TODAY", "YESTERDAY", "PAST_7_DAYS", "MONTH_TO_DATE", "LAST_MONTH", "CUSTOM")
+_DC_MAX_PROJECTS = 50
+_DC_POLL_INTERVAL = 15          # seconds between job-status polls (tests set 0)
+_DC_DEFAULT_WAIT = 600
+_DC_MAX_WAIT = 1500
+_DC_DEFAULT_MAX_ZIP_MB = 500
+_DC_MAX_UNCOMPRESSED = 4 * 1024 ** 3
+
+
+def _data_connector_dir() -> str:
+    return os.path.join(_data_dir(), "data_connector")
+
+
+def _dc_request_payload(arguments: dict, bare_project_ids: list[str]) -> dict:
+    """Validate the friendly create_data_request args and build the one-time request body."""
+    groups = arguments.get("service_groups") or []
+    if isinstance(groups, str):
+        groups = [groups]
+    allowed = set(DC_STANDARD_SERVICE_GROUPS) | set(DC_CDC_SERVICE_GROUPS)
+    bad = [g for g in groups if g not in allowed]
+    if not groups or bad:
+        raise ValueError(
+            f"service_groups must be a non-empty list of: {sorted(allowed)}"
+            + (f" (unknown: {bad})" if bad else "")
+        )
+    date_range = arguments.get("date_range")
+    start, end = arguments.get("start_date"), arguments.get("end_date")
+    if date_range is not None and date_range not in DC_DATE_RANGES:
+        raise ValueError(f"date_range must be one of {list(DC_DATE_RANGES)}.")
+    if date_range == "CUSTOM" and not (start and end):
+        raise ValueError("date_range CUSTOM needs both start_date and end_date.")
+    payload: dict = {
+        "description": (arguments.get("description") or
+                        f"forma-mcp extract: {', '.join(groups)}")[:255],
+        "scheduleInterval": "ONE_TIME",
+        "effectiveFrom": datetime.now(timezone.utc).isoformat(),
+        "serviceGroups": list(dict.fromkeys(groups)),
+        "projectIdList": bare_project_ids,
+        "sendEmail": bool(arguments.get("send_email", False)),
+    }
+    if start:
+        payload["startDate"] = start
+    if end:
+        payload["endDate"] = end
+    if date_range:
+        payload["dateRange"] = date_range
+    return payload
+
+
+async def _dc_poll_job(
+    client: httpx.AsyncClient, hdrs: dict, account_id: str, request_id: str, wait_seconds: int,
+) -> "dict | None":
+    """Return the request's newest job once it is no longer running (complete / failed /
+    cancelled), or None if it's still running after `wait_seconds`."""
+    waited = 0
+    while True:
+        r = await client.get(
+            f"{APS_BASE}/data-connector/v1/accounts/{account_id}/requests/{request_id}/jobs",
+            headers=hdrs, params={"sort": "desc", "limit": 1},
+        )
+        r.raise_for_status()
+        jobs = r.json().get("results", [])
+        if jobs and (jobs[0].get("status") or "").lower() in ("complete", "failed", "cancelled", "canceled"):
+            return jobs[0]
+        if waited >= wait_seconds:
+            return None
+        await asyncio.sleep(_DC_POLL_INTERVAL)
+        waited += max(_DC_POLL_INTERVAL, 1)
+
+
+def _extract_csv_tables(zip_path: str, out_dir: str, include_columns: bool = True) -> list[dict]:
+    """Unpack only the CSV tables of a Data Connector extract into `out_dir` (basenames
+    only — zip-slip safe; total uncompressed size capped against zip bombs) and describe
+    each: table name, local file, row count, and (optionally) its column names."""
+    csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
+    tables: list[dict] = []
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = [i for i in zf.infolist()
+                 if not i.is_dir() and i.filename.lower().endswith(".csv")]
+        if sum(i.file_size for i in infos) > _DC_MAX_UNCOMPRESSED:
+            raise ValueError("Extract is too large to unpack (> 4 GB uncompressed).")
+        budget = _DC_MAX_UNCOMPRESSED
+        for info in infos:
+            local = os.path.join(out_dir, _safe_download_name(info.filename, None))
+            with zf.open(info) as src, _private_output(local) as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    budget -= len(chunk)
+                    if budget < 0:
+                        raise ValueError("Extract is too large to unpack (> 4 GB uncompressed).")
+                    dst.write(chunk)
+            with open(local, newline="", encoding="utf-8-sig", errors="replace") as f:
+                reader = csv.reader(f)
+                header = next(reader, [])
+                rows = sum(1 for _ in reader)
+            row = {"table": os.path.splitext(os.path.basename(local))[0], "file": local, "rows": rows}
+            if include_columns:
+                row["columns"] = header
+            tables.append(row)
+    tables.sort(key=lambda t: t["table"])
+    return tables
 
 
 _REVIEWER_KEYS = ("reviewer_users", "reviewer_roles", "reviewer_companies")
@@ -3924,6 +4173,111 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_file_attributes",
+            description=(
+                "Read ACC Docs file metadata that the Data Management listing doesn't carry: "
+                "revision number, review/approval status (label + value), title, number, "
+                "process state and every CUSTOM ATTRIBUTE that holds a value (e.g. status "
+                "codes like S0/A2, naming-convention fields, description) as a {name: value} "
+                "map. Pick files by 'folder_path' (optionally 'recursive', filter with "
+                "'name_contains'), by 'item_ids' (latest version) and/or by exact "
+                "'version_urns'. Live and current — use this, not a Data Connector request, "
+                "for current file status/revision/attributes. Omit all selectors for a full "
+                "project file register (folder walk + 50-file batches; large results go to a "
+                "CSV file, see 'output'). 'include_definitions' adds the "
+                "folder's full custom-attribute catalogue (incl. unset attributes and drop-down "
+                "options) so blanks can be spotted. Read-only (data:read)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "folder_path": {"type": "string", "description": "Folder whose files to read: slash-separated path or raw folder URN. Omit (with no item_ids/version_urns) for the ENTIRE project."},
+                    "recursive": {"type": "boolean", "description": "With folder_path: include all subfolders (depth ≤ 8). Default false. The whole-project mode is always recursive."},
+                    "name_contains": {"type": "string", "description": "With folder_path: only files whose name contains this text (case-insensitive)."},
+                    "item_ids": {"type": "array", "items": {"type": "string"}, "description": "Item (lineage) URNs — returns their latest version."},
+                    "version_urns": {"type": "array", "items": {"type": "string"}, "description": "Exact version URNs (urn:adsk.wipprod:fs.file:vf.xxx?version=N)."},
+                    "include_definitions": {"type": "boolean", "description": "With folder_path: also return the folder's custom-attribute definitions. Default false."},
+                    "max_files": {"type": "integer", "minimum": 1, "maximum": _ATTR_HARD_MAX_FILES, "description": f"Stop after this many files (default {_ATTR_DEFAULT_MAX_FILES}); 'truncated' is set when hit."},
+                    "output": {"type": "string", "enum": ["auto", "json", "csv"], "description": f"'auto' (default) returns rows inline up to {_ATTR_CSV_THRESHOLD} files and otherwise writes a CSV to ~/.forma-mcp/file_attributes/ and returns its path + summary (per-attribute missing counts). 'json' forces inline, 'csv' forces the file."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
+            name="create_data_request",
+            description=(
+                "STEP 1 of 2 for heavy / project-wide analytics: start a one-time ACC Data "
+                "Connector extract (bulk CSV tables) for up to 50 projects of one hub. Use it "
+                "when a question spans many records (all issues incl. custom fields, all "
+                "reviews and per-document review outcomes, every member's roles, RFIs, "
+                "submittals, transmittals, history) rather than paging the live APIs. Pick "
+                "service_groups from the question: 'admin' = users, companies, project roles "
+                "and member↔role links; 'issues' = issues + custom attribute values, comments, "
+                "attachments; 'reviews' = file reviews, review_documents (status per file "
+                "version), steps/tasks/candidates; 'rfis'; 'submittalsacc' (ACC submittals; "
+                "'submittals' = legacy); 'transmittals'; 'sheets'; 'markups'; 'checklists'; "
+                "'forms'; 'dailylogs'; 'meetingminutes'; 'photos'; 'locations'; 'assets'; "
+                "'cost'; 'schedule'; 'relationships' (links between entities); 'activities' = "
+                "event log incl. Docs file activity (revision/approval/custom-attribute "
+                "changes) — max 31-day window, default YESTERDAY, set date_range or "
+                "start/end_date; 'cdc*' = delta-only variants (need a date range); 'all' = "
+                "everything (large). NOT a source of CURRENT Docs file status/revision/custom "
+                "attributes — use get_file_attributes for that. Limits: 24 jobs per hub AND per "
+                "user per 24 h; needs project-admin (or executive overview) rights and the "
+                "data:create scope, so it fails in read-only mode. A job takes minutes. Then "
+                "call get_data_request_results with the returned request_id."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "One project: name (partial ok), ID, or ACC URL."},
+                    "projects": {"type": "array", "items": {"type": "string"}, "description": "Several projects (≤ 50, same hub): names, IDs or ACC URLs. Combined with 'project'."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only)."},
+                    "service_groups": {"type": "array", "items": {"type": "string", "enum": list(DC_STANDARD_SERVICE_GROUPS + DC_CDC_SERVICE_GROUPS)}, "description": "Which datasets to extract (see description). Keep it to what the question needs."},
+                    "date_range": {"type": "string", "enum": list(DC_DATE_RANGES), "description": "Only for 'activities' and cdc* groups. CUSTOM uses start_date/end_date."},
+                    "start_date": {"type": "string", "description": "ISO 8601 start for date-range groups (activities ≤ 31 days)."},
+                    "end_date": {"type": "string", "description": "ISO 8601 end for date-range groups."},
+                    "description": {"type": "string", "description": "Label shown in the Data Connector UI."},
+                    "send_email": {"type": "boolean", "description": "Email the requester when the job finishes. Default false."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["service_groups"],
+            },
+        ),
+        Tool(
+            name="get_data_request_results",
+            description=(
+                "STEP 2 of 2 (after create_data_request): wait for the request's job (polls "
+                "every 15 s up to 'wait_seconds'), download the extract ZIP and unpack its CSV "
+                "tables to ~/.forma-mcp/data_connector/<job_id>/. Returns one row per table: "
+                "name, local CSV path, row count and column names — NOT the data itself. Read "
+                "or query only the CSVs the question needs with your own file tools (tables "
+                "join on ids such as bim360_project_id, issue_id, review_id, user ids). If the "
+                "job is still running it returns status 'running' — call again. Pass 'project' "
+                "or 'hub_name' so the right hub (account) is used."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {"type": "string", "description": "Returned by create_data_request."},
+                    "job_id": {"type": "string", "description": "Optional: a specific finished job of the request (default: its newest job)."},
+                    "project": {"type": "string", "description": "Any project in the request's hub (pins the account)."},
+                    "project_name": {"type": "string", "description": "Alias of 'project'."},
+                    "wait_seconds": {"type": "integer", "minimum": 0, "maximum": _DC_MAX_WAIT, "description": f"How long to wait for a running job (default {_DC_DEFAULT_WAIT})."},
+                    "include_columns": {"type": "boolean", "description": "List each table's column names. Default true."},
+                    "max_size_mb": {"type": "integer", "minimum": 1, "maximum": _DOWNLOAD_HARD_MAX_MB, "description": f"Refuse a ZIP larger than this (default {_DC_DEFAULT_MAX_ZIP_MB})."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok)."},
+                    "region": {"type": "string", "description": "Hub region. Defaults to EMEA."},
+                },
+                "required": ["request_id"],
+            },
+        ),
+        Tool(
             name="download_file",
             description=(
                 "Download a file's contents from ACC Docs to the local machine (read-only; needs "
@@ -5312,7 +5666,7 @@ class UnsafeArgumentError(ValueError):
 # Arguments whose value is placed in an APS URL path as-is.
 _URL_ID_ARG_KEYS = frozenset({
     "hub_id", "folder_id", "item_id", "issue_id", "review_id", "workflow_id", "request_id",
-    "rfi_id", "submittal_id", "transmittal_id", "package_id", "step_id", "task_id",
+    "rfi_id", "submittal_id", "transmittal_id", "package_id", "step_id", "task_id", "job_id",
 })
 # Folder-path arguments: a display-name path is matched against listings (never put in
 # a URL), but a value starting with `urn:` is used directly in the URL, so it's checked.
@@ -5971,6 +6325,188 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "project": resolved_name,
                 "scope": folder_path or "(entire project)",
                 "result_count": len(results), "files": results,
+            }, indent=2))]
+
+        if name == "get_file_attributes":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            bare_pid = _to_bare_id(project_id)
+            max_files = int(arguments.get("max_files") or _ATTR_DEFAULT_MAX_FILES)
+            urns: list[str] = []
+            paths: dict[str, str] = {}
+            for u in arguments.get("version_urns") or []:
+                urns.append(_check_adsk_urn(u, "version_urns entry"))
+            for u in arguments.get("item_ids") or []:
+                urns.append(_check_adsk_urn(u, "item_ids entry"))
+            folder_path = arguments.get("folder_path")
+            folder_id = None
+            whole_project = not folder_path and not urns
+            if folder_path or whole_project:
+                needle = (arguments.get("name_contains") or "").lower()
+                pred = (lambda n: needle in n) if needle else None
+                if whole_project or arguments.get("recursive"):
+                    start = await _resolve_start_folders(client, token, hdrs, hub_id, project_id, folder_path)
+                    folder_id = start[0]["id"] if (start and folder_path) else None
+                    files = await _walk_project_files(client, project_id, hdrs, start, predicate=pred)
+                    for f in files:
+                        urns.append(f["id"])
+                        paths[f["id"]] = f["path"]
+                else:
+                    folder_id, _ = await _resolve_folder(client, token, hub_id, project_id, folder_path)
+                    for i in await get_all_folder_contents(client, project_id, folder_id, hdrs):
+                        name_ = (i.get("attributes") or {}).get("displayName") or ""
+                        if i["type"] == "items" and (pred is None or pred(name_.lower())):
+                            urns.append(i["id"])
+                            paths[i["id"]] = f"{folder_path.rstrip('/')}/{name_}"
+            urns = list(dict.fromkeys(urns))
+            if not urns:
+                raise ValueError("No files found for the given selection.")
+            max_files = max(1, min(max_files, _ATTR_HARD_MAX_FILES))
+            truncated = len(urns) > max_files
+            urns = urns[:max_files]
+
+            results, errors = await _batch_get_version_attrs(client, hdrs, bare_pid, urns)
+            rows = []
+            for r in results:
+                row = _fmt_version_attrs(r)
+                if row["item_id"] in paths:
+                    row["path"] = paths[row["item_id"]]
+                rows.append(row)
+            by_status: dict[str, int] = {}
+            for row in rows:
+                key = row["approval_status"] or "(none)"
+                by_status[key] = by_status.get(key, 0) + 1
+            out: dict = {
+                "project": resolved_name,
+                "scope": folder_path or ("(entire project)" if whole_project else "(selected files)"),
+                "file_count": len(rows),
+                "truncated": truncated,
+                "by_approval_status": by_status,
+            }
+            mode = arguments.get("output") or "auto"
+            if mode == "csv" or (mode == "auto" and len(rows) > _ATTR_CSV_THRESHOLD):
+                csv_path, attr_names = _write_attributes_csv(rows, resolved_name)
+                out["csv_file"] = csv_path
+                out["attribute_columns"] = [f"attr:{a}" for a in attr_names]
+                out["files_missing_attribute"] = {
+                    a: sum(1 for r in rows if (r["custom_attributes"].get(a) in (None, "")))
+                    for a in attr_names
+                }
+                out["hint"] = ("Rows are in csv_file (one line per file, one column per custom "
+                               "attribute) — read or query it instead of re-calling this tool.")
+            else:
+                out["files"] = rows
+            if errors:
+                out["errors"] = errors
+            if arguments.get("include_definitions"):
+                if folder_id:
+                    out["attribute_definitions"] = await _get_attribute_definitions(
+                        client, hdrs, bare_pid, folder_id)
+                else:
+                    out["attribute_definitions_note"] = "include_definitions needs folder_path."
+            return [TextContent(type="text", text=json.dumps(out, indent=2))]
+
+        if name == "create_data_request":
+            refs = list(arguments.get("projects") or [])
+            if arguments.get("project") or arguments.get("project_name"):
+                refs.insert(0, arguments.get("project") or arguments.get("project_name"))
+            if not refs:
+                raise ValueError("Provide 'project' or 'projects' (up to 50 in one hub).")
+            if len(refs) > _DC_MAX_PROJECTS:
+                raise ValueError(f"A data request covers at most {_DC_MAX_PROJECTS} projects.")
+            resolved = []
+            for q in refs:
+                ref = await _resolve_project_ref(
+                    client, token, q, region=_norm_region(arguments),
+                    hub_name=arguments.get("hub_name"), allow_multiple=False,
+                )
+                resolved.append(ref)
+            hubs = {r["hub_id"] for r in resolved}
+            if len(hubs) > 1:
+                raise ValueError("All projects of one data request must be in the same hub; "
+                                 f"got projects in {len(hubs)} hubs — make one request per hub.")
+            account_id = _to_bare_id(resolved[0]["hub_id"])
+            bare_ids = list(dict.fromkeys(_to_bare_id(r["project_id"]) for r in resolved))
+            payload = _dc_request_payload(arguments, bare_ids)
+            r = await client.post(
+                f"{APS_BASE}/data-connector/v1/accounts/{account_id}/requests",
+                headers={**hdrs, "Content-Type": "application/json"}, json=payload,
+            )
+            if not r.is_success:
+                hint = (" Data requests need the data:create scope (not available in read-only "
+                        "mode) and project-admin rights." if r.status_code in (401, 403) else "")
+                return [TextContent(type="text", text=json.dumps({
+                    "error": r.status_code, "message": "Data request was not created." + hint,
+                    "body": _error_body(r),
+                }, indent=2))]
+            data = r.json()
+            return [TextContent(type="text", text=json.dumps({
+                "request_id": data.get("id"),
+                "status": "created",
+                "projects": [r["project_name"] for r in resolved],
+                "service_groups": payload["serviceGroups"],
+                "date_range": payload.get("dateRange"),
+                "next_step": "Call get_data_request_results with this request_id (and the "
+                             "same project) — it waits for the job and unpacks the CSVs.",
+            }, indent=2))]
+
+        if name == "get_data_request_results":
+            if arguments.get("project") or arguments.get("project_name"):
+                hub_id, _, _ = await _resolve_project_arg(client, token, arguments)
+            else:
+                hub_id, _ = await resolve_hub(client, token, _norm_region(arguments), hub_name=arguments.get("hub_name"))
+            account_id = _to_bare_id(hub_id)
+            request_id = arguments["request_id"]
+            wait = max(0, min(int(arguments.get("wait_seconds", _DC_DEFAULT_WAIT)), _DC_MAX_WAIT))
+            max_mb = int(arguments.get("max_size_mb") or _DC_DEFAULT_MAX_ZIP_MB)
+            if arguments.get("job_id"):
+                jr = await client.get(
+                    f"{APS_BASE}/data-connector/v1/accounts/{account_id}/jobs/{arguments['job_id']}",
+                    headers=hdrs,
+                )
+                jr.raise_for_status()
+                job = jr.json()
+            else:
+                job = await _dc_poll_job(client, hdrs, account_id, request_id, wait)
+            if job is None:
+                return [TextContent(type="text", text=json.dumps({
+                    "request_id": request_id, "status": "running",
+                    "message": f"No finished job after {wait}s — call again in a few minutes.",
+                }, indent=2))]
+            job_id = job.get("id")
+            info = {
+                "request_id": request_id, "job_id": job_id,
+                "status": job.get("status"), "completion_status": job.get("completionStatus"),
+                "completed_at": job.get("completedAt"),
+            }
+            if (job.get("completionStatus") or "").lower() != "success" or not job_id:
+                return [TextContent(type="text", text=json.dumps({
+                    **info, "error": "job_not_successful",
+                }, indent=2))]
+            if not _SAFE_ID_RE.match(str(job_id)) or ".." in str(job_id):
+                raise ValueError("Unexpected job id from Data Connector.")
+            sr = await client.get(
+                f"{APS_BASE}/data-connector/v1/accounts/{account_id}/jobs/{job_id}/data/autodesk_data_extract.zip",
+                headers=hdrs,
+            )
+            sr.raise_for_status()
+            signed_url = sr.json().get("signedUrl")
+            if not signed_url:
+                return [TextContent(type="text", text=json.dumps({
+                    **info, "error": "no_download_url", "body": sr.json(),
+                }, indent=2))]
+            out_dir = os.path.join(_data_connector_dir(), str(job_id))
+            zip_path = os.path.join(out_dir, "autodesk_data_extract.zip")
+            size, _ = await _stream_to_private_file(client, [signed_url], zip_path, max_mb * 1024 * 1024)
+            tables = _extract_csv_tables(
+                zip_path, out_dir, include_columns=arguments.get("include_columns", True) is not False,
+            )
+            return [TextContent(type="text", text=json.dumps({
+                **info,
+                "folder": out_dir,
+                "zip_size_bytes": size,
+                "table_count": len(tables),
+                "tables": tables,
+                "hint": "Read only the CSVs you need; tables join on their *_id columns.",
             }, indent=2))]
 
         if name == "download_file":
