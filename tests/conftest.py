@@ -37,7 +37,10 @@ def _no_real_keychain(monkeypatch):
     in-memory 3-legged access token."""
     import aps_mcp
     monkeypatch.setenv("FORMA_MCP_KEYRING", "0")
+    # Off by default; setenv (not delenv) so a direct os.environ write by run() is undone.
+    monkeypatch.setenv("FORMA_MCP_READ_ONLY", "")
     monkeypatch.setattr(aps_mcp, "_user_token_cache", {"token": None, "expires_at": 0})
+    monkeypatch.setattr(aps_mcp, "_app_token_cache", {"token": None, "expires_at": 0})
 
 
 @pytest.fixture(autouse=True)
