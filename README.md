@@ -801,9 +801,9 @@ List the file packages in "Northgate Tower" and the files in each
 
 ## Security & credentials
 
-- **Client secret** — stored in the **OS keychain** (Windows Credential Manager, encrypted with DPAPI to your Windows login; macOS Keychain; Secret Service on Linux) by `forma-mcp auth set-secret`, keyed per Client ID. It is read at runtime and never written to a file. Setting `APS_CLIENT_SECRET` in the MCP config still works and overrides the keychain, but then the secret sits in plain text in `~/.claude.json` — prefer the keychain.
-- **3-legged OAuth** — only the **refresh token** is persisted, in the OS keychain; the 1-hour access token lives in memory. Without a keychain, the refresh token falls back to an owner-only `~/.forma-mcp/tokens.json`. The browser login uses PKCE and a random `state` that the local callback verifies, so a forged callback to `localhost:8080` is rejected; the callback listener gives up after 5 minutes.
-- **2-legged OAuth** — the app token is derived from the Client ID + Secret at runtime and cached **in memory only**.
+- **Client secret** — stored in the **OS keychain** by `forma-mcp auth set-secret`, never in a file. `APS_CLIENT_SECRET` in the MCP config also works, but leaves the secret in plain text in `~/.claude.json`.
+- **3-legged OAuth** — only the refresh token is stored (keychain, or an owner-only `~/.forma-mcp/tokens.json` without one); the access token stays in memory. The browser login uses PKCE.
+- **2-legged OAuth** — the app token is kept in memory only.
 - **Managing stored credentials:**
 
   | Command | Effect |
@@ -813,14 +813,13 @@ List the file packages in "Northgate Tower" and the files in each
   | `forma-mcp auth delete-secret [--client-id ID]` | Removes the stored client secret |
   | `forma-mcp auth logout [--client-id ID]` | Removes the stored login (keychain entry and any `tokens.json`); the next tool call opens a browser login |
 
-  Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`. `--client-id` defaults to `APS_CLIENT_ID`. Add `--read-only` to act on the separate read-only login.
-- **Hardened tool arguments** — every argument that ends up in an API URL path (`hub_id`, `folder_id`, `item_id`, `issue_id`, `review_id`, `workflow_id`, `request_id`, and folder arguments given as a raw `urn:`) is checked against a strict id charset before any request is made. A value containing `/`, `?`, `#`, `%`, whitespace or `..` is rejected with an `unsafe_argument` error, so text the model picked up from ACC content (a file name, an issue description) can't redirect a call to a different API endpoint with your token.
-- **Credentials pinned to Autodesk** — the HTTP client refuses to send any `Authorization` header anywhere except `https://developer.api.autodesk.com`. The only other host ever contacted is the pre-signed (credential-free) download URL that a Data Connector job returns.
-- **Supply chain** — 3 direct dependencies; a hash-pinned `constraints.txt` for reproducible installs; CI actions pinned by commit SHA with a read-only workflow token; `pip-audit` on every change; Dependabot (with a 14-day cooldown), secret scanning and push protection enabled; release tags immutable.
-- **Whose permissions apply** — the 3-legged tools (navigation, folders, files, project membership, issues, reviews) act as **the signed-in user**, with their ACC permissions. The **2-legged** tools (account users/companies directory, hub onboarding/offboarding, project lookup by id) act as the **app**, with `account:read account:write`, on every account where the integration is activated — independent of the signed-in user's own rights. Activating the Custom Integration is therefore an account-admin decision, and revoking it disables the server for that account.
-- **Defensive input handling** (from an external static-analysis scan, Nov 2026): an empty or ambiguous `company_name` is refused instead of matching every user; `clone_user_access` keys roles by project **ID**, so two same-named projects can't swap role sets; a project ID the signed-in user's hubs don't contain is reported as not found (no name leak via the app token); list arguments are capped at 5,000 items and bulk fan-outs run on a fixed worker pool; `create_review` checks its 1,000-file limit before any lookup; audit CSVs get collision-proof names and are never overwritten; the login callback port is bound *before* the browser opens, with a clear error if it's taken.
-- **Symlink-safe state files** — the data directory is refused if it's a symlink or owned by another user (and tightened to `0700`); `tokens.json` is written via an exclusive temp file + atomic rename, so a planted symlink is replaced, never followed, and is never read through.
-- **Read-only mode** (`--read-only`): the tokens carry read scopes only, so Autodesk rejects writes. See [Read-only mode](#read-only-mode-for-testers).
+  Run them via `uvx --from git+https://github.com/lfcastel/Forma-MCP@<tag> forma-mcp auth ...`; add `--read-only` for the separate read-only login.
+- **Hardened tool arguments** — ids that end up in API URLs are validated before any request, so text picked up from ACC content can't redirect a call elsewhere.
+- **Credentials pinned to Autodesk** — the auth header is only ever sent to `developer.api.autodesk.com`.
+- **Supply chain** — few dependencies, hash-pinned installs, pinned CI actions, `pip-audit` and Dependabot on every change, immutable release tags.
+- **Whose permissions apply** — 3-legged tools act as **the signed-in user** with their ACC permissions; 2-legged tools (account directory, hub onboarding, project lookup by id) act as **the app** on every account where the integration is activated. Activating the Custom Integration is therefore an account-admin decision.
+- **Defensive input handling** — ambiguous or oversized inputs are refused rather than guessed, and local state files are written owner-only and symlink-safe.
+- **Read-only mode** (`--read-only`): tokens carry read scopes only, so Autodesk rejects writes. See [Read-only mode](#read-only-mode-for-testers).
 - Bulk write tools default to `dry_run: true` — no changes are made without explicit confirmation.
 
 ---
