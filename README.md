@@ -218,6 +218,7 @@ Then point the MCP config at the clone: either `"command": "uvx", "args": ["--fr
 | `move_folder` | Move a folder (and its contents) into another parent folder | 3-legged |
 | `find_files` | Search for files by name across a project | 3-legged |
 | `list_all_files` | Recursively list **every** file in a project (or a folder + subfolders) with full paths | 3-legged |
+| `list_deleted_items` | Audit **soft-deleted (hidden)** files and folders in a folder or the whole project: full path, id, last-modified (usually the deletion) and creator; also reports the contents of deleted folders (`deleted_via`: `self` / `parent_folder`). Read-only, no restore | 3-legged |
 | `export_deliverables_manifest` | Compact **filename-only** recursive list (deduped, sorted, no metadata) for cross-checking against an external deliverable list | 3-legged |
 | `get_file_attributes` | Current Docs metadata per file: **revision**, **review/approval status**, title/number and every filled-in **custom attribute** (e.g. status S0/A2) — by folder (optionally recursive), item ids, version URNs, or **the whole project** (no selector = full file register); above 200 files the rows go to a CSV in `~/.forma-mcp/file_attributes/` with per-attribute missing counts (`output`: auto/json/csv; up to 20 000 files); `include_definitions` adds the folder's full attribute catalogue | 3-legged |
 | `download_file` | Download a file's contents (latest or a given version) to `~/.forma-mcp/downloads/` so the agent can read it locally — e.g. an Excel tracker or a PDF; by `folder_path`+`file_name`, `item_id` or `version_urn`; size-capped (`max_size_mb`, default 200) and SHA-1-verified | 3-legged |
@@ -381,6 +382,7 @@ flowchart LR
         T5(find_recent_activity)
         T6(find_files)
         T39(list_all_files)
+        T77(list_deleted_items)
         T40(export_deliverables_manifest)
         T74(get_file_attributes)
         T73(download_file)
@@ -556,6 +558,8 @@ flowchart LR
     T6 --> E4
     T39 --> E3
     T39 --> E4
+    T77 --> E3
+    T77 --> E4
     T40 --> E3
     T40 --> E4
     T23 --> E4
@@ -662,7 +666,7 @@ flowchart LR
     T75 --> E12
     T76 --> E13
 
-    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70,T71,T72,T73,T74,T75,T76 tool
+    class T1,T2,T3,T4,T5,T6,T7,T8,T9,T10,T11,T12,T13,T14,T15,T16,T17,T18,T19,T20,T21,T22,T23,T24,T25,T26,T27,T28,T29,T30,T31,T32,T33,T34,T35,T36,T37,T38,T39,T40,T41,T42,T43,T44,T45,T46,T47,T48,T49,T50,T51,T52,T53,T54,T55,T56,T57,T58,T59,T60,T61,T62,T63,T64,T65,T66,T67,T68,T69,T70,T71,T72,T73,T74,T75,T76,T77 tool
     class E1,E2,E3,E4,E5,E6,E7,E8,E9,E13,E21,E22,E27,E28,E30,E31,E32,E33,E35,E36,E38,E39,E40,E43,E44,E47,E48,E51,E52,E55,E56 get
     class E57 post
     class E10,E11,E12,E14,E18,E19,E23,E24,E29,E37,E41,E42,E45,E49,E53,E54 post
@@ -840,7 +844,7 @@ List the file packages in "Northgate Tower" and the files in each
 
 - **Read-only mode: reads sent as POST are not yet verified live** — a few read operations use `POST` (e.g. the RFI search behind `list_rfis`). They are expected to work with `data:read`, but this hasn't been tested against a live hub yet; if one returns 403 in read-only mode, that is why.
 - **User last-activity date** — the `last_sign_in` field is only populated for **BIM360 projects**. The underlying ACC Account Admin API does not return this field for Forma projects, so activity timestamps will be absent for those users.
-- **APS rate limits** — Autodesk enforces [Data Management rate limits](https://aps.autodesk.com/en/docs/data/v2/overview/rate-limits/) **per endpoint, per client ID, per minute** (e.g. 300 rpm on `folders/{id}/contents`, 50 rpm on `hubs`/`projects` and on folder create/rename). The server paces itself to stay under them: every Data Management request goes through a per-endpoint token bucket (published limit × `APS_RATE_HEADROOM`, default 0.8, with a ~10 s burst allowance), and the recursive tree walks (`find_files`, `list_all_files`, `find_folder`, `find_recent_activity`, `export_permission_matrix`) keep at most 8 folder listings in flight. A 429 (APS's body reads `"Quota limit exceeded."` even for an ordinary rate limit) is retried after the full `Retry-After` period (capped at 60 s, up to 3 times) and also blocks that endpoint's bucket so concurrent calls back off together; only after the retries are exhausted does a tool return a clean `quota_exceeded` result with the `Retry-After` hint — wait and retry. The limits are shared by **everyone using the same APS client ID**, so if several people run this server, give each their own app registration. Set `APS_RATE_LIMITING=0` to disable the client-side pacing.
+- **APS rate limits** — Autodesk enforces [Data Management rate limits](https://aps.autodesk.com/en/docs/data/v2/overview/rate-limits/) **per endpoint, per client ID, per minute** (e.g. 300 rpm on `folders/{id}/contents`, 50 rpm on `hubs`/`projects` and on folder create/rename). The server paces itself to stay under them: every Data Management request goes through a per-endpoint token bucket (published limit × `APS_RATE_HEADROOM`, default 0.8, with a ~10 s burst allowance), and the recursive tree walks (`find_files`, `list_all_files`, `list_deleted_items`, `find_folder`, `find_recent_activity`, `export_permission_matrix`) keep at most 8 folder listings in flight. A 429 (APS's body reads `"Quota limit exceeded."` even for an ordinary rate limit) is retried after the full `Retry-After` period (capped at 60 s, up to 3 times) and also blocks that endpoint's bucket so concurrent calls back off together; only after the retries are exhausted does a tool return a clean `quota_exceeded` result with the `Retry-After` hint — wait and retry. The limits are shared by **everyone using the same APS client ID**, so if several people run this server, give each their own app registration. Set `APS_RATE_LIMITING=0` to disable the client-side pacing.
 - **Cloud-workshared Revit models can't be moved by API** — C4R models (`C4RModel`) return 403 on a move and cannot be relocated programmatically. During a `bulk_delete_folders` reorg they are what keeps a folder from being deleted: it is reported as `skipped_has_files` so a human can move them in the Revit/ACC UI first.
 - **No hard delete for hub users or companies** — the HQ API only supports soft-offboarding, so `deactivate_hub_users` / `deactivate_hub_companies` set `status: inactive` rather than removing the record. Deactivated entries remain visible (as inactive) in the account directory.
 - **Hub onboarding can't grant account-admin** — `bulk_add_hub_users` sets each user's company and (optional) default role, but the underlying `users/import` endpoint cannot elevate someone to **account administrator**; do that in the ACC Account Admin UI.
@@ -875,7 +879,7 @@ All changes go through a pull request. GitHub Actions runs the test suite and a 
 
 ```
 forma-mcp/
-├── aps_mcp.py                  # MCP server — 76 tools
+├── aps_mcp.py                  # MCP server — 77 tools
 ├── tests/                      # pytest test suite
 ├── .github/workflows/ci.yml    # GitHub Actions CI (tests + package build + dependency audit)
 ├── .github/dependabot.yml      # weekly dependency / action updates (14-day cooldown)

@@ -940,6 +940,7 @@ async def get_all_folder_contents(
     *,
     raise_on_error: bool = True,
     on_unauthorized=None,
+    include_hidden: bool = False,
 ) -> list:
     """Return ALL items in a folder, following JSON:API `links.next` pagination.
 
@@ -951,9 +952,15 @@ async def get_all_folder_contents(
     With `raise_on_error=False`, a non-success response (e.g. a 403 on a
     restricted subfolder) stops pagination and returns what was collected so
     far instead of raising — used by best-effort tree walks.
+
+    With `include_hidden=True` the listing also returns soft-deleted (hidden)
+    items and folders (`includeHidden=true`), each carrying `attributes.hidden`.
+    The flag is re-applied to every `next` page so a long listing can't drop it.
     """
     url = f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_id}/contents"
     params: dict | None = {"page[limit]": 200}
+    if include_hidden:
+        params["includeHidden"] = "true"
     items: list = []
     while url:
         res = await _request_with_retry(
@@ -974,6 +981,8 @@ async def get_all_folder_contents(
         else:
             url = None
         params = None  # the `next` href already carries pagination params
+        if include_hidden and url and "includeHidden" not in url:
+            params = {"includeHidden": "true"}
     return items
 
 
@@ -1044,6 +1053,86 @@ async def _walk_project_files(
     ])
     results.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
     return results
+
+
+async def _walk_deleted_items(
+    client: httpx.AsyncClient,
+    project_id: str,
+    headers: dict,
+    start_folders: list,
+    *,
+    recursive: bool = True,
+    include_folders: bool = True,
+    max_depth: int = 8,
+) -> dict:
+    """Collect soft-deleted (hidden) files and folders under each start folder.
+
+    Lists every folder with `includeHidden=true` and keeps the rows whose
+    `attributes.hidden` is true (`deleted_via: "self"`). With `recursive`, the
+    walk descends into live AND deleted sub-folders; anything found inside a
+    deleted folder is reported too, even when not flagged hidden itself, with
+    `deleted_via: "parent_folder"` and the deleted ancestor in `deleted_folder`
+    (it disappears from the UI along with that folder). A start folder that is
+    itself hidden (passed by URN) marks its whole subtree deleted. Sub-folder
+    listing errors are collected in `errors`, not raised (best-effort walk).
+    Read-only.
+    """
+    files: list[dict] = []
+    folders: list[dict] = []
+    errors: list[dict] = []
+    sem = asyncio.Semaphore(_WALK_CONCURRENCY)
+
+    async def walk(folder_id: str, path: str, depth: int, deleted_anc: str | None):
+        if depth > max_depth:
+            return
+        async with sem:
+            try:
+                contents = await get_all_folder_contents(
+                    client, project_id, folder_id, headers, include_hidden=True,
+                )
+            except httpx.HTTPStatusError as e:
+                errors.append({"folder": path, "folder_id": folder_id,
+                               "status": e.response.status_code})
+                return
+        tasks = []
+        for item in contents:
+            a = item.get("attributes") or {}
+            hidden = bool(a.get("hidden"))
+            is_folder = item.get("type") == "folders"
+            name_ = _folder_name(a) if is_folder else (a.get("displayName") or a.get("name") or "")
+            item_path = f"{path}/{name_}"
+            if hidden or deleted_anc:
+                row = {
+                    "name": name_,
+                    "path": item_path,
+                    "id": item["id"],
+                    "deleted_via": "self" if hidden else "parent_folder",
+                    "last_modified": a.get("lastModifiedTime"),
+                    "modified_by": a.get("lastModifiedUserName"),
+                    "created": a.get("createTime"),
+                    "created_by": a.get("createUserName"),
+                }
+                if not hidden:
+                    row["deleted_folder"] = deleted_anc
+                if is_folder:
+                    if include_folders:
+                        folders.append(row)
+                else:
+                    files.append(row)
+            if is_folder and recursive:
+                child_anc = deleted_anc or (item_path if hidden else None)
+                tasks.append(walk(item["id"], item_path, depth + 1, child_anc))
+        await asyncio.gather(*tasks)
+
+    await asyncio.gather(*[
+        walk(f["id"], _folder_name(f.get("attributes") or {}), 0,
+             _folder_name(f.get("attributes") or {}) if (f.get("attributes") or {}).get("hidden") else None)
+        for f in start_folders
+    ])
+    key = lambda x: x.get("last_modified") or ""
+    files.sort(key=key, reverse=True)
+    folders.sort(key=key, reverse=True)
+    return {"files": files, "folders": folders, "errors": errors}
 
 
 async def _request_with_retry(
@@ -4148,6 +4237,34 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="list_deleted_items",
+            description=(
+                "Audit soft-deleted (hidden) files and folders: everything removed in ACC "
+                "Docs that sits in the recycle bin until an admin restores it. Scope to one "
+                "folder with folder_path (a path, or a raw folder URN, which also works for "
+                "a folder that is itself deleted), or omit it for the whole project. "
+                "Recursive by default: it also descends into deleted folders and reports "
+                "their contents as deleted_via='parent_folder' (with the deleted ancestor "
+                "in deleted_folder); items deleted directly are deleted_via='self'. Each "
+                "row gives full path, id, last-modified time and user (for a deleted item "
+                "this is usually the deletion), plus created time and user. Newest first. "
+                "Read-only (data:read); it does not restore anything."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name (partial ok), ID (b.xxx or bare UUID), or full ACC URL — preferred over project_name; pins the exact hub."},
+                    "project_name": {"type": "string", "description": "Alias of 'project' (name only). Kept for backward compatibility."},
+                    "folder_path": {"type": "string", "description": "Folder to audit (optional). Slash-separated path of a live folder, or a raw folder URN (works for a deleted folder too). Omit for the entire project."},
+                    "recursive": {"type": "boolean", "description": "Include all subfolders, live and deleted (depth ≤ 8). Default true; false lists only the folder's own direct deleted children."},
+                    "include_folders": {"type": "boolean", "description": "Also list deleted folders (default true). False returns deleted files only."},
+                    "hub_name": {"type": "string", "description": "Hub display name (partial match ok, e.g. 'My Company - EU Hub'). Use when multiple hubs share the same region."},
+                    "region": {"type": "string", "description": "Hub region (e.g. EMEA, US). Defaults to EMEA."},
+                },
+                "required": [],
+            },
+        ),
+        Tool(
             name="export_deliverables_manifest",
             description=(
                 "Return a compact, plain-text list of every file NAME under a project (or one "
@@ -6326,6 +6443,46 @@ async def _dispatch_tool(name: str, arguments: dict) -> list[TextContent]:
                 "scope": folder_path or "(entire project)",
                 "result_count": len(results), "files": results,
             }, indent=2))]
+
+        if name == "list_deleted_items":
+            hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
+            folder_path = arguments.get("folder_path")
+            if folder_path and folder_path.startswith("urn:"):
+                # A raw URN may name a deleted folder, which path resolution can't see;
+                # read its own attributes so a hidden start folder marks its subtree.
+                fres = await client.get(
+                    f"{APS_BASE}/data/v1/projects/{project_id}/folders/{folder_path}",
+                    headers=hdrs,
+                )
+                fres.raise_for_status()
+                fd = fres.json().get("data") or {}
+                start_folders = [{"id": fd.get("id", folder_path), "attributes": fd.get("attributes") or {}}]
+            else:
+                start_folders = await _resolve_start_folders(
+                    client, token, hdrs, hub_id, project_id, folder_path
+                )
+            found = await _walk_deleted_items(
+                client, project_id, hdrs, start_folders,
+                recursive=arguments.get("recursive", True) is not False,
+                include_folders=arguments.get("include_folders", True) is not False,
+            )
+            out = {
+                "project": resolved_name,
+                "scope": folder_path or "(entire project)",
+                "summary": {
+                    "deleted_files": len(found["files"]),
+                    "deleted_files_self": sum(1 for f in found["files"] if f["deleted_via"] == "self"),
+                    "deleted_files_in_deleted_folder": sum(1 for f in found["files"] if f["deleted_via"] == "parent_folder"),
+                    "deleted_folders": len(found["folders"]),
+                    "folders_unreadable": len(found["errors"]),
+                },
+                "files": found["files"],
+            }
+            if arguments.get("include_folders", True) is not False:
+                out["folders"] = found["folders"]
+            if found["errors"]:
+                out["errors"] = found["errors"]
+            return [TextContent(type="text", text=json.dumps(out, indent=2))]
 
         if name == "get_file_attributes":
             hub_id, project_id, resolved_name = await _resolve_project_arg(client, token, arguments)
